@@ -14,20 +14,30 @@ sampled answer.
 export DEEPSEEK_API_KEY=...
 python3 gguf-tools/quality-testing/collect_official.py \
   --prompts gguf-tools/quality-testing/prompts.jsonl \
-  --out gguf-tools/quality-testing/data \
+  --out gguf-tools/quality-testing/data/flash \
   --count 100 \
   --max-tokens 24
 ```
 
-Use `--model deepseek-v4-pro --out gguf-tools/quality-testing/data/pro`
-to collect the same prompt set from PRO.  The default remains Flash.
+Use one output directory per official model.  The default model is Flash, so
+`data/flash` is the recommended path for Flash continuations.  For PRO:
+
+```sh
+python3 gguf-tools/quality-testing/collect_official.py \
+  --model deepseek-v4-pro \
+  --prompts gguf-tools/quality-testing/prompts.jsonl \
+  --out gguf-tools/quality-testing/data/pro \
+  --count 100 \
+  --max-tokens 24 \
+  --top-logprobs 20
+```
 
 The script writes:
 
-- `data/prompts/case_*.txt`
-- `data/continuations/case_*.txt`
-- `data/responses/case_*.json`
-- `data/manifest.tsv`
+- `data/<model>/prompts/case_*.txt`
+- `data/<model>/continuations/case_*.txt`
+- `data/<model>/responses/case_*.json`
+- `data/<model>/manifest.tsv`
 
 The prompt list is tracked in `prompts.jsonl`; the official responses are not
 tracked because they are derived from an external API.
@@ -45,16 +55,20 @@ The scorer links against the DS4 runtime and uses Metal by default.
 ```sh
 gguf-tools/quality-testing/score_official \
   ../deepseek-v4-quants/gguf/OLD.gguf \
-  gguf-tools/quality-testing/data/manifest.tsv \
+  gguf-tools/quality-testing/data/flash/manifest.tsv \
   /tmp/old.tsv \
   4096
 
 gguf-tools/quality-testing/score_official \
   ../deepseek-v4-quants/gguf/NEW.gguf \
-  gguf-tools/quality-testing/data/manifest.tsv \
+  gguf-tools/quality-testing/data/flash/manifest.tsv \
   /tmp/new.tsv \
   4096
 ```
+
+Use `data/pro/manifest.tsv` for PRO GGUFs.  The scorer and comparator do not
+care which model produced the manifest; the manifest path selects the
+continuation set.
 
 ## 4. Compare
 

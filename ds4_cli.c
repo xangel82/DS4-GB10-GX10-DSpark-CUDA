@@ -296,6 +296,7 @@ typedef struct {
     int base_tokens;
     int input_tokens;
     bool use_color;
+    bool finished;
 } cli_prefill_progress;
 
 static void cli_prefill_progress_cb(void *ud, const char *event, int current, int total) {
@@ -312,6 +313,9 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
     double pct = 100.0 * (double)processed / (double)p->input_tokens;
     if (pct > 100.0) pct = 100.0;
 
+    const bool complete = processed >= p->input_tokens;
+    if (complete && p->finished) return;
+
     if (p->use_color) {
         fputc('\r', stderr);
         ds4_log(stderr,
@@ -322,7 +326,7 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
                 p->input_tokens,
                 pct);
         fputs("\x1b[K", stderr);
-        if (processed >= p->input_tokens) fputc('\n', stderr);
+        if (complete) fputc('\n', stderr);
     } else {
         fprintf(stderr,
                 "processing %d input tokens: %d/%d (%.1f%%)\n",
@@ -331,6 +335,7 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
                 p->input_tokens,
                 pct);
     }
+    if (complete) p->finished = true;
     fflush(stderr);
 }
 

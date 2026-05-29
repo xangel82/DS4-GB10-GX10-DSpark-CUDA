@@ -70,7 +70,10 @@ static void cli_sigint_handler(int sig) {
     cli_interrupted = 1;
     if (cli_dist_busy && !cli_dist_notice_printed) {
         cli_dist_notice_printed = 1;
-        (void)write(STDERR_FILENO, cli_dist_drain_msg, sizeof(cli_dist_drain_msg) - 1u);
+        ssize_t ignored = write(STDERR_FILENO,
+                                cli_dist_drain_msg,
+                                sizeof(cli_dist_drain_msg) - 1u);
+        (void)ignored;
     }
 }
 

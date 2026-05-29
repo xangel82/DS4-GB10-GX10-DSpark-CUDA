@@ -9533,7 +9533,8 @@ static int run_agent(ds4_engine *engine, agent_config *cfg) {
                         }
                     }
                 } else if (cmd[0] == '/' && !agent_slash_command_known(cmd)) {
-                    write(STDOUT_FILENO, "\a", 1);
+                    ssize_t ignored = write(STDOUT_FILENO, "\a", 1);
+                    (void)ignored;
                     restore_line = xstrdup(cmd);
                 } else if (cmd[0] == '/' && busy) {
                     printf("command requires the model to be idle: %s\n", cmd);

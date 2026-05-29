@@ -618,6 +618,7 @@ static uint32_t ds4_expected_layer_compress_ratio(uint32_t il) {
     default:
         ds4_die("unsupported DeepSeek4 model variant");
     }
+    return 0;
 }
 
 static void ds4_die_errno(const char *what, const char *path) {

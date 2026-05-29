@@ -7641,6 +7641,7 @@ static void *dist_worker_data_listener_main(void *arg) {
         }
         pthread_detach(tid);
     }
+    return NULL;
 }
 
 /* =========================================================================

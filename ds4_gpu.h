@@ -1,6 +1,11 @@
 #ifndef DS4_GPU_H
 #define DS4_GPU_H
 
+/*
+ * GB10/GX10 DSpark CUDA modifications:
+ * Copyright (c) 2026 Marco Palaferri. Licensed under the MIT License.
+ */
+
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -40,6 +45,37 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
+/* CUDA-only experimental token graph. begin returns 1 when capture started and
+ * 0 when the caller should use the normal command path. end returns 1 after a
+ * graph launch, 0 for a safe normal-path fallback, and -1 for a launch error. */
+int ds4_gpu_token_graph_begin(uint32_t variant, uint32_t pos);
+int ds4_gpu_token_graph_end_token(uint32_t token);
+/* Prepare records/updates an executable without launching it.  It is used by
+ * the CUDA decode pipeline on a second per-thread default stream while the
+ * preceding token is executing.  launch_prepared returns the usual graph
+ * contract: 1 launched, 0 unavailable/stale, -1 launch failure. */
+int ds4_gpu_token_graph_prepare_begin(uint32_t variant, uint32_t pos);
+int ds4_gpu_token_graph_prepare_end(void);
+int ds4_gpu_token_graph_launch_prepared(uint32_t variant, uint32_t pos,
+                                        uint32_t token);
+void ds4_gpu_token_graph_abort(void);
+/* MTP graph calls use the same return contract.  Draft and verifier failures
+ * are isolated by family; callers can restore their host tape and replay a
+ * capture/end failure through the normal command path. */
+int ds4_gpu_mtp_graph_begin(uint32_t variant, uint32_t pos);
+int ds4_gpu_mtp_graph_end(void);
+void ds4_gpu_mtp_graph_abort(void);
+/* DSpark verifier and drafter graphs are K-aware and occupy graph families
+ * separate from normal decode and MTP. */
+int ds4_gpu_dspark_graph_begin(uint32_t n_tokens,
+                              uint32_t position_variant,
+                              uint32_t pos);
+int ds4_gpu_dspark_draft_graph_begin(uint32_t n_tokens,
+                                    uint32_t position_variant,
+                                    uint32_t pos);
+void ds4_gpu_token_graph_reset(void);
+void ds4_gpu_token_graph_note_readback(double readback_ms, double eval_ms);
+void ds4_gpu_token_graph_note_sampling(double sampling_ms);
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label);
@@ -205,6 +241,37 @@ int ds4_gpu_argmax_tensor(
         ds4_gpu_tensor       *out_idx,
         const ds4_gpu_tensor *logits,
         uint32_t                n_vocab);
+
+/* Sample one full-vocabulary row using temperature + min-p filtering and
+ * materialize the exact normalized q distribution used for the draw.  The
+ * uniform is read from a device tensor so CUDA Graph replays keep stable
+ * kernel parameters while receiving fresh RNG state. */
+int ds4_gpu_sample_min_p_tensor(
+        ds4_gpu_tensor       *out_idx,
+        ds4_gpu_tensor       *out_probs,
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *uniform,
+        uint32_t                n_vocab,
+        float                   temperature,
+        float                   min_p);
+
+/* Verify DSpark draft tokens with lossless p/q rejection sampling entirely on
+ * the device.  spec_logits contains n_rows target rows; draft_probs contains
+ * the normalized q rows produced by ds4_gpu_sample_min_p_tensor; dspark_tokens
+ * stores the pending current token followed by draft tokens.  The outputs are
+ * one token and one accepted flag per draft row. */
+int ds4_gpu_dspark_rejection_verify_tensor(
+        ds4_gpu_tensor       *out_tokens,
+        ds4_gpu_tensor       *out_accept,
+        const ds4_gpu_tensor *spec_logits,
+        const ds4_gpu_tensor *draft_probs,
+        const ds4_gpu_tensor *dspark_tokens,
+        const ds4_gpu_tensor *accept_uniforms,
+        const ds4_gpu_tensor *residual_uniforms,
+        uint32_t                n_rows,
+        uint32_t                n_vocab,
+        float                   temperature,
+        float                   min_p);
 
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
@@ -463,6 +530,25 @@ int ds4_gpu_store_raw_kv_batch_tensor(
         uint32_t                n_tokens,
         uint32_t                head_dim);
 
+/* Save/restore a short absolute-positioned slice of a circular KV ring.  The
+ * backup is linear in token order; restore_from selects a suffix so a
+ * speculative verifier can retain accepted rows and roll back rejected ones. */
+int ds4_gpu_ring_rows_save_tensor(
+        ds4_gpu_tensor       *backup,
+        const ds4_gpu_tensor *ring,
+        uint32_t              ring_cap,
+        uint32_t              pos0,
+        uint32_t              n_rows,
+        uint32_t              width);
+int ds4_gpu_ring_rows_restore_tensor(
+        ds4_gpu_tensor       *ring,
+        const ds4_gpu_tensor *backup,
+        uint32_t              ring_cap,
+        uint32_t              pos0,
+        uint32_t              restore_from,
+        uint32_t              n_rows,
+        uint32_t              width);
+
 /* =========================================================================
  * KV Compression and Attention.
  * =========================================================================
@@ -606,6 +692,44 @@ int ds4_gpu_attention_prefill_raw_heads_tensor(
         uint32_t                window,
         uint32_t                n_head,
         uint32_t                head_dim);
+
+/* DSpark's five draft rows attend non-causally to the complete 128-row main
+ * ring plus all draft KV rows.  This differs from the target model's causal
+ * prefill/decode masks and therefore has a dedicated CUDA entry point. */
+int ds4_gpu_dspark_attention_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        ds4_gpu_tensor       *kv_context,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *main_kv,
+        const ds4_gpu_tensor *draft_kv,
+        uint32_t              n_main,
+        uint32_t              main_cap,
+        uint32_t              main_start,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              head_dim);
+
+int ds4_gpu_dspark_confidence_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *hidden,
+        const ds4_gpu_tensor *markov,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n_tokens,
+        uint32_t              hidden_dim,
+        uint32_t              markov_dim);
+
+int ds4_gpu_interleave3_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        const ds4_gpu_tensor *c,
+        uint32_t              n_rows,
+        uint32_t              width);
 
 int ds4_gpu_attention_decode_raw_batch_heads_tensor(
         ds4_gpu_tensor       *heads,

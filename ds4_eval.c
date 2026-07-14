@@ -3415,6 +3415,10 @@ static int regrade_status_self_test_case(void) {
 
 static int run_extractor_self_tests(void) {
     int failed = 0;
+    if (!ds4_speculative_rejection_self_test()) {
+        fprintf(stderr, "ds4-eval: speculative rejection self-test failed\n");
+        failed++;
+    }
 
     failed += trace_copy_self_test_case();
     failed += regrade_status_self_test_case();
@@ -3566,7 +3570,7 @@ static int run_extractor_self_tests(void) {
         &int_82, "</think>Answer: 82\nThe value 2025 is just the year.", "82");
 
     if (failed) return 1;
-    printf("ds4-eval: answer extractor self-tests passed\n");
+    printf("ds4-eval: answer extractor and speculative rejection self-tests passed\n");
     return 0;
 }
 

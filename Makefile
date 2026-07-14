@@ -40,7 +40,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test cpu cuda cuda-spark cuda-spark-graph cuda-spark-mtp-tc cuda-spark-graph-sm121 cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -82,6 +82,9 @@ all: help
 help:
 	@echo "DS4 build targets:"
 	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10"
+	@echo "  make cuda-spark-graph    Build experimental token-level CUDA Graph path for GB10"
+	@echo "  make cuda-spark-mtp-tc   Build CUDA Graph + opt-in MTP Tensor Core support"
+	@echo "  make cuda-spark-graph-sm121  Build CUDA Graph path as a native GB10 sm_121 cubin"
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
@@ -92,6 +95,16 @@ help:
 
 cuda-spark:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=
+
+cuda-spark-graph:
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH= \
+		NVCCFLAGS="$(NVCCFLAGS) --default-stream per-thread -DDS4_CUDA_TOKEN_GRAPH_BUILD"
+
+cuda-spark-graph-sm121:
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=sm_121 \
+		NVCCFLAGS="-O3 -g -lineinfo --use_fast_math -arch=sm_121 -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread --default-stream per-thread -DDS4_CUDA_TOKEN_GRAPH_BUILD"
+
+cuda-spark-mtp-tc: cuda-spark-graph-sm121
 
 cuda-generic:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native

@@ -12,7 +12,7 @@ run.
 
 Preferred release test hosts:
 
-- CUDA / DGX Spark: `toor@192.168.0.180`.
+- CUDA / DGX Spark: `<gb10-user>@<gb10-host>`.
 - Metal / distributed Mac testing: `mac-m5max-it` and `mac-m5max-us`.
 - ROCm: The Strix Halo system at antirez@strixhalo (Framework Desktop).
 
@@ -106,7 +106,7 @@ SSD streaming is a capacity path, so test both correctness and user experience.
 ## 6. CUDA / DGX Spark
 
 Before a release, ask the user for CUDA access if it is not already configured.
-Use the DGX Spark / GB10 host `toor@192.168.0.180`.  Do not claim CUDA is
+Use the DGX Spark / GB10 host `<gb10-user>@<gb10-host>`.  Do not claim CUDA is
 release-ready without this pass.
 
 - Fetch or push the exact release commit to the CUDA machine.

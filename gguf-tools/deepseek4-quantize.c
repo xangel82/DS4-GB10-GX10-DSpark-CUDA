@@ -1,6 +1,9 @@
 /*
  * DeepSeek V4 Flash/Pro HF -> GGUF quantizer.
  *
+ * GB10/GX10 DSpark CUDA modifications:
+ * Copyright (c) 2026 Marco Palaferri. Licensed under the MIT License.
+ *
  * This is a plain C, model-specific version of the DS4 quantization pipeline.
  * It deliberately keeps only the pieces needed by the DeepSeek V4 Flash and
  * Pro GGUF recipes used by this repository:
@@ -874,6 +877,7 @@ typedef enum { EXP_NONE, EXP_W1, EXP_W2, EXP_W3 } expert_part;
 
 typedef struct {
     bool is_expert;
+    bool is_dspark;
     int layer;
     expert_part part;
 } expert_tensor;
@@ -888,6 +892,17 @@ static expert_tensor parse_expert_tensor(const char *name) {
     {
         if (strcmp(kind, "gate") == 0 || strcmp(kind, "down") == 0 || strcmp(kind, "up") == 0) {
             e.is_expert = true;
+            e.layer = layer;
+            e.part = strcmp(kind, "gate") == 0 ? EXP_W1 : strcmp(kind, "down") == 0 ? EXP_W2 : EXP_W3;
+        }
+    }
+    if (!e.is_expert &&
+        sscanf(name, "dspark.%d.ffn_%15[^_]_exps.weight%n", &layer, kind, &rest) == 2
+        && rest == (int)strlen(name))
+    {
+        if (strcmp(kind, "gate") == 0 || strcmp(kind, "down") == 0 || strcmp(kind, "up") == 0) {
+            e.is_expert = true;
+            e.is_dspark = true;
             e.layer = layer;
             e.part = strcmp(kind, "gate") == 0 ? EXP_W1 : strcmp(kind, "down") == 0 ? EXP_W2 : EXP_W3;
         }
@@ -954,7 +969,65 @@ static const name_map layer_map[] = {
     { "ffn_gate_tid2eid.weight",          "ffn.gate.tid2eid" },
 };
 
+/* DSpark is published inside the DeepSeek V4 checkpoint under mtp.0..2, but
+ * its sidecar GGUF deliberately uses a distinct dspark.* namespace.  This
+ * prevents the three-block semi-autoregressive module from being mistaken for
+ * the older one-block MTP support model already understood by ds4. */
+static const name_map dspark_map[] = {
+    { "main_proj.weight",          "main_proj.weight" },
+    { "main_norm.weight",          "main_norm.weight" },
+    { "hc_attn_base.weight",       "hc_attn_base" },
+    { "hc_attn_fn.weight",         "hc_attn_fn" },
+    { "hc_attn_scale.weight",      "hc_attn_scale" },
+    { "attn_norm.weight",          "attn_norm.weight" },
+    { "attn_q_a.weight",           "attn.wq_a.weight" },
+    { "attn_q_a_norm.weight",      "attn.q_norm.weight" },
+    { "attn_q_b.weight",           "attn.wq_b.weight" },
+    { "attn_kv.weight",            "attn.wkv.weight" },
+    { "attn_kv_a_norm.weight",     "attn.kv_norm.weight" },
+    { "attn_sinks.weight",         "attn.attn_sink" },
+    { "attn_output_a.weight",      "attn.wo_a.weight" },
+    { "attn_output_b.weight",      "attn.wo_b.weight" },
+    { "hc_ffn_base.weight",        "hc_ffn_base" },
+    { "hc_ffn_fn.weight",          "hc_ffn_fn" },
+    { "hc_ffn_scale.weight",       "hc_ffn_scale" },
+    { "ffn_norm.weight",           "ffn_norm.weight" },
+    { "ffn_gate_inp.weight",       "ffn.gate.weight" },
+    { "exp_probs_b.bias",          "ffn.gate.bias" },
+    { "ffn_gate_shexp.weight",     "ffn.shared_experts.w1.weight" },
+    { "ffn_down_shexp.weight",     "ffn.shared_experts.w2.weight" },
+    { "ffn_up_shexp.weight",       "ffn.shared_experts.w3.weight" },
+    { "hc_head_base.weight",       "hc_head_base" },
+    { "hc_head_fn.weight",         "hc_head_fn" },
+    { "hc_head_scale.weight",      "hc_head_scale" },
+    { "norm.weight",               "norm.weight" },
+    { "markov_w1.weight",          "markov_head.markov_w1.weight" },
+    { "markov_w2.weight",          "markov_head.markov_w2.weight" },
+    { "confidence_proj.weight",    "confidence_head.proj.weight" },
+};
+
+static char *hf_name_for_dspark_regular(const char *gguf_name) {
+    int layer = -1;
+    int prefix = 0;
+    if (sscanf(gguf_name, "dspark.%d.%n", &layer, &prefix) != 1 ||
+        layer < 0 || layer >= 3 || prefix <= 0)
+    {
+        return NULL;
+    }
+    const char *rest = gguf_name + prefix;
+    for (size_t i = 0; i < sizeof(dspark_map) / sizeof(dspark_map[0]); i++) {
+        if (strcmp(rest, dspark_map[i].gguf) == 0) {
+            char buf[512];
+            snprintf(buf, sizeof(buf), "mtp.%d.%s", layer, dspark_map[i].hf);
+            return xstrdup(buf);
+        }
+    }
+    return NULL;
+}
+
 static char *hf_name_for_regular(const char *gguf_name) {
+    char *dspark_name = hf_name_for_dspark_regular(gguf_name);
+    if (dspark_name) return dspark_name;
     for (size_t i = 0; i < sizeof(top_map) / sizeof(top_map[0]); i++) {
         if (strcmp(gguf_name, top_map[i].gguf) == 0) return xstrdup(top_map[i].hf);
     }
@@ -1151,7 +1224,13 @@ static size_t tensor_nbytes(ds4q_type type, const int64_t *ne, int n_dims) {
 }
 
 static void check_reversed_shape(const char *gguf_name, const st_info *info, const tensor_meta *tmpl) {
-    int nd = tensor_n_dims(tmpl);
+    /* Prefer the rank recorded in the template.  Existing GGUF templates may
+     * carry padding dimensions of size one, so retain the historical trimmed
+     * form only as a compatibility fallback.  This matters for DSpark's
+     * confidence projection: HF stores the Linear(4352, 1) weight as [1,
+     * 4352], and the synthetic GGUF intentionally preserves it as [4352, 1]. */
+    int nd = tmpl->n_dims;
+    if (info->n_dims != nd) nd = tensor_n_dims(tmpl);
     if (info->n_dims != nd) {
         fprintf(stderr, "error: rank mismatch for %s\n", gguf_name);
         exit(1);
@@ -1223,7 +1302,11 @@ typedef struct {
 
 static void generate_one_expert(expert_job *j, int xid) {
     char prefix[256];
-    snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
+    if (j->expert.is_dspark) {
+        snprintf(prefix, sizeof(prefix), "mtp.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
+    } else {
+        snprintf(prefix, sizeof(prefix), "layers.%d.ffn.experts.%d.%s", j->expert.layer, xid, j->wid);
+    }
     char weight_name[320];
     char scale_name[320];
     snprintf(weight_name, sizeof(weight_name), "%s.weight", prefix);
@@ -1549,6 +1632,151 @@ static gguf_file load_gguf_metadata(const char *path) {
     return g;
 }
 
+enum {
+    DSPARK_N_BLOCK = 3,
+    DSPARK_N_EMBD = 4096,
+    DSPARK_N_HC = 4,
+    DSPARK_HC_MIX = 24,
+    DSPARK_N_HEAD = 64,
+    DSPARK_N_HEAD_DIM = 512,
+    DSPARK_N_Q_RANK = 1024,
+    DSPARK_N_OUT_LOW = 8192,
+    DSPARK_N_EXPERT = 256,
+    DSPARK_N_EXPERT_FF = 2048,
+    DSPARK_N_VOCAB = 129280,
+    DSPARK_MARKOV_RANK = 256,
+};
+
+static void dspark_template_add(
+        gguf_file  *g,
+        const char *name,
+        ds4q_type   type,
+        int         n_dims,
+        int64_t     d0,
+        int64_t     d1,
+        int64_t     d2) {
+    if (g->n_tensors >= 96) die("internal DSpark sidecar tensor capacity exceeded");
+    tensor_meta *t = &g->tensors[g->n_tensors++];
+    t->name = xstrdup(name);
+    t->type = type;
+    t->n_dims = n_dims;
+    t->ne[0] = d0;
+    t->ne[1] = d1;
+    t->ne[2] = d2;
+    t->size = tensor_nbytes(type, t->ne, n_dims);
+}
+
+static gguf_file build_dspark_sidecar_template(const gguf_file *base) {
+    gguf_file g = {0};
+    g.path = xstrdup(base && base->path ? base->path : "dspark-sidecar");
+    g.version = base && base->version ? base->version : 3;
+    g.alignment = base && base->alignment ? base->alignment : DS4_GGUF_DEFAULT_ALIGNMENT;
+    /* A support model has no tokenizer or target-model configuration of its
+     * own.  Keep only alignment metadata so the sidecar stays small and can be
+     * generated without access to an existing 80+ GiB target GGUF. */
+    const char *alignment_key = "general.alignment";
+    const uint64_t key_len = strlen(alignment_key);
+    g.n_kv = 1;
+    g.kv_raw_len = sizeof(uint64_t) + (size_t)key_len + sizeof(uint32_t) + sizeof(uint32_t);
+    g.kv_raw = xmalloc(g.kv_raw_len);
+    size_t kvp = 0;
+    memcpy(g.kv_raw + kvp, &key_len, sizeof(key_len)); kvp += sizeof(key_len);
+    memcpy(g.kv_raw + kvp, alignment_key, (size_t)key_len); kvp += (size_t)key_len;
+    const uint32_t kv_type = GGUF_TYPE_UINT32;
+    const uint32_t kv_alignment = (uint32_t)g.alignment;
+    memcpy(g.kv_raw + kvp, &kv_type, sizeof(kv_type)); kvp += sizeof(kv_type);
+    memcpy(g.kv_raw + kvp, &kv_alignment, sizeof(kv_alignment)); kvp += sizeof(kv_alignment);
+    if (kvp != g.kv_raw_len) die("internal DSpark metadata size mismatch");
+    g.n_experts = DSPARK_N_EXPERT;
+    g.tensors = xcalloc(96, sizeof(g.tensors[0]));
+
+    char n[160];
+#define DSPARK_ADD(suffix_, type_, nd_, d0_, d1_, d2_) do { \
+        snprintf(n, sizeof(n), "dspark.%u.%s", b, (suffix_)); \
+        dspark_template_add(&g, n, (type_), (nd_), (d0_), (d1_), (d2_)); \
+    } while (0)
+
+    for (unsigned b = 0; b < DSPARK_N_BLOCK; b++) {
+        if (b == 0) {
+            DSPARK_ADD("main_proj.weight", DS4Q_TYPE_Q8_0, 2,
+                       3 * DSPARK_N_EMBD, DSPARK_N_EMBD, 0);
+            DSPARK_ADD("main_norm.weight", DS4Q_TYPE_F32, 1,
+                       DSPARK_N_EMBD, 0, 0);
+        }
+
+        DSPARK_ADD("hc_attn_base.weight", DS4Q_TYPE_F32, 1,
+                   DSPARK_HC_MIX, 0, 0);
+        DSPARK_ADD("hc_attn_fn.weight", DS4Q_TYPE_F16, 2,
+                   DSPARK_N_HC * DSPARK_N_EMBD, DSPARK_HC_MIX, 0);
+        DSPARK_ADD("hc_attn_scale.weight", DS4Q_TYPE_F32, 1, 3, 0, 0);
+        DSPARK_ADD("attn_norm.weight", DS4Q_TYPE_F32, 1,
+                   DSPARK_N_EMBD, 0, 0);
+        DSPARK_ADD("attn_q_a.weight", DS4Q_TYPE_Q8_0, 2,
+                   DSPARK_N_EMBD, DSPARK_N_Q_RANK, 0);
+        DSPARK_ADD("attn_q_a_norm.weight", DS4Q_TYPE_F32, 1,
+                   DSPARK_N_Q_RANK, 0, 0);
+        DSPARK_ADD("attn_q_b.weight", DS4Q_TYPE_Q8_0, 2,
+                   DSPARK_N_Q_RANK, DSPARK_N_HEAD * DSPARK_N_HEAD_DIM, 0);
+        DSPARK_ADD("attn_kv.weight", DS4Q_TYPE_Q8_0, 2,
+                   DSPARK_N_EMBD, DSPARK_N_HEAD_DIM, 0);
+        DSPARK_ADD("attn_kv_a_norm.weight", DS4Q_TYPE_F32, 1,
+                   DSPARK_N_HEAD_DIM, 0, 0);
+        DSPARK_ADD("attn_sinks.weight", DS4Q_TYPE_F32, 1,
+                   DSPARK_N_HEAD, 0, 0);
+        DSPARK_ADD("attn_output_a.weight", DS4Q_TYPE_Q8_0, 2,
+                   DSPARK_N_HEAD_DIM * (DSPARK_N_HEAD / 8), DSPARK_N_OUT_LOW, 0);
+        DSPARK_ADD("attn_output_b.weight", DS4Q_TYPE_Q8_0, 2,
+                   DSPARK_N_OUT_LOW, DSPARK_N_EMBD, 0);
+
+        DSPARK_ADD("hc_ffn_base.weight", DS4Q_TYPE_F32, 1,
+                   DSPARK_HC_MIX, 0, 0);
+        DSPARK_ADD("hc_ffn_fn.weight", DS4Q_TYPE_F16, 2,
+                   DSPARK_N_HC * DSPARK_N_EMBD, DSPARK_HC_MIX, 0);
+        DSPARK_ADD("hc_ffn_scale.weight", DS4Q_TYPE_F32, 1, 3, 0, 0);
+        DSPARK_ADD("ffn_norm.weight", DS4Q_TYPE_F32, 1,
+                   DSPARK_N_EMBD, 0, 0);
+        DSPARK_ADD("ffn_gate_inp.weight", DS4Q_TYPE_F16, 2,
+                   DSPARK_N_EMBD, DSPARK_N_EXPERT, 0);
+        DSPARK_ADD("exp_probs_b.bias", DS4Q_TYPE_F32, 1,
+                   DSPARK_N_EXPERT, 0, 0);
+        DSPARK_ADD("ffn_gate_exps.weight", DS4Q_TYPE_Q4_K, 3,
+                   DSPARK_N_EMBD, DSPARK_N_EXPERT_FF, DSPARK_N_EXPERT);
+        DSPARK_ADD("ffn_down_exps.weight", DS4Q_TYPE_Q4_K, 3,
+                   DSPARK_N_EXPERT_FF, DSPARK_N_EMBD, DSPARK_N_EXPERT);
+        DSPARK_ADD("ffn_up_exps.weight", DS4Q_TYPE_Q4_K, 3,
+                   DSPARK_N_EMBD, DSPARK_N_EXPERT_FF, DSPARK_N_EXPERT);
+        DSPARK_ADD("ffn_gate_shexp.weight", DS4Q_TYPE_Q8_0, 2,
+                   DSPARK_N_EMBD, DSPARK_N_EXPERT_FF, 0);
+        DSPARK_ADD("ffn_down_shexp.weight", DS4Q_TYPE_Q8_0, 2,
+                   DSPARK_N_EXPERT_FF, DSPARK_N_EMBD, 0);
+        DSPARK_ADD("ffn_up_shexp.weight", DS4Q_TYPE_Q8_0, 2,
+                   DSPARK_N_EMBD, DSPARK_N_EXPERT_FF, 0);
+
+        if (b == DSPARK_N_BLOCK - 1) {
+            DSPARK_ADD("hc_head_base.weight", DS4Q_TYPE_F32, 1,
+                       DSPARK_N_HC, 0, 0);
+            DSPARK_ADD("hc_head_fn.weight", DS4Q_TYPE_F16, 2,
+                       DSPARK_N_HC * DSPARK_N_EMBD, DSPARK_N_HC, 0);
+            DSPARK_ADD("hc_head_scale.weight", DS4Q_TYPE_F32, 1, 1, 0, 0);
+            DSPARK_ADD("norm.weight", DS4Q_TYPE_F32, 1,
+                       DSPARK_N_EMBD, 0, 0);
+            DSPARK_ADD("markov_w1.weight", DS4Q_TYPE_F16, 2,
+                       DSPARK_MARKOV_RANK, DSPARK_N_VOCAB, 0);
+            DSPARK_ADD("markov_w2.weight", DS4Q_TYPE_F16, 2,
+                       DSPARK_MARKOV_RANK, DSPARK_N_VOCAB, 0);
+            DSPARK_ADD("confidence_proj.weight", DS4Q_TYPE_F16, 2,
+                       DSPARK_N_EMBD + DSPARK_MARKOV_RANK, 1, 0);
+        }
+    }
+#undef DSPARK_ADD
+
+    char **keys = xmalloc((size_t)g.n_tensors * sizeof(keys[0]));
+    for (uint64_t i = 0; i < g.n_tensors; i++) keys[i] = g.tensors[i].name;
+    hmap_build(&g.tensor_map, keys, (int)g.n_tensors);
+    free(keys);
+    return g;
+}
+
 static byte_buf read_gguf_tensor_data(const gguf_file *g, const char *path, const char *name) {
     int idx = hmap_get(&g->tensor_map, name);
     if (idx < 0) {
@@ -1691,14 +1919,16 @@ typedef struct {
     bool dry_run;
     bool overwrite;
     bool imatrix_strict;
+    bool dspark_sidecar;
 } params;
 
 static void usage(const char *argv0) {
-    printf("usage: %s --hf DIR --template MODEL.gguf --out OUT.gguf [options]\n", argv0);
+    printf("usage: %s --hf DIR [--template MODEL.gguf | --dspark-sidecar] --out OUT.gguf [options]\n", argv0);
     printf("\nDeepSeek V4 Flash/Pro safetensors -> GGUF quantizer in plain C.\n\n");
     printf("options:\n");
     printf("  --hf DIR               Hugging Face model directory with model.safetensors.index.json\n");
     printf("  --template FILE        existing DS4 GGUF used for metadata, tensor order, shapes\n");
+    printf("  --dspark-sidecar       synthesize the 3-block V4 Flash DSpark tensor layout\n");
     printf("  --out FILE             output GGUF path\n");
     printf("  --compare-gguf FILE    reference GGUF for --compare-tensor, default template\n");
     printf("  --compare-tensor NAME  regenerate one tensor, byte-compare, and exit\n");
@@ -1754,6 +1984,8 @@ static params parse_args(int argc, char **argv) {
             p.hf_dir = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--template") == 0) {
             p.template_gguf = need_value(argc, argv, &i, arg);
+        } else if (strcmp(arg, "--dspark-sidecar") == 0) {
+            p.dspark_sidecar = true;
         } else if (strcmp(arg, "--out") == 0) {
             p.out_gguf = need_value(argc, argv, &i, arg);
         } else if (strcmp(arg, "--compare-gguf") == 0) {
@@ -1806,9 +2038,12 @@ static params parse_args(int argc, char **argv) {
         }
     }
     if (!p.hf_dir) die("--hf is required");
-    if (!p.template_gguf) die("--template is required");
+    if (!p.template_gguf && !p.dspark_sidecar) die("--template is required unless --dspark-sidecar is used");
     if (!p.dry_run && !p.compare_tensor && !p.out_gguf) die("--out is required unless --dry-run or --compare-tensor is used");
-    if (p.compare_tensor && !p.compare_gguf) p.compare_gguf = p.template_gguf;
+    if (p.compare_tensor && !p.compare_gguf) {
+        if (p.dspark_sidecar) die("--compare-tensor with --dspark-sidecar needs --compare-gguf");
+        p.compare_gguf = p.template_gguf;
+    }
     if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) die("output exists; use --overwrite");
     return p;
 }
@@ -1869,7 +2104,25 @@ int main(int argc, char **argv) {
     imatrix_store imatrix = {0};
     if (p.imatrix_file) imatrix_load(&imatrix, p.imatrix_file, p.imatrix_strict);
 
-    gguf_file tmpl = load_gguf_metadata(p.template_gguf);
+    gguf_file tmpl = {0};
+    if (p.dspark_sidecar) {
+        gguf_file base = {0};
+        if (p.template_gguf) {
+            base = load_gguf_metadata(p.template_gguf);
+        } else {
+            base.path = xstrdup("dspark-sidecar");
+            base.version = 3;
+            base.alignment = DS4_GGUF_DEFAULT_ALIGNMENT;
+        }
+        tmpl = build_dspark_sidecar_template(&base);
+        free_gguf_file(&base);
+        fprintf(stderr,
+                "using synthetic DeepSeek V4 Flash DSpark sidecar layout "
+                "(%" PRIu64 " tensors)\n",
+                tmpl.n_tensors);
+    } else {
+        tmpl = load_gguf_metadata(p.template_gguf);
+    }
     if (p.n_experts <= 0) {
         if (tmpl.n_experts > 0) {
             p.n_experts = tmpl.n_experts;

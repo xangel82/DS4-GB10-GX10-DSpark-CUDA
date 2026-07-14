@@ -94,11 +94,13 @@ typedef struct {
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *dspark_path;
     ds4_backend backend;
     int n_threads;
     uint32_t prefill_chunk;
     int mtp_draft_tokens;
     float mtp_margin;
+    int dspark_draft_tokens;
     const char *directional_steering_file;
     const char *expert_profile_path;
     float directional_steering_attn;
@@ -256,14 +258,33 @@ int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);
 int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
+int ds4_speculative_rejection_sample(const float *target_logits,
+                                     const float *draft_probs,
+                                     int n_vocab,
+                                     float temperature,
+                                     float min_p,
+                                     int draft_token,
+                                     uint64_t *rng,
+                                     bool *accepted);
+int ds4_speculative_rejection_self_test(void);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k);
 int ds4_session_token_logprob(ds4_session *s, int token, ds4_token_score *out);
 int ds4_session_copy_logits(ds4_session *s, float *out, int cap);
 int ds4_session_set_logits(ds4_session *s, const float *logits, int n);
+int ds4_session_materialize_logits(ds4_session *s, char *err, size_t errlen);
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen);
+int ds4_session_eval_greedy(ds4_session *s, int token, int *next_token,
+                            char *err, size_t errlen);
 int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
+                                        int *accepted, int accepted_cap,
+                                        char *err, size_t errlen);
+int ds4_session_eval_speculative_sample(ds4_session *s, int first_token,
+                                        int max_tokens, int eos_token,
+                                        float temperature, int top_k,
+                                        float top_p, float min_p,
+                                        uint64_t *rng,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
@@ -275,6 +296,9 @@ int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
 int ds4_engine_mtp_draft_tokens(ds4_engine *e);
+bool ds4_engine_has_dspark(ds4_engine *e);
+int ds4_engine_dspark_draft_tokens(ds4_engine *e);
+int ds4_engine_spec_draft_tokens(ds4_engine *e);
 const ds4_tokens *ds4_session_tokens(ds4_session *s);
 
 /* Low-level graph slice entry points used by distributed inference.  The
@@ -302,8 +326,11 @@ int ds4_session_eval_output_head_from_hc(ds4_session *s,
 /* Disk KV payload helpers.  HTTP/agent code owns the outer file header and
  * persistence policy; the engine owns the DS4-specific serialized graph state. */
 #define DS4_SESSION_PAYLOAD_MAGIC UINT32_C(0x34565344) /* "DSV4" */
-#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(2)
+#define DS4_SESSION_PAYLOAD_VERSION UINT32_C(3)
 #define DS4_SESSION_PAYLOAD_U32_FIELDS 13u
+#define DS4_SESSION_DSPARK_MAGIC UINT32_C(0x4b505344) /* "DSPK" */
+#define DS4_SESSION_DSPARK_VERSION UINT32_C(1)
+#define DS4_SESSION_DSPARK_U32_FIELDS 6u
 #define DS4_SESSION_LAYER_PAYLOAD_MAGIC UINT32_C(0x4c565344) /* "DSVL" */
 #define DS4_SESSION_LAYER_PAYLOAD_VERSION UINT32_C(1)
 #define DS4_SESSION_LAYER_PAYLOAD_U32_FIELDS 14u

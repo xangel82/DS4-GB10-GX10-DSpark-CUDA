@@ -10370,6 +10370,14 @@ decode_again:
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
     int next_decode_log = 50;
+    const bool device_greedy_request =
+        getenv("DS4_CUDA_GREEDY_ARGMAX") != NULL &&
+        j->req.temperature <= 0.0f &&
+        !ds4_think_mode_enabled(j->req.think_mode) &&
+        !j->req.has_tools &&
+        ds4_engine_spec_draft_tokens(s->engine) <= 1;
+    int device_greedy_next = -1;
+    bool device_greedy_next_valid = false;
     if (max_tokens < 0) max_tokens = 0;
     if (max_tokens > room) max_tokens = room;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
@@ -10399,15 +10407,38 @@ decode_again:
         float top_p = j->req.top_p;
         float min_p = j->req.min_p;
         if (ds4_think_mode_enabled(j->req.think_mode)) {
-            temperature = DS4_DEFAULT_TEMPERATURE;
-            top_k = 0;
-            top_p = DS4_DEFAULT_TOP_P;
-            min_p = DS4_DEFAULT_MIN_P;
+            const bool spec_greedy_think =
+                (getenv("DS4_SPEC_GREEDY_THINK") != NULL ||
+                 getenv("DS4_MTP_GREEDY_THINK") != NULL) &&
+                ds4_engine_spec_draft_tokens(s->engine) > 1;
+            if (spec_greedy_think) {
+                /* The current MTP verifier is correctness-gated for greedy
+                 * decoding.  Thinking mode normally forces the model default
+                 * temperature even when the request asks for zero, which
+                 * silently disables MTP.  Keep deterministic thinking an
+                 * explicit benchmark/production choice. */
+                temperature = 0.0f;
+                top_k = 0;
+                top_p = 1.0f;
+                min_p = 0.0f;
+            } else {
+                temperature = DS4_DEFAULT_TEMPERATURE;
+                top_k = 0;
+                top_p = DS4_DEFAULT_TOP_P;
+                min_p = DS4_DEFAULT_MIN_P;
+            }
         }
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
         }
-        int token = ds4_session_sample(s->session, temperature, top_k, top_p, min_p, &rng);
+        int token = device_greedy_request && device_greedy_next_valid
+            ? device_greedy_next
+            : ds4_session_sample(s->session,
+                                 temperature,
+                                 top_k,
+                                 top_p,
+                                 min_p,
+                                 &rng);
         if (token == ds4_token_eos(s->engine)) {
             finish = "stop";
             break;
@@ -10415,14 +10446,25 @@ decode_again:
 
         int toks[17];
         int ntok = 0;
-        if (temperature <= 0.0f &&
+        const bool use_dspark_spec =
+            ds4_engine_has_dspark(s->engine) &&
+            ds4_engine_dspark_draft_tokens(s->engine) > 0 &&
+            getenv("DS4_DSPARK_SPEC_DISABLE") == NULL;
+        const bool use_mtp_spec =
+            temperature <= 0.0f &&
+            ds4_engine_has_mtp(s->engine) &&
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
-            getenv("DS4_MTP_SPEC_DISABLE") == NULL)
-        {
-            ntok = ds4_session_eval_speculative_argmax(s->session,
+            getenv("DS4_MTP_SPEC_DISABLE") == NULL;
+        if (use_dspark_spec || use_mtp_spec) {
+            ntok = ds4_session_eval_speculative_sample(s->session,
                                                        token,
                                                        max_tokens - completion,
                                                        ds4_token_eos(s->engine),
+                                                       temperature,
+                                                       top_k,
+                                                       top_p,
+                                                       min_p,
+                                                       &rng,
                                                        toks,
                                                        (int)(sizeof(toks) / sizeof(toks[0])),
                                                        err,
@@ -10432,7 +10474,21 @@ decode_again:
                 break;
             }
         } else {
-            if (ds4_session_eval(s->session, token, err, sizeof(err)) != 0) {
+            int eval_rc;
+            if (device_greedy_request) {
+                eval_rc = ds4_session_eval_greedy(s->session,
+                                                  token,
+                                                  &device_greedy_next,
+                                                  err,
+                                                  sizeof(err));
+                device_greedy_next_valid = eval_rc == 0;
+            } else {
+                eval_rc = ds4_session_eval(s->session,
+                                           token,
+                                           err,
+                                           sizeof(err));
+            }
+            if (eval_rc != 0) {
                 finish = "error";
                 break;
             }
@@ -10722,6 +10778,7 @@ decode_again:
                             &last_decode_log_t,
                             &last_decode_log_completion);
     }
+    const double decode_elapsed = now_sec() - decode_t0;
 
     if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {
         char *tail = xstrndup(text.ptr + plain_stream_pos, text.len - plain_stream_pos);
@@ -10967,6 +11024,17 @@ decode_again:
                        &parsed_calls, final_finish,
                        prompt_tokens, completion);
     }
+    server_log(DS4_LOG_GENERATION,
+               "ds4-server: decode summary req=%s kind=%s prompt=%d gen=%d "
+               "seconds=%.6f tps=%.3f greedy_gpu=%d finish=%s",
+               id,
+               j->req.kind == REQ_CHAT ? "chat" : "completion",
+               prompt_tokens,
+               completion,
+               decode_elapsed,
+               decode_elapsed > 0.0 ? (double)completion / decode_elapsed : 0.0,
+               device_greedy_request ? 1 : 0,
+               final_finish);
     if (j->req.kind == REQ_CHAT && j->req.has_tools) {
         char flags[80];
         log_flags(flags, sizeof(flags),
@@ -11517,6 +11585,7 @@ static server_config parse_options(int argc, char **argv) {
             .backend = default_server_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
+            .dspark_draft_tokens = 5,
         },
         .host = "127.0.0.1",
         .port = 8000,
@@ -11556,6 +11625,10 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark")) {
+            c.engine.dspark_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark-draft")) {
+            c.engine.dspark_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {

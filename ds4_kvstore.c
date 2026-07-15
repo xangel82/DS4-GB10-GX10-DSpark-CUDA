@@ -55,6 +55,11 @@
  * density to evict them. */
 #define KV_CACHE_ANCHOR_REASON_SCORE_FACTOR 2.0
 
+static bool kv_cache_keep_long_text_hits(void) {
+    const char *v = getenv("DS4_KV_KEEP_LONG_TEXT_HITS");
+    return v && v[0] && strcmp(v, "0") != 0;
+}
+
 typedef struct {
     char *ptr;
     size_t len;
@@ -747,6 +752,16 @@ int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
     return live_tokens;
 }
 
+/* Return the last aligned frontier at or before live_tokens without changing
+ * the next continued-store schedule.  canonical-only uses this only for
+ * diagnostics and keeps the durable checkpoint at the exact full prompt. */
+int ds4_kvstore_continued_floor_target(const ds4_kvstore *kc, int live_tokens) {
+    const int step = kv_cache_continued_step(kc);
+    if (step <= 0 || live_tokens < kc->opt.min_tokens) return 0;
+    const int target = live_tokens - live_tokens % step;
+    return target >= kc->opt.min_tokens ? target : 0;
+}
+
 void ds4_kvstore_note_store(ds4_kvstore *kc, int tokens) {
     if (tokens > kc->continued_last_store_tokens) {
         kc->continued_last_store_tokens = tokens;
@@ -1319,7 +1334,9 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
         kc->continued_last_store_tokens = loaded;
         const char *key_kind = ds4_kvstore_key_kind(hdr.ext_flags);
         bool consumed = false;
-        if (kc->opt.cold_max_tokens > 0 && loaded > kc->opt.cold_max_tokens) {
+        if (kc->opt.cold_max_tokens > 0 &&
+            loaded > kc->opt.cold_max_tokens &&
+            !kv_cache_keep_long_text_hits()) {
             unlink(path);
             consumed = true;
             kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,

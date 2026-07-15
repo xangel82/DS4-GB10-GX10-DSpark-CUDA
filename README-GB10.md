@@ -644,6 +644,38 @@ Con contesto `131072` sono stati riportati circa 3.112 MiB di context buffer.
 Bisogna quindi lasciare margine oltre agli 80,76 GiB del modello e alle cache
 di pesi.
 
+### Persistenza KV `canonical-only` e retry
+
+Il percorso scelto per Athena è `canonical-only`: il prefill viene completato,
+poi la frontiera completa del prompt viene salvata una sola volta con la chiave
+testuale canonica della richiesta, e infine inizia il decode. Non vengono
+serializzate frontiere intermedie `continued` durante il prefill.
+
+Se una scrittura SSE fallisce, i token già prodotti ma non consegnati al client
+non vengono salvati come nuova risposta e il server non tenta un rewind CUDA nel
+job fallito. Viene armato un guard one-shot; soltanto il retry identico può
+caricare il checkpoint canonico completo e ripartire senza ripetere il prefill.
+Il guard confronta API, tipo richiesta, lunghezza token e SHA-1 del prompt, e
+viene consumato anche da una richiesta non corrispondente.
+
+Log attesi:
+
+```text
+kv canonical prefill checkpoint tokens=... persisted=1
+stream-failure deferred restore ... abandoned_tail=...
+stream retry guard consumed matched=1 ...
+stream retry selecting canonical disk restore ...
+```
+
+Configurazione predefinita:
+
+```text
+DS4_KV_PREFILL_CHECKPOINT_POLICY=canonical-only
+DS4_KV_CANONICAL_LONG_PREFILL=1
+DS4_KV_CANONICAL_PREFILL_MIN_SEC=30
+DS4_KV_KEEP_LONG_TEXT_HITS=1
+```
+
 ## Deploy dal Mac senza toccare l'installazione originale
 
 Il comando compatibile con il `rsync` incluso in macOS è già raccolto nello

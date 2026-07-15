@@ -12,6 +12,7 @@ THREADS="${DS4_THREADS:-10}"
 PORT="${DS4_PORT:-30007}"
 DRAFT="${DS4_DSPARK_DRAFT:-5}"
 TELEMETRY="${DS4_TELEMETRY:-0}"
+PREFILL_POLICY="${DS4_KV_PREFILL_CHECKPOINT_POLICY:-canonical-only}"
 
 if [[ ! -f "$MODEL" ]]; then
   echo "Main model not found: $MODEL" >&2
@@ -23,6 +24,11 @@ if [[ ! -f "$DSPARK" ]]; then
   exit 2
 fi
 mkdir -p "$KV_DIR"
+
+case "$PREFILL_POLICY" in
+  canonical-only|coalesced|legacy) ;;
+  *) echo "Invalid DS4_KV_PREFILL_CHECKPOINT_POLICY: $PREFILL_POLICY" >&2; exit 2 ;;
+esac
 
 export DS4_CUDA_COPY_MODEL=1
 export DS4_CUDA_WEIGHT_CACHE_LIMIT_GB="${DS4_CUDA_WEIGHT_CACHE_LIMIT_GB:-112}"
@@ -38,6 +44,12 @@ export DS4_CUDA_TOKEN_GRAPH=1
 export DS4_CUDA_DSPARK_GRAPH=1
 export DS4_CUDA_COALESCED_F16_MATMUL=1
 export DS4_CUDA_Q8_U16_LOADS=1
+# Long retries must find the exact full-prompt checkpoint even when the prompt
+# exceeds cold_max_tokens.  canonical-only writes no intermediate frontiers.
+export DS4_KV_KEEP_LONG_TEXT_HITS="${DS4_KV_KEEP_LONG_TEXT_HITS:-1}"
+export DS4_KV_PREFILL_CHECKPOINT_POLICY="$PREFILL_POLICY"
+export DS4_KV_CANONICAL_LONG_PREFILL="${DS4_KV_CANONICAL_LONG_PREFILL:-1}"
+export DS4_KV_CANONICAL_PREFILL_MIN_SEC="${DS4_KV_CANONICAL_PREFILL_MIN_SEC:-30}"
 if [[ "${DS4_CUDA_DSPARK_TENSOR_CORES:-1}" == "1" ]]; then
   export DS4_CUDA_DSPARK_TENSOR_CORES=1
   export DS4_CUDA_DSPARK_TC_PAD_N="${DS4_CUDA_DSPARK_TC_PAD_N:-8}"
@@ -104,6 +116,7 @@ fi
 echo "Target: $MODEL"
 echo "DSpark: $DSPARK (draft=$DRAFT)"
 echo "Cache:  Q8->F16=${DS4_CUDA_Q8_F16_CACHE_MB} MiB, weight limit=${DS4_CUDA_WEIGHT_CACHE_LIMIT_GB} GiB"
+echo "KV:     policy=$DS4_KV_PREFILL_CHECKPOINT_POLICY keep-long-text-hits=$DS4_KV_KEEP_LONG_TEXT_HITS canonical-min-sec=$DS4_KV_CANONICAL_PREFILL_MIN_SEC"
 echo "DSpark scheduler: full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY"
 echo "DSpark sampling: lossless p/q rejection for top_k=0 top_p=1 min-p policy (rollback DS4_DSPARK_REJECTION_DISABLE=1)"
 echo "GB10 verifier: Q8 batch-reuse=${DS4_CUDA_Q8_BATCH_REUSE:-0}, Q4-sidecar direct-MoE=${DS4_CUDA_MOE_TINY_DIRECT_Q4_ONLY:-0}, tiny-TC=${DS4_CUDA_DSPARK_TENSOR_CORES:-0}, tiny-TC-Q8=${DS4_CUDA_DSPARK_TENSOR_CORES_Q8:-0}"

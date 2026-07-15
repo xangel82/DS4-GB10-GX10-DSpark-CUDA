@@ -7733,6 +7733,14 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    /* One-shot authorization for restoring the canonical pre-decode
+     * checkpoint after a failed streaming write.  The exact prompt identity
+     * prevents an unrelated client from rewinding the live session. */
+    bool stream_retry_guard_valid;
+    req_kind stream_retry_guard_kind;
+    api_style stream_retry_guard_api;
+    int stream_retry_guard_tokens;
+    char stream_retry_guard_prompt_sha[41];
 };
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
@@ -7746,6 +7754,43 @@ struct job {
     pthread_cond_t cv;
     job *next;
 };
+
+static void stream_retry_guard_arm(server *s, const request *r) {
+    if (!s) return;
+    s->stream_retry_guard_valid = false;
+    if (!r || !r->prompt_text || !r->prompt_text[0] || r->prompt.len <= 0) return;
+    s->stream_retry_guard_kind = r->kind;
+    s->stream_retry_guard_api = r->api;
+    s->stream_retry_guard_tokens = r->prompt.len;
+    ds4_kvstore_sha1_bytes_hex(r->prompt_text, strlen(r->prompt_text),
+                               s->stream_retry_guard_prompt_sha);
+    s->stream_retry_guard_valid = true;
+}
+
+/* Consume the guard even on mismatch.  This makes it one-shot and prevents a
+ * later unrelated request from inheriting permission to discard live state. */
+static bool stream_retry_guard_consume(server *s, const request *r,
+                                       bool *guard_was_armed) {
+    if (guard_was_armed) *guard_was_armed = false;
+    if (!s || !s->stream_retry_guard_valid) return false;
+    if (guard_was_armed) *guard_was_armed = true;
+    const req_kind expected_kind = s->stream_retry_guard_kind;
+    const api_style expected_api = s->stream_retry_guard_api;
+    const int expected_tokens = s->stream_retry_guard_tokens;
+    char expected_sha[41];
+    memcpy(expected_sha, s->stream_retry_guard_prompt_sha, sizeof(expected_sha));
+    s->stream_retry_guard_valid = false;
+    if (!r || !r->prompt_text || r->kind != expected_kind ||
+        r->api != expected_api || r->prompt.len != expected_tokens) return false;
+    char incoming_sha[41];
+    ds4_kvstore_sha1_bytes_hex(r->prompt_text, strlen(r->prompt_text), incoming_sha);
+    return memcmp(incoming_sha, expected_sha, sizeof(expected_sha)) == 0;
+}
+
+static bool stream_retry_should_restore_disk(bool authorized, int common,
+                                             int prompt_tokens, int live_tokens) {
+    return authorized && common == prompt_tokens && live_tokens > common;
+}
 
 /* =========================================================================
  * Tool Call Text Memory.
@@ -8765,6 +8810,26 @@ static void kv_cache_store_current(server *s, const char *reason) {
     }
 }
 
+/* A failed SSE request may have a few valid-but-undelivered tokens after the
+ * prompt checkpoint.  Do not rewind CUDA/DSpark in the failed job: leave the
+ * live tail untouched and let the exact retry restore the canonical snapshot
+ * from disk. */
+static void kv_cache_defer_stream_failed_prompt(server *s,
+                                                const ds4_tokens *prompt,
+                                                const char *ctx,
+                                                bool canonical_saved) {
+    if (!s || !prompt) return;
+    const int live = ds4_session_pos(s->session);
+    thinking_live_clear(s);
+    responses_live_clear(s);
+    anthropic_live_clear(s);
+    server_log(canonical_saved ? DS4_LOG_KVCACHE : DS4_LOG_WARNING,
+               "ds4-server: stream-failure deferred restore ctx=%s live=%d prompt=%d abandoned_tail=%d canonical=%d",
+               ctx ? ctx : "?", live, prompt->len,
+               live > prompt->len ? live - prompt->len : 0,
+               canonical_saved ? 1 : 0);
+}
+
 static void kv_cache_note_store(kv_disk_cache *kc, int tokens) {
     ds4_kvstore_note_store(kc, tokens);
 }
@@ -9332,7 +9397,20 @@ typedef struct {
     bool headers_sent;
     bool stream_failed;
     double last_keepalive;
+    bool kv_canonical_only;
 } server_prefill_progress;
+
+typedef enum {
+    KV_PREFILL_POLICY_COALESCED,
+    KV_PREFILL_POLICY_CANONICAL_ONLY,
+    KV_PREFILL_POLICY_LEGACY,
+} kv_prefill_policy;
+
+static kv_prefill_policy kv_prefill_policy_parse(const char *name) {
+    if (name && !strcmp(name, "canonical-only")) return KV_PREFILL_POLICY_CANONICAL_ONLY;
+    if (name && !strcmp(name, "legacy")) return KV_PREFILL_POLICY_LEGACY;
+    return KV_PREFILL_POLICY_COALESCED;
+}
 
 static void request_ctx_span(char *buf, size_t len, int cached, int prompt) {
     int suffix = prompt - cached;
@@ -9656,7 +9734,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (is_display) return;
     double elapsed = now - p->t0;
     if (p->seen && current == p->last_current) {
-        if (p->srv && current > p->cached_tokens) {
+        if (p->srv && current > p->cached_tokens && !p->kv_canonical_only) {
             kv_cache_maybe_store_continued(p->srv);
         }
         return;
@@ -9697,7 +9775,7 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                chunk_tps,
                avg_tps,
                elapsed);
-    if (p->srv && current > p->cached_tokens) {
+    if (p->srv && current > p->cached_tokens && !p->kv_canonical_only) {
         kv_cache_maybe_store_continued(p->srv);
     }
 }
@@ -9993,6 +10071,16 @@ static void generate_job(server *s, job *j) {
     err[0] = '\0';
     const int old_pos = ds4_session_pos(s->session);
     const int common = ds4_session_common_prefix(s->session, &j->req.prompt);
+    bool retry_guard_was_armed = false;
+    const bool stream_retry_authorized = stream_retry_guard_consume(
+        s, &j->req, &retry_guard_was_armed);
+    const bool stream_retry_force_disk = stream_retry_should_restore_disk(
+        stream_retry_authorized, common, j->req.prompt.len, old_pos);
+    if (retry_guard_was_armed) {
+        server_log(stream_retry_authorized ? DS4_LOG_KVCACHE : DS4_LOG_WARNING,
+                   "ds4-server: stream retry guard consumed matched=%d prompt=%d",
+                   stream_retry_authorized ? 1 : 0, j->req.prompt.len);
+    }
     trace_cache_diag cache_diag = {0};
     trace_cache_capture(&cache_diag, ds4_session_tokens(s->session),
                         &j->req.prompt, old_pos, common);
@@ -10060,11 +10148,11 @@ static void generate_job(server *s, job *j) {
         http_error(j->fd, s->enable_cors, 409,
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
-    } else if (cached == 0) {
+    } else if (cached == 0 && !stream_retry_force_disk) {
         cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
         cache_source = cached > 0 ? "memory-token" : "none";
     }
-    if (cached == 0) {
+    if (cached == 0 && !stream_retry_force_disk) {
         int thinking_cached =
             thinking_live_visible_prefix_prompt(s, &j->req, old_pos,
                                                 &effective_prompt);
@@ -10078,7 +10166,7 @@ static void generate_job(server *s, job *j) {
     int disk_cached = 0;
     char *disk_cache_path = NULL;
     uint8_t disk_cache_ext_flags = 0;
-    if (cached == 0) {
+    if (cached == 0 && !stream_retry_force_disk) {
         int text_cached = live_text_prefix_prompt(s, &j->req, &effective_prompt);
         if (text_cached > 0) {
             cached = text_cached;
@@ -10094,7 +10182,8 @@ static void generate_job(server *s, job *j) {
                    trace_cache_miss_reason(&cache_diag));
     }
     if (cached == 0) s->kv.continued_last_store_tokens = 0;
-    if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
+    if (s->kv.enabled && cached == 0 && !stream_retry_force_disk &&
+        old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
@@ -10109,6 +10198,17 @@ static void generate_job(server *s, job *j) {
             cache_source = "disk-text";
             prompt_for_sync = &effective_prompt;
         }
+    }
+    if (stream_retry_force_disk && disk_cached == 0) {
+        ds4_session_invalidate(s->session);
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: stream retry canonical restore miss; falling back to cold prefill prompt=%d",
+                   j->req.prompt.len);
+    }
+    if (stream_retry_force_disk) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: stream retry selecting canonical disk restore prompt=%d abandoned_tail=%d",
+                   common, old_pos - common);
     }
     const bool responses_reasoning_state_preserved =
         cached > 0 &&
@@ -10144,7 +10244,15 @@ static void generate_job(server *s, job *j) {
         .stream = j->req.stream,
         .enable_cors = s->enable_cors,
     };
+    const char *kv_policy_env = getenv("DS4_KV_PREFILL_CHECKPOINT_POLICY");
+    const kv_prefill_policy kv_policy = kv_prefill_policy_parse(kv_policy_env);
+    progress.kv_canonical_only = kv_policy == KV_PREFILL_POLICY_CANONICAL_ONLY;
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
+    if (progress.kv_canonical_only && s->kv.enabled && prompt_tokens > cached) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv prefill checkpoints policy=canonical-only cached=%d prompt=%d intermediate=0",
+                   cached, prompt_tokens);
+    }
     char req_flags[64];
     log_flags(req_flags, sizeof(req_flags), responses_protocol,
               j->req.has_tools, false, false, false);
@@ -10207,7 +10315,7 @@ static void generate_job(server *s, job *j) {
                          anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
     }
     int suppressed_continued_last = -1;
-    if (cold_store_len >= s->kv.opt.min_tokens) {
+    if (!progress.kv_canonical_only && cold_store_len >= s->kv.opt.min_tokens) {
         /* A cold checkpoint can land exactly on the continued-checkpoint
          * frontier.  The prefill progress callback would then write the same
          * prefix as "continued" while we are intentionally stopping there to
@@ -10268,14 +10376,38 @@ static void generate_job(server *s, job *j) {
     if (!thinking_live_continuation) thinking_live_clear(s);
     ds4_session_set_progress(s->session, NULL, NULL);
     ds4_session_set_display_progress(s->session, NULL, NULL);
-    kv_cache_maybe_store_continued(s);
+    bool canonical_prefill_saved = false;
+    const char *canonical_enabled_env = getenv("DS4_KV_CANONICAL_LONG_PREFILL");
+    const bool canonical_enabled = !canonical_enabled_env ||
+        strcmp(canonical_enabled_env, "0") != 0;
+    const char *canonical_min_env = getenv("DS4_KV_CANONICAL_PREFILL_MIN_SEC");
+    double canonical_min_sec = canonical_min_env ? strtod(canonical_min_env, NULL) : 30.0;
+    if (canonical_min_sec < 0.0) canonical_min_sec = 0.0;
+    const double prefill_elapsed = now_sec() - t0;
+    if (canonical_enabled && s->kv.enabled &&
+        (progress.kv_canonical_only || prefill_elapsed >= canonical_min_sec) &&
+        prompt_tokens >= s->kv.opt.min_tokens &&
+        j->req.prompt_text && j->req.prompt_text[0])
+    {
+        /* This is the sole durable checkpoint for canonical-only: exact full
+         * request text, complete prompt frontier, immediately before decode. */
+        canonical_prefill_saved = kv_cache_store_live_prefix_text(
+            s, prompt_for_sync, prompt_tokens, "continued",
+            j->req.prompt_text, responses_protocol ? KV_EXT_RESPONSES_VISIBLE : 0,
+            "prefill-complete");
+        if (canonical_prefill_saved) kv_cache_note_store(&s->kv, prompt_tokens);
+        server_log(canonical_prefill_saved ? DS4_LOG_KVCACHE : DS4_LOG_WARNING,
+                   "ds4-server: kv canonical prefill checkpoint tokens=%d elapsed=%.3fs persisted=%d",
+                   prompt_tokens, prefill_elapsed, canonical_prefill_saved ? 1 : 0);
+    }
+    if (!progress.kv_canonical_only) kv_cache_maybe_store_continued(s);
     server_log(DS4_LOG_PREFILL,
                "ds4-server: %s ctx=%s%s%s prompt done %.3fs",
                j->req.kind == REQ_CHAT ? "chat" : "completion",
                ctx_span,
                req_flags[0] ? " " : "",
                req_flags,
-               now_sec() - t0);
+               prefill_elapsed);
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
             kv_cache_note_store(&s->kv, cold_store_len);
@@ -10399,7 +10531,8 @@ decode_again:
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
-        if (!(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
+        if (!progress.kv_canonical_only &&
+            !(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
             kv_cache_maybe_store_continued(s);
         }
         float temperature = j->req.temperature;
@@ -10780,9 +10913,16 @@ decode_again:
     }
     const double decode_elapsed = now_sec() - decode_t0;
 
-    if (j->req.stream && !structured_stream && text.len > plain_stream_pos) {
+    bool stream_write_failed = j->req.stream && !strcmp(finish, "error") &&
+        !strcmp(err, "client stream write failed");
+    if (j->req.stream && !stream_write_failed &&
+        !structured_stream && text.len > plain_stream_pos) {
         char *tail = xstrndup(text.ptr + plain_stream_pos, text.len - plain_stream_pos);
-        if (!sse_chunk(j->fd, &j->req, id, tail, NULL)) finish = "error";
+        if (!sse_chunk(j->fd, &j->req, id, tail, NULL)) {
+            finish = "error";
+            snprintf(err, sizeof(err), "client stream write failed");
+            stream_write_failed = true;
+        }
         free(tail);
     }
 
@@ -10791,7 +10931,7 @@ decode_again:
     char *parsed_reasoning = NULL;
     const char *final_finish = finish;
     bool recovered_tool_parse_failure = false;
-    if (j->req.kind == REQ_CHAT) {
+    if (j->req.kind == REQ_CHAT && !stream_write_failed) {
         bool parsed_ok = parse_generated_message_for_response(
             text.ptr ? text.ptr : "",
             j->req.has_tools,
@@ -10963,7 +11103,7 @@ decode_again:
         thinking_live_clear(s);
     }
 
-    if (j->req.stream) {
+    if (j->req.stream && !stream_write_failed) {
         bool response_ok = true;
         if (j->req.api == API_ANTHROPIC) {
             response_ok = anthropic_sse_finish_live(j->fd, s, &j->req, id, &anthropic_live,
@@ -10998,6 +11138,10 @@ decode_again:
                           sse_done(j->fd, &j->req, id, prompt_tokens, completion);
         }
         if (!response_ok) {
+            finish = "error";
+            final_finish = "error";
+            snprintf(err, sizeof(err), "client stream write failed");
+            stream_write_failed = true;
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: %s ctx=%s%s%s final stream failed",
                        j->req.kind == REQ_CHAT ? "chat" : "completion",
@@ -11005,24 +11149,30 @@ decode_again:
                        req_flags[0] ? " " : "",
                        req_flags);
         }
-    } else if (j->req.api == API_ANTHROPIC) {
+    } else if (!j->req.stream && j->req.api == API_ANTHROPIC) {
         anthropic_final_response(j->fd, s->enable_cors, &j->req, id,
                                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
                                  prompt_tokens, completion);
-    } else if (j->req.api == API_RESPONSES) {
+    } else if (!j->req.stream && j->req.api == API_RESPONSES) {
         responses_final_response(j->fd, s->enable_cors, &j->req, id,
                                  parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                                  parsed_reasoning,
                                  &parsed_calls, final_finish,
                                  prompt_tokens, completion);
-    } else {
+    } else if (!j->req.stream) {
         final_response(j->fd, s->enable_cors, &j->req, id,
                        parsed_content ? parsed_content : (text.ptr ? text.ptr : ""),
                        parsed_reasoning,
                        &parsed_calls, final_finish,
                        prompt_tokens, completion);
+    }
+
+    if (stream_write_failed) {
+        stream_retry_guard_arm(s, &j->req);
+        kv_cache_defer_stream_failed_prompt(s, prompt_for_sync, ctx_span,
+                                            canonical_prefill_saved);
     }
     server_log(DS4_LOG_GENERATION,
                "ds4-server: decode summary req=%s kind=%s prompt=%d gen=%d "

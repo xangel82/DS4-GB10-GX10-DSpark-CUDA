@@ -990,6 +990,40 @@ della GB10. `DS4_CUDA_DSPARK_CACHE_PRIORITY=1` prepara prima output, attention
 e shared-expert Q8 usati dal verifier, invece di consumare il budget in ordine
 di file.
 
+Il launcher DSpark imposta `--prefill-chunk` dal profilo memoria
+(`DS4_PREFILL_CHUNK` per A/B) e, con policy `canonical-only`, abilita
+`DS4_PREFILL_FINAL_LOGITS_ONLY=1`: durante un cold prefill lungo vengono evitati
+output-head e readback dei logits sui chunk intermedi, calcolandoli soltanto sul
+chunk finale usato dal decode.
+
+`DS4_MEMORY_PROFILE=prefill-fast` mantiene 12 GiB di cache Q8→F16 per non
+sottrarre le proiezioni calde al prefill target, usa chunk 4096 per contenere lo
+scratch e imposta `DS4_CUDA_COPY_SECONDARY_MODEL=0`, quindi il sidecar DSpark
+viene mappato invece di essere copiato in device memory. Questo profilo è solo
+per A/B del prefill: può liberare molta memoria, ma va confrontato con il
+throughput DSpark di generazione.
+
+Il default torna a `DS4_MEMORY_PROFILE=balanced`: 12 GiB di cache Q8→F16, chunk
+8192 e copia device del sidecar DSpark. I risparmi sugli scratch sotto servono a
+pagare questo profilo senza togliere memoria al prefill. Se la macchina torna
+troppo vicina al limite, `DS4_MEMORY_PROFILE=lean` conserva DSpark copiato ma usa
+11 GiB di cache Q8→F16 e chunk 4096.
+
+Il prefill CUDA usa inoltre una maschera compressa densa a una sola riga: il
+percorso batched ratio-4 passa gli indici top-k a `comp_selected` e non richiede
+più una slab `comp_cap * prefill_cap`. Questo libera circa 512 MiB con chunk
+4096, circa 1 GiB con chunk 8192 e ctx 131k, senza cambiare i 512 top-k. Per
+diagnostica si può ripristinare il vecchio buffer con
+`DS4_PREFILL_DENSE_COMP_MASK=1`.
+
+I buffer batch con lifetime non sovrapposti condividono inoltre la stessa
+allocazione device: `batch_flat_hc`, `batch_attn_low`, `batch_group_tmp` e
+`batch_low_tmp` riusano regioni di `batch_q`; `batch_q_half` riusa
+`batch_routed_down`; `batch_ffn_cur` e `batch_ffn_norm` riusano i corrispondenti
+buffer attention. Con Flash, chunk 4096, questo vale circa altri 850 MiB. Il
+risparmio scala a circa 1.7 GiB con chunk 8192. Il rollback diagnostico è
+`DS4_PREFILL_NO_SCRATCH_ALIAS=1`.
+
 `DS4_CUDA_DSPARK_GRAPH=1` usa graph dedicati sia per il drafter sia per il
 verifier: dieci famiglie K-aware (drafter K=1..5 e verifier con 2..6 righe),
 ciascuna con quattro varianti di posizione e quattro per il passaggio del

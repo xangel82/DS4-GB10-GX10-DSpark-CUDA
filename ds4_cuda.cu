@@ -4036,8 +4036,12 @@ static int cuda_model_add_secondary_map(const void *model_map, uint64_t model_si
         }
     }
 
+    const char *copy_secondary_env = getenv("DS4_CUDA_COPY_SECONDARY_MODEL");
+    const bool copy_secondary =
+        !(copy_secondary_env && copy_secondary_env[0] &&
+          strcmp(copy_secondary_env, "0") == 0);
     const char *copy_env = getenv("DS4_CUDA_COPY_MODEL");
-    if (copy_env && copy_env[0]) {
+    if (copy_secondary && copy_env && copy_env[0]) {
         void *dev = NULL;
         const double t0 = cuda_wall_sec();
         cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
@@ -4068,6 +4072,9 @@ static int cuda_model_add_secondary_map(const void *model_map, uint64_t model_si
                     cudaGetErrorString(err));
             (void)cudaGetLastError();
         }
+    } else if (copy_env && copy_env[0]) {
+        fprintf(stderr,
+                "ds4: CUDA secondary model device copy disabled; using mapped host backing\n");
     }
 
     unsigned int flags = cudaHostRegisterMapped | cudaHostRegisterReadOnly;
@@ -5455,6 +5462,32 @@ __global__ static void quantize_q8_0_f32_kernel(
     } else {
         dst[threadIdx.x] = 0;
     }
+}
+
+static int launch_quantize_q8_0_f32_rows(
+        int8_t *xq,
+        float *xscale,
+        const float *x,
+        uint64_t rows,
+        uint64_t in_dim,
+        uint64_t blocks,
+        const char *what) {
+    if (!xq || !xscale || !x || rows == 0 || in_dim == 0 || blocks == 0) return 0;
+    const uint64_t max_grid_y = 32768u;
+    for (uint64_t row0 = 0; row0 < rows; ) {
+        uint64_t chunk = rows - row0;
+        if (chunk > max_grid_y) chunk = max_grid_y;
+        dim3 qgrid((unsigned)blocks, (unsigned)chunk, 1);
+        quantize_q8_0_f32_kernel<<<qgrid, 32>>>(
+                xq + row0 * blocks * 32u,
+                xscale + row0 * blocks,
+                x + row0 * in_dim,
+                in_dim,
+                blocks);
+        if (!cuda_ok(cudaGetLastError(), what)) return 0;
+        row0 += chunk;
+    }
+    return 1;
 }
 
 __global__ static void matmul_q8_0_preq_kernel(
@@ -10988,9 +11021,13 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
-    dim3 qgrid((unsigned)blocks, (unsigned)n_tok, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
-    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 quantize launch")) return 0;
+    if (!launch_quantize_q8_0_f32_rows(xq,
+                                       xscale,
+                                       (const float *)x->ptr,
+                                       n_tok,
+                                       in_dim,
+                                       blocks,
+                                       "matmul_q8_0 quantize launch")) return 0;
     if (n_tok == 1) {
         matmul_q8_0_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
                 (float *)out->ptr,
@@ -11125,9 +11162,13 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
-    dim3 qgrid((unsigned)blocks, 1, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
-    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0 pair quantize launch")) return 0;
+    if (!launch_quantize_q8_0_f32_rows(xq,
+                                       xscale,
+                                       (const float *)x->ptr,
+                                       1,
+                                       in_dim,
+                                       blocks,
+                                       "matmul_q8_0 pair quantize launch")) return 0;
     const uint64_t max_out = out0_dim > out1_dim ? out0_dim : out1_dim;
     matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)max_out + 7u) / 8u, 256>>>(
             (float *)out0->ptr,
@@ -11203,8 +11244,13 @@ static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
-    quantize_q8_0_f32_kernel<<<(unsigned)blocks, 32>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
-    if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_hc_expand quantize launch")) return 0;
+    if (!launch_quantize_q8_0_f32_rows(xq,
+                                       xscale,
+                                       (const float *)x->ptr,
+                                       1,
+                                       in_dim,
+                                       blocks,
+                                       "matmul_q8_0_hc_expand quantize launch")) return 0;
     matmul_q8_0_hc_expand_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256>>>(
             (float *)out_hc->ptr,
             (float *)block_out->ptr,
@@ -13018,13 +13064,13 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         int8_t *xq = (int8_t *)tmp;
         float *xscale = (float *)((char *)tmp + scale_offset);
         const int use_dp4a = cuda_q8_use_dp4a();
-        dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
-        quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq,
-                                                xscale,
-                                                (const float *)heads->ptr,
-                                                group_dim,
-                                                blocks_a);
-        if (!cuda_ok(cudaGetLastError(), "attention_output_q8_a prequant launch")) return 0;
+        if (!launch_quantize_q8_0_f32_rows(xq,
+                                           xscale,
+                                           (const float *)heads->ptr,
+                                           x_rows,
+                                           group_dim,
+                                           blocks_a,
+                                           "attention_output_q8_a prequant launch")) return 0;
         dim3 grid_a(((unsigned)low_dim + 7u) / 8u, (unsigned)n_tokens, 1);
         grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
                                                           out_a,
@@ -13104,13 +13150,13 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     int8_t *xq = (int8_t *)tmp;
     float *xscale = (float *)((char *)tmp + scale_offset);
     const int use_dp4a = cuda_q8_use_dp4a();
-    dim3 qgrid((unsigned)blocks_a, (unsigned)x_rows, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32>>>(xq,
-                                            xscale,
-                                            (const float *)heads->ptr,
-                                            group_dim,
-                                            blocks_a);
-    if (!cuda_ok(cudaGetLastError(), "attention_output_low_q8 prequant launch")) return 0;
+    if (!launch_quantize_q8_0_f32_rows(xq,
+                                       xscale,
+                                       (const float *)heads->ptr,
+                                       x_rows,
+                                       group_dim,
+                                       blocks_a,
+                                       "attention_output_low_q8 prequant launch")) return 0;
     dim3 grid_a(((unsigned)low_dim + 7u) / 8u, 1, 1);
     grouped_q8_0_a_preq_warp8_kernel<<<grid_a, 256>>>((float *)low->ptr,
                                                       out_a,

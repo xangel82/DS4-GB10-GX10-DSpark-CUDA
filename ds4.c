@@ -2262,7 +2262,12 @@ static bool accelerator_cache_q8_tensors(const ds4_model *m,
     const bool mtp_tc = getenv("DS4_CUDA_MTP_TENSOR_CORES") != NULL;
     const bool verifier_priority = mtp_tc ||
         getenv("DS4_CUDA_DSPARK_CACHE_PRIORITY") != NULL;
-    const int passes = verifier_priority ? 2 : 1;
+    const bool compact_priority =
+        getenv("DS4_CUDA_DSPARK_CACHE_COMPACT") != NULL;
+    const int priority_passes = 4;
+    const int passes = verifier_priority
+        ? priority_passes + (compact_priority ? 0 : 1)
+        : 1;
     for (int pass = 0; pass < passes; pass++) {
         for (uint64_t i = 0; i < m->n_tensors; i++) {
             const ds4_tensor *t = &m->tensors[i];
@@ -2281,14 +2286,23 @@ static bool accelerator_cache_q8_tensors(const ds4_model *m,
                  * head is commonly near the end.  The separate MTP drafter
                  * mostly uses N=1; its sole batched Q8 h_proj is preloaded
                  * explicitly instead of scanning the whole support model. */
-                const bool priority =
-                    strstr(label, "output.weight") != NULL ||
-                    strstr(label, "attn_q_b") != NULL ||
-                    strstr(label, "attn_output") != NULL ||
-                    strstr(label, "ffn_gate_shexp") != NULL ||
-                    strstr(label, "ffn_up_shexp") != NULL ||
-                    strstr(label, "ffn_down_shexp") != NULL;
-                if ((pass == 0) != priority) continue;
+                int rank = -1;
+                if (strstr(label, "output.weight") != NULL) {
+                    rank = 0;
+                } else if (strstr(label, "attn_q_b") != NULL) {
+                    rank = 1;
+                } else if (strstr(label, "attn_output") != NULL) {
+                    rank = 2;
+                } else if (strstr(label, "ffn_gate_shexp") != NULL ||
+                           strstr(label, "ffn_up_shexp") != NULL ||
+                           strstr(label, "ffn_down_shexp") != NULL) {
+                    rank = 3;
+                }
+                if (pass < priority_passes) {
+                    if (rank != pass) continue;
+                } else if (rank >= 0) {
+                    continue;
+                }
             }
             if (t->type == DS4_TENSOR_Q8_0 && t->ndim == 2 &&
                 ds4_gpu_cache_q8_f16_range(m->map, m->size, t->abs_offset, t->bytes, t->dim[0], t->dim[1], label) == 0) {
@@ -8506,6 +8520,11 @@ static uint32_t ds4_prefill_cap_for_prompt(int prompt_len,
     return cap;
 }
 
+static bool ds4_prefill_final_logits_only(void) {
+    const char *env = getenv("DS4_PREFILL_FINAL_LOGITS_ONLY");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
 /* Allocate all CPU decode temporaries once.  This keeps generation deterministic
  * from the VM's point of view and makes accidental hot-loop malloc visible. */
 static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ctx_size) {
@@ -11186,6 +11205,15 @@ static bool metal_graph_ensure_batch_ffn_out(ds4_gpu_graph *g) {
     return g->batch_ffn_out != NULL;
 }
 
+static ds4_gpu_tensor *metal_graph_tensor_alias_or_alloc(
+        ds4_gpu_tensor *base,
+        uint64_t        offset,
+        uint64_t        bytes,
+        bool            alias) {
+    ds4_gpu_tensor *t = alias ? ds4_gpu_tensor_view(base, offset, bytes) : NULL;
+    return t ? t : ds4_gpu_tensor_alloc(bytes);
+}
+
 /* =========================================================================
  * Metal Release Graph Allocation.
  * ========================================================================= */
@@ -11253,6 +11281,8 @@ static bool metal_graph_alloc_raw_cap(
         : DS4_N_INDEXER_HEAD_DIM);
     const uint64_t indexer_q_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
     const uint64_t pc = prefill_cap;
+    const bool alias_batch_scratch =
+        getenv("DS4_PREFILL_NO_SCRATCH_ALIAS") == NULL;
     uint64_t kv_cache_bytes = 0;
     const uint64_t context_bytes =
         metal_graph_context_bytes_for_kv_policy(ctx_size, raw_cap, prefill_cap, &kv_cache_bytes);
@@ -11367,7 +11397,16 @@ static bool metal_graph_alloc_raw_cap(
     g->indexer_q = ds4_gpu_tensor_alloc(indexer_q_dim * sizeof(float));
     g->indexer_weights = ds4_gpu_tensor_alloc((uint64_t)DS4_N_INDEXER_HEAD * sizeof(float));
     g->indexer_scores = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap * pc * sizeof(float));
-    g->comp_mask = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap * pc * sizeof(float));
+    /*
+     * Batched ratio-4 prefill/decode now routes top-k rows through
+     * comp_selected and the indexed-attention kernel.  The dense mask remains
+     * only for the token fallback, so keep a single-row mask by default instead
+     * of a prefill_cap-row slab.  Set DS4_PREFILL_DENSE_COMP_MASK=1 to restore
+     * the old allocation for diagnostics.
+     */
+    const uint64_t comp_mask_rows =
+        getenv("DS4_PREFILL_DENSE_COMP_MASK") != NULL ? pc : 1u;
+    g->comp_mask = ds4_gpu_tensor_alloc((uint64_t)g->comp_cap * comp_mask_rows * sizeof(float));
     g->comp_selected = ds4_gpu_tensor_alloc((uint64_t)(DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 1u) *
                                               pc * sizeof(uint32_t));
     g->heads = ds4_gpu_tensor_alloc(q_dim * sizeof(float));
@@ -11480,18 +11519,29 @@ static bool metal_graph_alloc_raw_cap(
         }
     }
 
+    const uint64_t batch_q_bytes = pc * q_dim * sizeof(float);
+    const uint64_t batch_attn_low_bytes = pc * low_dim * sizeof(float);
+    const uint64_t batch_group_tmp_bytes = pc * group_dim * sizeof(float);
+    const uint64_t batch_low_tmp_bytes = pc * DS4_N_LORA_O * sizeof(float);
+    const uint64_t batch_q_half_bytes = pc * q_dim * sizeof(uint16_t);
+    const uint64_t batch_routed_down_bytes =
+        pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);
+
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
     g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
     g->batch_next_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
-    g->batch_flat_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
+    g->batch_q = ds4_gpu_tensor_alloc(batch_q_bytes);
+    g->batch_flat_hc = metal_graph_tensor_alias_or_alloc(
+            g->batch_q, 0, pc * hc_dim * sizeof(float), alias_batch_scratch);
     g->batch_hc_mix = ds4_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
     g->batch_hc_split = ds4_gpu_tensor_alloc(pc * mix_hc * sizeof(float));
     g->batch_attn_cur = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
     g->batch_attn_norm = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
     g->batch_qr = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
     g->batch_qr_norm = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
-    g->batch_q = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
-    g->batch_q_half = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(uint16_t));
+    g->batch_routed_down = ds4_gpu_tensor_alloc(batch_routed_down_bytes);
+    g->batch_q_half = metal_graph_tensor_alias_or_alloc(
+            g->batch_routed_down, 0, batch_q_half_bytes, alias_batch_scratch);
     g->batch_kv_raw = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
     g->batch_kv = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
     g->batch_comp_kv = ds4_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
@@ -11499,13 +11549,21 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_indexer_q = ds4_gpu_tensor_alloc(pc * indexer_q_dim * sizeof(float));
     g->batch_indexer_weights = ds4_gpu_tensor_alloc(pc * DS4_N_INDEXER_HEAD * sizeof(float));
     g->batch_heads = ds4_gpu_tensor_alloc(pc * q_dim * sizeof(float));
-    g->batch_attn_low = ds4_gpu_tensor_alloc(pc * low_dim * sizeof(float));
+    uint64_t batch_q_alias_offset = 0;
+    g->batch_attn_low = metal_graph_tensor_alias_or_alloc(
+            g->batch_q, batch_q_alias_offset, batch_attn_low_bytes, alias_batch_scratch);
+    batch_q_alias_offset += batch_attn_low_bytes;
     g->batch_attn_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
-    g->batch_group_tmp = ds4_gpu_tensor_alloc(pc * group_dim * sizeof(float));
-    g->batch_low_tmp = ds4_gpu_tensor_alloc(pc * DS4_N_LORA_O * sizeof(float));
+    g->batch_group_tmp = metal_graph_tensor_alias_or_alloc(
+            g->batch_q, batch_q_alias_offset, batch_group_tmp_bytes, alias_batch_scratch);
+    batch_q_alias_offset += batch_group_tmp_bytes;
+    g->batch_low_tmp = metal_graph_tensor_alias_or_alloc(
+            g->batch_q, batch_q_alias_offset, batch_low_tmp_bytes, alias_batch_scratch);
     g->batch_after_attn_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
-    g->batch_ffn_cur = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
-    g->batch_ffn_norm = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
+    g->batch_ffn_cur = metal_graph_tensor_alias_or_alloc(
+            g->batch_attn_cur, 0, pc * DS4_N_EMBD * sizeof(float), alias_batch_scratch);
+    g->batch_ffn_norm = metal_graph_tensor_alias_or_alloc(
+            g->batch_attn_norm, 0, pc * DS4_N_EMBD * sizeof(float), alias_batch_scratch);
     g->batch_shared_gate = ds4_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
     g->batch_shared_up = ds4_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
     g->batch_shared_mid = ds4_gpu_tensor_alloc(pc * shared_dim * sizeof(float));
@@ -11522,7 +11580,6 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_routed_gate = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->batch_routed_up = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
     g->batch_routed_mid = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * routed_mid_dim * sizeof(float));
-    g->batch_routed_down = ds4_gpu_tensor_alloc(pc * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
     g->batch_routed_out = ds4_gpu_tensor_alloc(pc * DS4_N_EMBD * sizeof(float));
 
     bool layer_cache_ok = true;
@@ -22289,6 +22346,7 @@ static bool metal_graph_prefill_chunked_range(
     if (chunk_cap == 0) return false;
 
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
+    const bool final_logits_only = ds4_prefill_final_logits_only();
     const double t0 = profile ? now_sec() : 0.0;
     const uint32_t end = start + n_tokens;
 
@@ -22315,7 +22373,7 @@ static bool metal_graph_prefill_chunked_range(
         }
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
         const uint32_t chunk_end = pos0 + chunk;
-        float *chunk_logits = (progress || chunk_end == end) ? logits : NULL;
+        float *chunk_logits = ((!final_logits_only && progress) || chunk_end == end) ? logits : NULL;
         bool ok = metal_graph_prefill_layer_major(g,
                                                   model,
                                                   weights,
@@ -28561,6 +28619,7 @@ static void ds4_session_note_prefill_progress(void *ud, const char *event, int c
         p->session->checkpoint.len = 0;
         for (int i = 0; i < current; i++) token_vec_push(&p->session->checkpoint, p->prompt->v[i]);
         p->session->checkpoint_valid = true;
+        p->session->logits_host_valid = false;
         p->session->mtp_draft_valid = false;
     }
     if (p->user) p->user(p->user_ud, event, current, total);
@@ -28705,8 +28764,14 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                                         &cancelled);
             if (cancelled) {
                 snprintf(err, errlen, "interrupted");
-                s->checkpoint_valid = true;
+                if (ds4_prefill_final_logits_only()) {
+                    s->checkpoint_valid = false;
+                    s->checkpoint.len = 0;
+                } else {
+                    s->checkpoint_valid = true;
+                }
                 s->mtp_draft_valid = false;
+                s->logits_host_valid = false;
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
             if (!ok) {
@@ -28768,8 +28833,14 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
                                          &cancelled);
         if (cancelled) {
             snprintf(err, errlen, "interrupted");
-            s->checkpoint_valid = s->checkpoint.len > 0;
+            if (ds4_prefill_final_logits_only()) {
+                s->checkpoint_valid = false;
+                s->checkpoint.len = 0;
+            } else {
+                s->checkpoint_valid = s->checkpoint.len > 0;
+            }
             s->mtp_draft_valid = false;
+            s->logits_host_valid = false;
             return DS4_SESSION_SYNC_INTERRUPTED;
         }
     } else {

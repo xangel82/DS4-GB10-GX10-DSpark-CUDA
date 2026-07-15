@@ -13,6 +13,8 @@ PORT="${DS4_PORT:-30007}"
 DRAFT="${DS4_DSPARK_DRAFT:-5}"
 TELEMETRY="${DS4_TELEMETRY:-0}"
 PREFILL_POLICY="${DS4_KV_PREFILL_CHECKPOINT_POLICY:-canonical-only}"
+MEMORY_PROFILE="${DS4_MEMORY_PROFILE:-balanced}"
+PREFILL_CHUNK="${DS4_PREFILL_CHUNK:-}"
 
 if [[ ! -f "$MODEL" ]]; then
   echo "Main model not found: $MODEL" >&2
@@ -35,7 +37,36 @@ export DS4_CUDA_WEIGHT_CACHE_LIMIT_GB="${DS4_CUDA_WEIGHT_CACHE_LIMIT_GB:-112}"
 # The GB10 has enough unified-memory headroom for the measured 80.8 GiB target,
 # 10.7 GiB sidecar, context buffers and a 12 GiB hot Q8->F16 cache.  Keeping the
 # hot projections resident avoids the 6 GiB cache ceiling seen in early runs.
-export DS4_CUDA_Q8_F16_CACHE_MB="${DS4_CUDA_Q8_F16_CACHE_MB:-12288}"
+case "$MEMORY_PROFILE" in
+  balanced)
+    export DS4_CUDA_Q8_F16_CACHE_MB="${DS4_CUDA_Q8_F16_CACHE_MB:-12288}"
+    export DS4_CUDA_COPY_SECONDARY_MODEL="${DS4_CUDA_COPY_SECONDARY_MODEL:-1}"
+    unset DS4_CUDA_DSPARK_CACHE_COMPACT
+    if [[ "$PREFILL_CHUNK" == "" ]]; then
+      PREFILL_CHUNK=8192
+    fi
+    ;;
+  prefill-fast)
+    export DS4_CUDA_Q8_F16_CACHE_MB="${DS4_CUDA_Q8_F16_CACHE_MB:-12288}"
+    export DS4_CUDA_COPY_SECONDARY_MODEL="${DS4_CUDA_COPY_SECONDARY_MODEL:-0}"
+    unset DS4_CUDA_DSPARK_CACHE_COMPACT
+    if [[ "$PREFILL_CHUNK" == "" ]]; then
+      PREFILL_CHUNK=4096
+    fi
+    ;;
+  lean)
+    export DS4_CUDA_Q8_F16_CACHE_MB="${DS4_CUDA_Q8_F16_CACHE_MB:-11264}"
+    export DS4_CUDA_COPY_SECONDARY_MODEL="${DS4_CUDA_COPY_SECONDARY_MODEL:-1}"
+    export DS4_CUDA_DSPARK_CACHE_COMPACT="${DS4_CUDA_DSPARK_CACHE_COMPACT:-1}"
+    if [[ "$PREFILL_CHUNK" == "" ]]; then
+      PREFILL_CHUNK=4096
+    fi
+    ;;
+  *)
+    echo "Invalid DS4_MEMORY_PROFILE: $MEMORY_PROFILE (expected balanced, prefill-fast or lean)" >&2
+    exit 2
+    ;;
+esac
 export DS4_CUDA_DSPARK_CACHE_PRIORITY=1
 export DS4_CUDA_DEFER_END_SYNC=1
 export DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS=0
@@ -50,6 +81,13 @@ export DS4_KV_KEEP_LONG_TEXT_HITS="${DS4_KV_KEEP_LONG_TEXT_HITS:-1}"
 export DS4_KV_PREFILL_CHECKPOINT_POLICY="$PREFILL_POLICY"
 export DS4_KV_CANONICAL_LONG_PREFILL="${DS4_KV_CANONICAL_LONG_PREFILL:-1}"
 export DS4_KV_CANONICAL_PREFILL_MIN_SEC="${DS4_KV_CANONICAL_PREFILL_MIN_SEC:-30}"
+if [[ "${DS4_PREFILL_FINAL_LOGITS_ONLY:-}" != "" ]]; then
+  export DS4_PREFILL_FINAL_LOGITS_ONLY
+elif [[ "$PREFILL_POLICY" == "canonical-only" ]]; then
+  export DS4_PREFILL_FINAL_LOGITS_ONLY=1
+else
+  unset DS4_PREFILL_FINAL_LOGITS_ONLY
+fi
 if [[ "${DS4_CUDA_DSPARK_TENSOR_CORES:-1}" == "1" ]]; then
   export DS4_CUDA_DSPARK_TENSOR_CORES=1
   export DS4_CUDA_DSPARK_TC_PAD_N="${DS4_CUDA_DSPARK_TC_PAD_N:-8}"
@@ -115,7 +153,9 @@ fi
 
 echo "Target: $MODEL"
 echo "DSpark: $DSPARK (draft=$DRAFT)"
-echo "Cache:  Q8->F16=${DS4_CUDA_Q8_F16_CACHE_MB} MiB, weight limit=${DS4_CUDA_WEIGHT_CACHE_LIMIT_GB} GiB"
+echo "Cache:  profile=$MEMORY_PROFILE Q8->F16=${DS4_CUDA_Q8_F16_CACHE_MB} MiB compact-priority=${DS4_CUDA_DSPARK_CACHE_COMPACT:-0}, weight limit=${DS4_CUDA_WEIGHT_CACHE_LIMIT_GB} GiB"
+echo "Memory: secondary-copy=${DS4_CUDA_COPY_SECONDARY_MODEL:-1}"
+echo "Prefill: chunk=$PREFILL_CHUNK final-logits-only=${DS4_PREFILL_FINAL_LOGITS_ONLY:-0}"
 echo "KV:     policy=$DS4_KV_PREFILL_CHECKPOINT_POLICY keep-long-text-hits=$DS4_KV_KEEP_LONG_TEXT_HITS canonical-min-sec=$DS4_KV_CANONICAL_PREFILL_MIN_SEC"
 echo "DSpark scheduler: full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY"
 echo "DSpark sampling: lossless p/q rejection for top_k=0 top_p=1 min-p policy (rollback DS4_DSPARK_REJECTION_DISABLE=1)"
@@ -127,6 +167,7 @@ exec ./ds4-server \
   -m "$MODEL" \
   --dspark "$DSPARK" \
   --dspark-draft "$DRAFT" \
+  --prefill-chunk "$PREFILL_CHUNK" \
   -c "$CTX" \
   -n "$MAX_TOKENS" \
   -t "$THREADS" \

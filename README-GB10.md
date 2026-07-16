@@ -696,6 +696,24 @@ DS4_KV_CANONICAL_PREFILL_MIN_SEC=30
 DS4_KV_KEEP_LONG_TEXT_HITS=1
 ```
 
+### Nota negativa: snapshot RAM prima del decode
+
+E' stata provata una frontier RAM per canonicalizzare tool call senza passare da
+checkpoint NVMe: dopo il prefill, prima del primo token assistant, il server
+copiava in RAM host logits, contatori/frontiere compressor e indexer, raw SWA
+ring e ring DSpark. La semantica era corretta, ma su GB10 ha ridotto il decode
+DSpark di circa 2 token/s.
+
+La causa probabile e' il costo indiretto delle copie sincrone GPU->host
+(`cudaMemcpyDeviceToHost`) subito prima della generazione: anche se fuori dal
+timer del decode, raffreddano o disturbano il percorso caldo successivo. La
+patch e' stata rimossa e il throughput e' tornato al profilo atteso.
+
+Vincolo per patch future: non introdurre snapshot host-side o readback CUDA tra
+prefill e decode. Una frontier per tool/canonicalizzazione deve restare
+GPU-resident, usare copie device-to-device, oppure essere catturata soltanto in
+un punto che non precede direttamente il decode caldo.
+
 ### Long context anchor per richieste ripetute
 
 Per prompt molto grandi il retry canonico completo non basta: se la richiesta

@@ -13,6 +13,7 @@ PORT="${DS4_PORT:-30007}"
 KV_DISK_SPACE_MB="${DS4_KV_DISK_SPACE_MB:-16384}"
 DRAFT="${DS4_DSPARK_DRAFT:-5}"
 TELEMETRY="${DS4_TELEMETRY:-0}"
+STREAM_HEARTBEAT_SEC="${DS4_STREAM_HEARTBEAT_SEC:-140}"
 PREFILL_POLICY="${DS4_KV_PREFILL_CHECKPOINT_POLICY:-canonical-only}"
 MEMORY_PROFILE="${DS4_MEMORY_PROFILE:-balanced}"
 PREFILL_CHUNK="${DS4_PREFILL_CHUNK:-}"
@@ -86,6 +87,7 @@ export DS4_CUDA_TOKEN_GRAPH=1
 export DS4_CUDA_DSPARK_GRAPH=1
 export DS4_CUDA_COALESCED_F16_MATMUL=1
 export DS4_CUDA_Q8_U16_LOADS=1
+export DS4_STREAM_HEARTBEAT_SEC="$STREAM_HEARTBEAT_SEC"
 # Long retries must find the exact full-prompt checkpoint even when the prompt
 # exceeds cold_max_tokens.  canonical-only writes no intermediate frontiers.
 export DS4_KV_KEEP_LONG_TEXT_HITS="${DS4_KV_KEEP_LONG_TEXT_HITS:-1}"
@@ -169,6 +171,7 @@ echo "DSpark: $DSPARK (draft=$DRAFT)"
 echo "Cache:  profile=$MEMORY_PROFILE Q8->F16=${DS4_CUDA_Q8_F16_CACHE_MB} MiB compact-priority=${DS4_CUDA_DSPARK_CACHE_COMPACT:-0}, weight limit=${DS4_CUDA_WEIGHT_CACHE_LIMIT_GB} GiB"
 echo "Memory: secondary-copy=${DS4_CUDA_COPY_SECONDARY_MODEL:-1}, drop-copied-source-pages=${DS4_CUDA_DROP_COPIED_MODEL_PAGES:-0}"
 echo "Prefill: chunk=$PREFILL_CHUNK final-logits-only=${DS4_PREFILL_FINAL_LOGITS_ONLY:-0}"
+echo "Streaming: decode-heartbeat=${DS4_STREAM_HEARTBEAT_SEC}s"
 echo "KV:     policy=$DS4_KV_PREFILL_CHECKPOINT_POLICY keep-long-text-hits=$DS4_KV_KEEP_LONG_TEXT_HITS canonical-min-sec=$DS4_KV_CANONICAL_PREFILL_MIN_SEC cold-max=$KV_COLD_MAX_TOKENS long-anchor-min=$DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS trim=$DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS disk-mb=$KV_DISK_SPACE_MB"
 echo "Context guard: physical=$CTX advertise=${ADVERTISE_CONTEXT_PCT}%"
 echo "DSpark scheduler: full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY"

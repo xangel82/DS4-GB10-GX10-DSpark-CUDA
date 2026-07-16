@@ -4893,6 +4893,8 @@ static bool http_error_context_length_exceeded(int fd, bool enable_cors,
 /* Streaming is a translation state machine over the raw DS4 text.  The model
  * may produce <think> and DSML tool blocks; clients should receive those as
  * protocol-native reasoning/tool deltas, never as visible assistant text. */
+static double now_sec(void);
+
 static bool sse_headers(int fd, bool enable_cors) {
     buf h = {0};
     buf_puts(&h,
@@ -4904,6 +4906,25 @@ static bool sse_headers(int fd, bool enable_cors) {
     bool ok = send_all(fd, h.ptr, h.len);
     buf_free(&h);
     return ok;
+}
+
+static double stream_heartbeat_seconds(void) {
+    const char *env = getenv("DS4_STREAM_HEARTBEAT_SEC");
+    if (!env || !env[0]) return 140.0;
+    char *end = NULL;
+    double v = strtod(env, &end);
+    if (end == env) return 140.0;
+    return v > 0.0 ? v : 0.0;
+}
+
+static bool sse_decode_heartbeat_maybe(int fd, double interval, double *last_t) {
+    if (interval <= 0.0 || !last_t) return true;
+    double now = now_sec();
+    if (now - *last_t < interval) return true;
+    static const char hb[] = ": ds4 decode\n\n";
+    if (!send_all(fd, hb, sizeof(hb) - 1)) return false;
+    *last_t = now;
+    return true;
 }
 
 static bool sse_error_event(int fd, const request *r, const char *msg) {
@@ -10583,6 +10604,9 @@ decode_again:
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d effective_ctx=%d",
                 max_tokens, room, effective_context_size(s));
     const double decode_t0 = now_sec();
+    const double stream_heartbeat_sec =
+        j->req.stream ? stream_heartbeat_seconds() : 0.0;
+    double last_stream_heartbeat_t = decode_t0;
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
     thinking_state thinking = thinking_state_from_prompt(&j->req);
@@ -10776,6 +10800,15 @@ decode_again:
                 break;
             }
             free(piece);
+            if (j->req.stream &&
+                !sse_decode_heartbeat_maybe(j->fd,
+                                            stream_heartbeat_sec,
+                                            &last_stream_heartbeat_t)) {
+                finish = "error";
+                snprintf(err, sizeof(err), "client stream write failed");
+                stop_decode = true;
+                break;
+            }
 
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 if (thinking_gates_tool_markers && thinking.inside) {

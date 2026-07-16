@@ -159,6 +159,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     }
     if (tool == DS4_HELP_SERVER) {
         opt(fp, c, "-n, --tokens N", "Default max output tokens when clients omit a limit.");
+        opt(fp, c, "--advertise-context-pct N", "Advertise and enforce N% of --ctx as the client-visible context guard. Default: 100");
     }
     opt(fp, c, "-t, --threads N", "CPU helper threads for host-side/reference work.");
     opt(fp, c, "--power N", "GPU duty-cycle target, 1..100. Default: 100");

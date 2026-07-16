@@ -10,11 +10,16 @@ CTX="${DS4_CTX:-131072}"
 MAX_TOKENS="${DS4_MAX_TOKENS:-2200}"
 THREADS="${DS4_THREADS:-10}"
 PORT="${DS4_PORT:-30007}"
+KV_DISK_SPACE_MB="${DS4_KV_DISK_SPACE_MB:-16384}"
 DRAFT="${DS4_DSPARK_DRAFT:-5}"
 TELEMETRY="${DS4_TELEMETRY:-0}"
 PREFILL_POLICY="${DS4_KV_PREFILL_CHECKPOINT_POLICY:-canonical-only}"
 MEMORY_PROFILE="${DS4_MEMORY_PROFILE:-balanced}"
 PREFILL_CHUNK="${DS4_PREFILL_CHUNK:-}"
+KV_COLD_MAX_TOKENS="${DS4_KV_CACHE_COLD_MAX_TOKENS:-$CTX}"
+ADVERTISE_CONTEXT_PCT="${DS4_ADVERTISE_CONTEXT_PCT:-85}"
+LONG_ANCHOR_MIN_TOKENS="${DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS:-$((CTX / 2))}"
+LONG_ANCHOR_TRIM_TOKENS="${DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS:-$((CTX / 16))}"
 
 if [[ ! -f "$MODEL" ]]; then
   echo "Main model not found: $MODEL" >&2
@@ -81,6 +86,8 @@ export DS4_KV_KEEP_LONG_TEXT_HITS="${DS4_KV_KEEP_LONG_TEXT_HITS:-1}"
 export DS4_KV_PREFILL_CHECKPOINT_POLICY="$PREFILL_POLICY"
 export DS4_KV_CANONICAL_LONG_PREFILL="${DS4_KV_CANONICAL_LONG_PREFILL:-1}"
 export DS4_KV_CANONICAL_PREFILL_MIN_SEC="${DS4_KV_CANONICAL_PREFILL_MIN_SEC:-30}"
+export DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS="$LONG_ANCHOR_MIN_TOKENS"
+export DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS="$LONG_ANCHOR_TRIM_TOKENS"
 if [[ "${DS4_PREFILL_FINAL_LOGITS_ONLY:-}" != "" ]]; then
   export DS4_PREFILL_FINAL_LOGITS_ONLY
 elif [[ "$PREFILL_POLICY" == "canonical-only" ]]; then
@@ -156,7 +163,8 @@ echo "DSpark: $DSPARK (draft=$DRAFT)"
 echo "Cache:  profile=$MEMORY_PROFILE Q8->F16=${DS4_CUDA_Q8_F16_CACHE_MB} MiB compact-priority=${DS4_CUDA_DSPARK_CACHE_COMPACT:-0}, weight limit=${DS4_CUDA_WEIGHT_CACHE_LIMIT_GB} GiB"
 echo "Memory: secondary-copy=${DS4_CUDA_COPY_SECONDARY_MODEL:-1}"
 echo "Prefill: chunk=$PREFILL_CHUNK final-logits-only=${DS4_PREFILL_FINAL_LOGITS_ONLY:-0}"
-echo "KV:     policy=$DS4_KV_PREFILL_CHECKPOINT_POLICY keep-long-text-hits=$DS4_KV_KEEP_LONG_TEXT_HITS canonical-min-sec=$DS4_KV_CANONICAL_PREFILL_MIN_SEC"
+echo "KV:     policy=$DS4_KV_PREFILL_CHECKPOINT_POLICY keep-long-text-hits=$DS4_KV_KEEP_LONG_TEXT_HITS canonical-min-sec=$DS4_KV_CANONICAL_PREFILL_MIN_SEC cold-max=$KV_COLD_MAX_TOKENS long-anchor-min=$DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS trim=$DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS disk-mb=$KV_DISK_SPACE_MB"
+echo "Context guard: physical=$CTX advertise=${ADVERTISE_CONTEXT_PCT}%"
 echo "DSpark scheduler: full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY"
 echo "DSpark sampling: lossless p/q rejection for top_k=0 top_p=1 min-p policy (rollback DS4_DSPARK_REJECTION_DISABLE=1)"
 echo "GB10 verifier: Q8 batch-reuse=${DS4_CUDA_Q8_BATCH_REUSE:-0}, Q4-sidecar direct-MoE=${DS4_CUDA_MOE_TINY_DIRECT_Q4_ONLY:-0}, tiny-TC=${DS4_CUDA_DSPARK_TENSOR_CORES:-0}, tiny-TC-Q8=${DS4_CUDA_DSPARK_TENSOR_CORES_Q8:-0}"
@@ -169,9 +177,11 @@ exec ./ds4-server \
   --dspark-draft "$DRAFT" \
   --prefill-chunk "$PREFILL_CHUNK" \
   -c "$CTX" \
+  --advertise-context-pct "$ADVERTISE_CONTEXT_PCT" \
   -n "$MAX_TOKENS" \
   -t "$THREADS" \
   --host 0.0.0.0 \
   --port "$PORT" \
   --kv-disk-dir "$KV_DIR" \
-  --kv-disk-space-mb 65536
+  --kv-cache-cold-max-tokens "$KV_COLD_MAX_TOKENS" \
+  --kv-disk-space-mb "$KV_DISK_SPACE_MB"

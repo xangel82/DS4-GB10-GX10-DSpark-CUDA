@@ -4841,6 +4841,21 @@ static bool request_exceeds_context(const request *r, int ctx_size) {
     return r && r->prompt.len >= ctx_size;
 }
 
+static bool request_exceeds_context_budget(const request *r, int ctx_size) {
+    if (request_exceeds_context(r, ctx_size)) return true;
+    if (!r || r->max_tokens <= 0) return false;
+    return (int64_t)r->prompt.len + (int64_t)r->max_tokens > (int64_t)ctx_size;
+}
+
+static int advertised_context_size_from_pct(int physical_ctx, int pct) {
+    if (physical_ctx <= 0) return 0;
+    if (pct <= 0 || pct >= 100) return physical_ctx;
+    int64_t advertised = ((int64_t)physical_ctx * pct) / 100;
+    if (advertised < 1) advertised = 1;
+    if (advertised >= physical_ctx) return physical_ctx;
+    return (int)advertised;
+}
+
 static bool http_error_context_length_exceeded(int fd, bool enable_cors,
                                                const request *r,
                                                int n_prompt_tokens,
@@ -7714,6 +7729,7 @@ struct server {
     ds4_engine *engine;
     ds4_session *session;
     int default_tokens;
+    int advertised_ctx_size;
     kv_disk_cache kv;
     tool_memory tool_mem;
     live_tool_state responses_live;
@@ -7742,6 +7758,13 @@ struct server {
     int stream_retry_guard_tokens;
     char stream_retry_guard_prompt_sha[41];
 };
+
+static int effective_context_size(const server *s) {
+    if (!s || !s->session) return 0;
+    const int physical_ctx = ds4_session_ctx(s->session);
+    return s->advertised_ctx_size > 0 && s->advertised_ctx_size < physical_ctx ?
+        s->advertised_ctx_size : physical_ctx;
+}
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
@@ -8686,6 +8709,38 @@ static void build_prompt_from_exact_prefix_and_text_suffix(
 
 static int kv_cache_store_len(const kv_disk_cache *kc, int tokens) {
     return ds4_kvstore_store_len(kc, tokens);
+}
+
+static int kv_cache_long_anchor_env_int(const char *name, int fallback, int min_value) {
+    const char *v = getenv(name);
+    if (!v || !v[0]) return fallback;
+    char *end = NULL;
+    long n = strtol(v, &end, 10);
+    if (end == v || n < min_value || n > INT32_MAX) return fallback;
+    return (int)n;
+}
+
+static int kv_cache_store_len_with_trim(const kv_disk_cache *kc, int tokens, int trim) {
+    if (!kc) return tokens;
+    const int align = kc->opt.boundary_align_tokens;
+    if (tokens > kc->opt.min_tokens + trim) {
+        int stable = tokens - trim;
+        if (align > 0) stable -= stable % align;
+        if (stable >= kc->opt.min_tokens) return stable;
+    }
+    return tokens;
+}
+
+static int kv_cache_long_cold_boundary_len(const kv_disk_cache *kc, int tokens, int ctx_size) {
+    if (!kc) return 0;
+    const int default_min_tokens = ctx_size > 0 ? ctx_size / 2 : 0;
+    const int min_tokens = kv_cache_long_anchor_env_int(
+        "DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS", default_min_tokens, 0);
+    if (min_tokens <= 0 || tokens < min_tokens) return 0;
+    const int default_trim = ctx_size > 0 ? ctx_size / 16 : 0;
+    const int trim = kv_cache_long_anchor_env_int(
+        "DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS", default_trim, 0);
+    return kv_cache_store_len_with_trim(kc, tokens, trim);
 }
 
 static int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
@@ -10311,8 +10366,18 @@ static void generate_job(server *s, job *j) {
         const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
                                                     ds4_token_user(s->engine),
                                                     ds4_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        int boundary = kv_cache_long_cold_boundary_len(&s->kv, prompt_for_sync->len,
+                                                       ds4_session_ctx(s->session));
+        if (boundary < s->kv.opt.min_tokens) {
+            boundary = kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        }
+        cold_store_len = boundary;
+        if (anchor >= s->kv.opt.min_tokens && anchor > cold_store_len) {
+            cold_store_len = anchor;
+        }
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv cold anchor target prompt=%d target=%d chat=%d boundary=%d",
+                   prompt_for_sync->len, cold_store_len, anchor, boundary);
     }
     int suppressed_continued_last = -1;
     if (!progress.kv_canonical_only && cold_store_len >= s->kv.opt.min_tokens) {
@@ -10496,6 +10561,9 @@ decode_again:
     int completion = 0;
     int max_tokens = j->req.max_tokens;
     int room = ds4_session_ctx(s->session) - ds4_session_pos(s->session);
+    int advertised_room = effective_context_size(s) - ds4_session_pos(s->session);
+    if (advertised_room < 0) advertised_room = 0;
+    if (advertised_room < room) room = advertised_room;
     bool saw_tool_start = false;
     bool saw_tool_end = false;
     bool saw_orphan_tool_end = false;
@@ -10512,7 +10580,8 @@ decode_again:
     bool device_greedy_next_valid = false;
     if (max_tokens < 0) max_tokens = 0;
     if (max_tokens > room) max_tokens = room;
-    trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
+    trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d effective_ctx=%d",
+                max_tokens, room, effective_context_size(s));
     const double decode_t0 = now_sec();
     double last_decode_log_t = decode_t0;
     int last_decode_log_completion = 0;
@@ -11389,8 +11458,12 @@ typedef struct {
 } client_arg;
 
 static void append_model_json_values(buf *b, const char *id, const char *name,
-                                     int ctx, int default_tokens) {
-    const int max_completion = default_tokens < ctx ? default_tokens : ctx;
+                                     int physical_ctx, int advertised_ctx,
+                                     int default_tokens) {
+    if (advertised_ctx <= 0 || advertised_ctx > physical_ctx) advertised_ctx = physical_ctx;
+    const int max_completion = default_tokens < advertised_ctx ? default_tokens : advertised_ctx;
+    const int max_input = max_completion < advertised_ctx ?
+        advertised_ctx - max_completion : advertised_ctx;
     buf_printf(b,
         "{\"id\":");
     json_escape(b, id);
@@ -11403,8 +11476,11 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
     buf_printf(b,
         ","
         "\"context_length\":%d,"
+        "\"max_input_tokens\":%d,"
+        "\"max_tokens\":%d,"
         "\"top_provider\":{"
             "\"context_length\":%d,"
+            "\"max_input_tokens\":%d,"
             "\"max_completion_tokens\":%d,"
             "\"is_moderated\":false},"
         "\"supported_parameters\":["
@@ -11419,8 +11495,11 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"seed\","
             "\"stream\","
             "\"reasoning_effort\"]}",
-        ctx,
-        ctx,
+        advertised_ctx,
+        max_input,
+        max_completion,
+        advertised_ctx,
+        max_input,
         max_completion);
 }
 
@@ -11429,6 +11508,7 @@ static void append_model_json(buf *b, const server *s, const char *id) {
                              id,
                              ds4_engine_model_name(s->engine),
                              ds4_session_ctx(s->session),
+                             s->advertised_ctx_size,
                              s->default_tokens);
 }
 
@@ -11500,6 +11580,7 @@ static void *client_main(void *arg) {
     char err[160];
     bool ok = false;
     const int ctx_size = ds4_session_ctx(s->session);
+    const int request_ctx_size = effective_context_size(s);
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
@@ -11527,8 +11608,9 @@ static void *client_main(void *arg) {
         free(req.model);
         req.model = xstrdup(server_model_id_from_engine(s->engine));
     }
-    if (request_exceeds_context(&req, ctx_size)) {
-        http_error_context_length_exceeded(fd, s->enable_cors, &req, req.prompt.len, ctx_size);
+    if (request_exceeds_context_budget(&req, request_ctx_size)) {
+        http_error_context_length_exceeded(fd, s->enable_cors, &req,
+                                           req.prompt.len, request_ctx_size);
         request_free(&req);
         goto done;
     }
@@ -11610,6 +11692,7 @@ typedef struct {
     const char *host;
     int port;
     int ctx_size;
+    int advertise_context_pct;
     int default_tokens;
     const char *chdir_path;
     const char *trace_path;
@@ -11740,6 +11823,7 @@ static server_config parse_options(int argc, char **argv) {
         .host = "127.0.0.1",
         .port = 8000,
         .ctx_size = 32768,
+        .advertise_context_pct = 100,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
     };
@@ -11785,6 +11869,13 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.mtp_margin = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--advertise-context-pct")) {
+            c.advertise_context_pct = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.advertise_context_pct < 1 || c.advertise_context_pct > 100) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: --advertise-context-pct must be between 1 and 100");
+                exit(2);
+            }
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.default_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -11960,6 +12051,13 @@ int main(int argc, char **argv) {
     s.engine = engine;
     s.session = session;
     s.default_tokens = cfg.default_tokens;
+    s.advertised_ctx_size =
+        advertised_context_size_from_pct(cfg.ctx_size, cfg.advertise_context_pct);
+    if (s.advertised_ctx_size > 0 && s.advertised_ctx_size < cfg.ctx_size) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: advertised context guard %d/%d tokens (%d%%)",
+                   s.advertised_ctx_size, cfg.ctx_size, cfg.advertise_context_pct);
+    }
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
@@ -12376,6 +12474,12 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
     r.prompt.len = 16;
     TEST_ASSERT(request_exceeds_context(&r, 16));
     TEST_ASSERT(!request_exceeds_context(&r, 17));
+    r.prompt.len = 138815;
+    r.max_tokens = 2200;
+    TEST_ASSERT(request_exceeds_context_budget(&r, 140083));
+    r.max_tokens = 1000;
+    TEST_ASSERT(!request_exceeds_context_budget(&r, 140083));
+    r.prompt.len = 16;
 
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -14834,20 +14938,57 @@ static void test_json_string_handles_surrogates(void) {
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 393216);
+                             32768, 32768, 393216);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"max_input_tokens\":32768") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":32768") != NULL);
     buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
-                             100000, 4096);
+                             100000, 95000, 4096);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
-    TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"context_length\":95000") != NULL);
+    TEST_ASSERT(strstr(b.ptr, "\"max_input_tokens\":90904") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
     buf_free(&b);
+}
+
+static void test_advertised_context_pct(void) {
+    TEST_ASSERT(advertised_context_size_from_pct(131072, 95) == 124518);
+    TEST_ASSERT(advertised_context_size_from_pct(131072, 100) == 131072);
+    TEST_ASSERT(advertised_context_size_from_pct(131072, 0) == 131072);
+    TEST_ASSERT(advertised_context_size_from_pct(10, 1) == 1);
+}
+
+static void restore_test_env(const char *name, char *value) {
+    if (value) {
+        setenv(name, value, 1);
+        free(value);
+    } else {
+        unsetenv(name);
+    }
+}
+
+static void test_long_cold_anchor_defaults_scale_with_context(void) {
+    char *old_min = getenv("DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS") ?
+        xstrdup(getenv("DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS")) : NULL;
+    char *old_trim = getenv("DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS") ?
+        xstrdup(getenv("DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS")) : NULL;
+    unsetenv("DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS");
+    unsetenv("DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS");
+
+    kv_disk_cache kc = {0};
+    kc.opt.min_tokens = 512;
+    kc.opt.boundary_align_tokens = 2048;
+    TEST_ASSERT(kv_cache_long_cold_boundary_len(&kc, 60000, 131072) == 0);
+    TEST_ASSERT(kv_cache_long_cold_boundary_len(&kc, 125000, 131072) == 116736);
+    TEST_ASSERT(kv_cache_long_cold_boundary_len(&kc, 70000, 65536) == 65536);
+
+    restore_test_env("DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS", old_min);
+    restore_test_env("DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS", old_trim);
 }
 
 static void test_client_socket_nonblocking_flag(void) {
@@ -16057,6 +16198,8 @@ static void ds4_server_unit_tests_run(void) {
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
     test_model_metadata_clamps_completion_to_context();
+    test_advertised_context_pct();
+    test_long_cold_anchor_defaults_scale_with_context();
     test_client_socket_nonblocking_flag();
     test_thinking_state_tracks_prompt_and_generated_tags();
     test_thinking_checkpoint_remember_gate();

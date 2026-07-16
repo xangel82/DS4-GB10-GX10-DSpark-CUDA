@@ -36,6 +36,10 @@ on a single GB10/GX10 machine without changing the target model distribution.
 - Added DSpark-specific CUDA Graph variants for drafter and verifier paths.
 - Added GB10-oriented Tensor Core tiny-batch experiments.
 - Added Q8 tiny-batch reuse and Q8/F16 hot-cache launch profiles.
+- Added long-prefix KV reuse so repeated tool turns can prefill only the
+  appended suffix instead of replaying the whole prompt.
+- Added a client-visible context guard so frontends compact before the physical
+  DS4 context is exhausted.
 - Added reproducible run scripts, benchmark analyzers and release-oriented
   installation notes.
 
@@ -54,7 +58,15 @@ on a single GB10/GX10 machine without changing the target model distribution.
   - 12 GiB Q8->F16 hot cache;
   - Q8 tiny-batch reuse;
   - DSpark Tensor Core tiny-batch path enabled by default;
-  - always-on DSpark drafting for a single active GB10 decode stream.
+  - always-on DSpark drafting for a single active GB10 decode stream;
+  - 131k physical context with an 85% advertised context guard;
+  - 16 GiB default disk budget for persisted KV checkpoints.
+- Append-prefill optimization for long chats: canonical KV checkpoints are
+  retained near long stable prompt boundaries, so subsequent requests with the
+  same prefix can resume from disk and process only the new tail.
+- `/v1/models` now advertises both `context_length` and `max_input_tokens`;
+  `max_input_tokens` reserves the configured completion budget so clients can
+  compact before generation runs into the physical context ceiling.
 
 The best measured profile in this lab reached about 18 token/s weighted decode
 throughput, with K4 becoming the stable scheduler champion.  Exact numbers vary
@@ -104,7 +116,7 @@ Recommended layout:
 ```text
 /home/athena/DS4-GB10-GX10-DSpark-CUDA   # source checkout
 /home/athena/ds4                         # model files and logs
-/tmp/ds4-gb10-dspark-kv                  # disposable KV disk cache
+/tmp/ds4-gb10-dspark-kv                  # disposable KV disk cache, default 16 GiB budget
 ```
 
 ### 1. Clone and compile
@@ -236,6 +248,39 @@ Quick API check:
 ```bash
 curl http://127.0.0.1:30007/v1/models
 ```
+
+Current GB10 release defaults in `run-dspark-server.sh`:
+
+```text
+DS4_CTX=131072
+DS4_ADVERTISE_CONTEXT_PCT=85
+DS4_MAX_TOKENS=2200
+DS4_KV_DISK_SPACE_MB=16384
+DS4_MEMORY_PROFILE=prefill-fast
+DS4_KV_PREFILL_CHECKPOINT_POLICY=canonical-only
+DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS=$((DS4_CTX / 2))
+DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS=$((DS4_CTX / 16))
+```
+
+With the default completion budget, the server advertises about 111k total
+context and about 109k input tokens.  The remaining physical context is kept as
+a safety margin for generation and for clients such as Claude Code to trigger
+their own compaction before DS4 reaches the hard 131k limit.
+
+The long-anchor values intentionally scale from `DS4_CTX`: at 131k context they
+resolve to 65536 and 8192 tokens.  This preserves the append-prefill behavior
+when the physical context is changed for A/B tests, instead of hardcoding one
+specific checkpoint boundary.
+
+To test a different guard or disk budget:
+
+```bash
+DS4_ADVERTISE_CONTEXT_PCT=95 ./run-dspark-server.sh
+DS4_KV_DISK_SPACE_MB=65536 ./run-dspark-server.sh
+```
+
+The detailed lab notes, memory accounting and longer A/B history live in
+`README-GB10.md`.
 
 ## Useful rollback switches
 

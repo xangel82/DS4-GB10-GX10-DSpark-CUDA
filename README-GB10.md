@@ -61,6 +61,24 @@ DS4_CUDA_GREEDY_ARGMAX=1
 
 `12288 MiB` corrispondono a `12 GiB`, non a 12 MiB.
 
+### Paracadute compact / limite client
+
+Il contesto fisico resta configurato con `DS4_CTX`, ma il launcher GB10 pubblica
+ai client solo l'85% del contesto:
+
+```text
+DS4_ADVERTISE_CONTEXT_PCT=85
+```
+
+Con `DS4_CTX=131072`, l'85% espone circa `111411` token in `/v1/models`;
+con `DS4_MAX_TOKENS=2200` pubblica inoltre `max_input_tokens` attorno a
+`109211`. Il guard rail HTTP usa lo stesso budget,
+contando sia il prompt sia il `max_tokens` richiesto dal client. Questo lascia
+margine per la compaction del client prima del limite reale del modello e
+impedisce il caso patologico in cui il prompt occupa quasi tutto il contesto
+fisico, lasciando solo pochi token di risposta (`finish=length`). Per testare
+il contesto pieno senza paracadute usare `DS4_ADVERTISE_CONTEXT_PCT=100`.
+
 Per il solo ciclo diagnostico aggiungere:
 
 ```text
@@ -610,10 +628,12 @@ di consumare memoria utile a contesto e workspace.
 
 ## KV disk cache e memoria
 
-`--kv-disk-space-mb 65536` assegna un budget massimo di 64 GiB alla cache su
-disco; non prealloca necessariamente 64 GiB e non è memoria GPU. Per questo la
-nuova directory mostrava inizialmente solo circa 258 MiB, mentre la vecchia
-`/home/athena/ds4-kv` era già cresciuta fino a 64 GiB.
+`--kv-disk-space-mb` assegna un budget massimo alla cache su disco; non
+prealloca necessariamente quella dimensione e non e' memoria GPU. Il launcher
+GB10 usa `DS4_KV_DISK_SPACE_MB=16384`, cioe' 16 GiB, per evitare che decine di
+checkpoint da 1-2 GiB restino candidati alla page cache della memoria unificata.
+Per test A/B o recupero sessioni lunghe si puo' rialzare temporaneamente, per
+esempio `DS4_KV_DISK_SPACE_MB=65536`.
 
 Questa directory contiene checkpoint/snapshot persistenti usati all'inizio di
 una richiesta per evitare parte del prefill. Non è la KV attiva letta dai
@@ -675,6 +695,30 @@ DS4_KV_CANONICAL_LONG_PREFILL=1
 DS4_KV_CANONICAL_PREFILL_MIN_SEC=30
 DS4_KV_KEEP_LONG_TEXT_HITS=1
 ```
+
+### Long context anchor per richieste ripetute
+
+Per prompt molto grandi il retry canonico completo non basta: se la richiesta
+successiva cambia solo la domanda finale, il checkpoint completo precedente non
+e' piu' un prefisso testuale esatto. Il launcher GB10 quindi alza il limite cold
+cache fino al contesto corrente e abilita un singolo checkpoint di prefisso lungo
+prima della coda mutevole:
+
+```text
+DS4_KV_CACHE_COLD_MAX_TOKENS=$DS4_CTX
+DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS=$((DS4_CTX / 2))
+DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS=$((DS4_CTX / 16))
+```
+
+Con `DS4_CTX=131072` questi default restano `65536` e `8192`, ma scalano
+automaticamente se il server viene avviato con un contesto diverso. Con un
+prompt da circa 125k token il primo giro puo' salvare, per esempio, un anchor
+attorno a 114k-116k token. Un turno successivo con lo stesso file e una domanda
+diversa puo' quindi partire da un log simile a `ctx=114688..124xxx:~10k` invece
+di `ctx=0..124xxx:124xxx`. Questo non aumenta la memoria CUDA: aggiunge solo
+uno snapshot su NVMe nella directory `--kv-disk-dir`. Il trim si puo' aumentare
+se la parte variabile e' piu' lunga, oppure disabilitare mettendo
+`DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS=0`.
 
 ## Deploy dal Mac senza toccare l'installazione originale
 

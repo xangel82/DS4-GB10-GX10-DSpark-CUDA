@@ -39,6 +39,12 @@ esac
 
 export DS4_CUDA_COPY_MODEL=1
 export DS4_CUDA_WEIGHT_CACHE_LIMIT_GB="${DS4_CUDA_WEIGHT_CACHE_LIMIT_GB:-112}"
+if [[ "${DS4_CUDA_DROP_COPIED_MODEL_PAGES:-1}" == "1" ]]; then
+  export DS4_CUDA_DROP_COPIED_MODEL_PAGES=1
+  unset DS4_CUDA_KEEP_MODEL_PAGES
+else
+  export DS4_CUDA_KEEP_MODEL_PAGES=1
+fi
 # The GB10 has enough unified-memory headroom for the measured 80.8 GiB target,
 # 10.7 GiB sidecar, context buffers and a 12 GiB hot Q8->F16 cache.  Keeping the
 # hot projections resident avoids the 6 GiB cache ceiling seen in early runs.
@@ -161,7 +167,7 @@ fi
 echo "Target: $MODEL"
 echo "DSpark: $DSPARK (draft=$DRAFT)"
 echo "Cache:  profile=$MEMORY_PROFILE Q8->F16=${DS4_CUDA_Q8_F16_CACHE_MB} MiB compact-priority=${DS4_CUDA_DSPARK_CACHE_COMPACT:-0}, weight limit=${DS4_CUDA_WEIGHT_CACHE_LIMIT_GB} GiB"
-echo "Memory: secondary-copy=${DS4_CUDA_COPY_SECONDARY_MODEL:-1}"
+echo "Memory: secondary-copy=${DS4_CUDA_COPY_SECONDARY_MODEL:-1}, drop-copied-source-pages=${DS4_CUDA_DROP_COPIED_MODEL_PAGES:-0}"
 echo "Prefill: chunk=$PREFILL_CHUNK final-logits-only=${DS4_PREFILL_FINAL_LOGITS_ONLY:-0}"
 echo "KV:     policy=$DS4_KV_PREFILL_CHECKPOINT_POLICY keep-long-text-hits=$DS4_KV_KEEP_LONG_TEXT_HITS canonical-min-sec=$DS4_KV_CANONICAL_PREFILL_MIN_SEC cold-max=$KV_COLD_MAX_TOKENS long-anchor-min=$DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS trim=$DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS disk-mb=$KV_DISK_SPACE_MB"
 echo "Context guard: physical=$CTX advertise=${ADVERTISE_CONTEXT_PCT}%"

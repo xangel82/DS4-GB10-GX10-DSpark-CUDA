@@ -27769,39 +27769,48 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = NULL;
             return 1;
         }
-        if (e->mtp_ready &&
-            !ds4_gpu_set_model_map_range(e->mtp_model.map,
-                                           e->mtp_model.size,
-                                           e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.size - e->mtp_model.tensor_data_pos,
-                                           e->mtp_model.max_tensor_bytes))
-        {
-            fprintf(stderr,
-                    "ds4: %s failed to map MTP model views; aborting startup. "
-                    "This is commonly caused by insufficient memory or accelerator VM budget.\n",
-                    ds4_backend_name(e->backend));
-            free(load_offsets);
-            free(load_sizes);
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
+        if (e->mtp_ready) {
+            (void)ds4_gpu_set_model_fd_for_map(e->mtp_model.fd,
+                                                e->mtp_model.map);
+            if (!ds4_gpu_set_model_map_range(e->mtp_model.map,
+                                             e->mtp_model.size,
+                                             e->mtp_model.tensor_data_pos,
+                                             e->mtp_model.size - e->mtp_model.tensor_data_pos,
+                                             e->mtp_model.max_tensor_bytes))
+            {
+                fprintf(stderr,
+                        "ds4: %s failed to map MTP model views; aborting startup. "
+                        "This is commonly caused by insufficient memory or accelerator VM budget.\n",
+                        ds4_backend_name(e->backend));
+                free(load_offsets);
+                free(load_sizes);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
         }
-        if (e->dspark_ready &&
-            !ds4_gpu_set_model_map_range(e->dspark_model.map,
-                                         e->dspark_model.size,
-                                         e->dspark_model.tensor_data_pos,
-                                         e->dspark_model.size - e->dspark_model.tensor_data_pos,
-                                         e->dspark_model.max_tensor_bytes))
-        {
-            fprintf(stderr,
-                    "ds4: %s failed to map DSpark sidecar views; aborting startup. "
-                    "Reduce DS4_CUDA_Q8_F16_CACHE_MB if unified memory is tight.\n",
-                    ds4_backend_name(e->backend));
-            free(load_offsets);
-            free(load_sizes);
-            ds4_engine_close(e);
-            *out = NULL;
-            return 1;
+        if (e->dspark_ready) {
+            (void)ds4_gpu_set_model_fd_for_map(e->dspark_model.fd,
+                                                e->dspark_model.map);
+            if (!ds4_gpu_set_model_map_range(e->dspark_model.map,
+                                             e->dspark_model.size,
+                                             e->dspark_model.tensor_data_pos,
+                                             e->dspark_model.size - e->dspark_model.tensor_data_pos,
+                                             e->dspark_model.max_tensor_bytes))
+            {
+                fprintf(stderr,
+                        "ds4: %s failed to map DSpark sidecar views; aborting startup. "
+                        "Reduce DS4_CUDA_Q8_F16_CACHE_MB if unified memory is tight.\n",
+                        ds4_backend_name(e->backend));
+                free(load_offsets);
+                free(load_sizes);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
+        }
+        if (e->mtp_ready || e->dspark_ready) {
+            (void)ds4_gpu_set_model_fd_for_map(e->model.fd, e->model.map);
         }
         if (!ds4_engine_preload_pro_q4_expert_tables(e,
                                                      load_slice,

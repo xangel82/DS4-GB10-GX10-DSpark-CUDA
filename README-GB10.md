@@ -1053,6 +1053,16 @@ pagare questo profilo senza togliere memoria al prefill. Se la macchina torna
 troppo vicina al limite, `DS4_MEMORY_PROFILE=lean` conserva DSpark copiato ma usa
 11 GiB di cache Q8→F16 e chunk 4096.
 
+Il profilo DSpark rilascia inoltre le pagine sorgente dei GGUF dopo una copia
+CUDA riuscita del target e del sidecar. Il launcher imposta
+`DS4_CUDA_DROP_COPIED_MODEL_PAGES=1`, quindi `posix_fadvise(DONTNEED)` e
+`posix_madvise(DONTNEED)` lasciano residenti i pesi device senza tenere calde
+anche le stesse pagine file/mmap lato host. Nel test del 16 luglio 2026 questo
+ha liberato circa 2 GiB di RAM senza ridurre prefill o throughput DSpark. Per
+diagnostica si può disattivare dal launcher con
+`DS4_CUDA_DROP_COPIED_MODEL_PAGES=0`; usando il binario direttamente resta
+valido il rollback `DS4_CUDA_KEEP_MODEL_PAGES=1`.
+
 Il prefill CUDA usa inoltre una maschera compressa densa a una sola riga: il
 percorso batched ratio-4 passa gli indici top-k a `comp_selected` e non richiede
 più una slab `comp_cap * prefill_cap`. Questo libera circa 512 MiB con chunk

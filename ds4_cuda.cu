@@ -1289,14 +1289,38 @@ static void cuda_model_discard_source_pages(const void *model_map, uint64_t mode
 #endif
 }
 
-static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
+static void cuda_model_drop_file_pages_for_map(const void *model_map, uint64_t offset, uint64_t bytes) {
 #if defined(POSIX_FADV_DONTNEED)
     if (g_model_fd < 0 || getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL || bytes == 0) return;
+    if (g_model_fd_host_base != NULL && model_map != NULL && model_map != g_model_fd_host_base) return;
     (void)posix_fadvise(g_model_fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
 #else
+    (void)model_map;
     (void)offset;
     (void)bytes;
 #endif
+}
+
+static void cuda_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
+    cuda_model_drop_file_pages_for_map(g_model_fd_host_base, offset, bytes);
+}
+
+static void cuda_model_drop_copied_source_pages(
+        const void *model_map,
+        uint64_t model_size,
+        const char *label) {
+    if (!model_map || model_size == 0 ||
+        getenv("DS4_CUDA_KEEP_MODEL_PAGES") != NULL) {
+        return;
+    }
+    cuda_model_drop_file_pages_for_map(model_map, 0, model_size);
+    cuda_model_discard_source_pages(model_map, model_size, 0, model_size);
+    if (getenv("DS4_CUDA_MODEL_COPY_VERBOSE") != NULL) {
+        fprintf(stderr,
+                "ds4: CUDA dropped %.2f GiB source pages after %s device copy\n",
+                (double)model_size / 1073741824.0,
+                label ? label : "model");
+    }
 }
 
 static uint64_t cuda_round_down(uint64_t v, uint64_t align) {
@@ -4057,6 +4081,9 @@ static int cuda_model_add_secondary_map(const void *model_map, uint64_t model_si
                 g_model_range_by_offset[cuda_model_offset_key(model_map, 0)] =
                     g_model_ranges.size() - 1u;
                 g_model_range_bytes += model_size;
+                cuda_model_drop_copied_source_pages(model_map,
+                                                     model_size,
+                                                     "secondary model");
                 fprintf(stderr,
                         "ds4: CUDA secondary model copy complete in %.3fs\n",
                         cuda_wall_sec() - t0);
@@ -4134,6 +4161,9 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
             if (err == cudaSuccess) {
                 g_model_device_base = (const char *)dev;
                 g_model_device_owned = 1;
+                cuda_model_drop_copied_source_pages(model_map,
+                                                     model_size,
+                                                     "model");
                 const double t1 = clock() / (double)CLOCKS_PER_SEC;
                 fprintf(stderr, "ds4: CUDA model copy complete in %.3fs\n", t1 - t0);
                 return 1;

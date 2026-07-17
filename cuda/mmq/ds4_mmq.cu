@@ -774,6 +774,39 @@ int ds4_mmq_moe_impl(
     return 0;
 }
 
+struct ds4_mmq_fused_down {
+    const void  * W;
+    const float * router_weights;
+    float       * mid_f32;
+    float       * out;
+    int           out_dim;
+    float         clamp;
+};
+
+// Produce the weighted SwiGLU rows in their canonical pair-major order. The
+// proven upstream quantizer below gathers them through the already available
+// ids_dst map, so gate/up and down share one expert-major schedule without a
+// second mm_ids_helper.
+static __global__ void ds4_swiglu_weighted_f32(
+        const float * __restrict__ gate,
+        const float * __restrict__ up,
+        const float * __restrict__ router_weights,
+        float * __restrict__ mid,
+        uint64_t n,
+        int K,
+        float clamp) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const uint64_t pair = i / (uint64_t)K;
+    float g = isfinite(gate[i]) ? gate[i] : 0.0f;
+    float u = isfinite(up[i]) ? up[i] : 0.0f;
+    if (clamp > 1.0e-6f) {
+        g = fminf(g, clamp);
+        u = fminf(fmaxf(u, -clamp), clamp);
+    }
+    mid[i] = (g / (1.0f + expf(-g))) * u * router_weights[pair];
+}
+
 // Paired MoE: one helper + one quantize covers both weights.  See the
 // header comment on ds4_mmq_iq2_xxs_moe_pair for motivation.  Internal
 // structure mirrors ds4_mmq_moe_impl above; the only differences are the
@@ -800,7 +833,8 @@ int ds4_mmq_moe_pair_impl(
         const char    * xb_soa     = NULL,
         int64_t         soa_blocks = 0,
         /* ds4 (P3): see ds4_mmq_moe_impl. */
-        bool            sanitize_out = true) {
+        bool            sanitize_out = true,
+        const ds4_mmq_fused_down *fused_down = nullptr) {
 
     if (!W_a || !W_b || !X_f32 || !ids || !out_a || !out_b) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -817,6 +851,13 @@ int ds4_mmq_moe_pair_impl(
     }
     if (n_expert_used > n_experts) {
         fprintf(stderr, "%s: n_expert_used=%d > n_experts=%d\n", tag, n_expert_used, n_experts);
+        return -1;
+    }
+    if (fused_down &&
+        (type != GGML_TYPE_IQ2_XXS || !fused_down->W ||
+         !fused_down->router_weights || !fused_down->mid_f32 ||
+         !fused_down->out || fused_down->out_dim <= 0 || M % 256 != 0)) {
+        fprintf(stderr, "%s: invalid fused Q2_K down configuration\n", tag);
         return -1;
     }
 
@@ -872,6 +913,13 @@ int ds4_mmq_moe_pair_impl(
         return -2;
     }
 
+    const bool use_stream_k =
+        (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
+        GGML_CUDA_CC_IS_CDNA(cc);
+
+    /* The gate/up Q8_1 can be stream-freed before allocating the down Q8_1;
+     * ids_dst and expert_bounds remain alive outside this scope. */
+    {
     const size_t nbytes_src1_q8_1 =
         ne_get_rows * ne10_padded * sizeof(block_q8_1) / QK8_1 +
         get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
@@ -901,10 +949,6 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s1      = (int64_t)M;
     const int64_t s12_mmq = ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13_mmq = ne12 * s12_mmq;
-
-    const bool use_stream_k =
-        (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
-        GGML_CUDA_CC_IS_CDNA(cc);
 
     if (out_memset_enabled()) {
         cudaMemsetAsync(out_a, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
@@ -981,6 +1025,88 @@ int ds4_mmq_moe_pair_impl(
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: mul_mat_q_case (pair b) launch failed: %s\n", tag, cudaGetErrorString(err));
         return -5;
+    }
+    }
+
+    if (fused_down) {
+        const int64_t down_ne10_padded = GGML_PAD((int64_t)M, MATRIX_ROW_PADDING);
+        const size_t logical_q8_bytes =
+            (size_t)ne_get_rows * (size_t)down_ne10_padded * sizeof(block_q8_1) / QK8_1;
+        const size_t tail_q8_bytes =
+            (size_t)get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
+        ggml_cuda_pool_alloc<char> down_q8_1(
+            ctx->pool(), logical_q8_bytes + tail_q8_bytes);
+
+        cudaMemsetAsync(down_q8_1.get(), 0, logical_q8_bytes + tail_q8_bytes, stream);
+        const uint64_t mid_values = (uint64_t)ne_get_rows * (uint64_t)M;
+        ds4_swiglu_weighted_f32<<<
+            (uint32_t)((mid_values + 255u) / 256u), 256, 0, stream>>>(
+                out_a, out_b, fused_down->router_weights,
+                fused_down->mid_f32, mid_values, M, fused_down->clamp);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: weighted SwiGLU launch failed: %s\n",
+                    tag, cudaGetErrorString(err));
+            return -6;
+        }
+
+        quantize_mmq_q8_1_cuda(
+            fused_down->mid_f32, ids_dst.get(), (void *)down_q8_1.get(),
+            GGML_TYPE_Q2_K, /*ne00=*/M, /*s01=*/M,
+            /*s02=*/(int64_t)M, /*s03=*/(int64_t)M * ne_get_rows,
+            /*ne0=*/down_ne10_padded, /*ne1=*/ne_get_rows,
+            /*ne2=*/1, /*ne3=*/1, stream);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: down quantize_mmq_q8_1_cuda failed: %s\n",
+                    tag, cudaGetErrorString(err));
+            return -7;
+        }
+
+        if (out_memset_enabled()) {
+            cudaMemsetAsync(fused_down->out, 0,
+                    (size_t)fused_down->out_dim * (size_t)ne_get_rows * sizeof(float),
+                    stream);
+        }
+        const int64_t down_s01 = (int64_t)M / ggml_blck_size(GGML_TYPE_Q2_K);
+        const int64_t down_s02 = (int64_t)fused_down->out_dim * down_s01;
+        const int64_t down_s12 =
+            down_ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
+        const mmq_args down_args = {
+            /*x=*/(const char *)fused_down->W,
+            /*type_x=*/GGML_TYPE_Q2_K,
+            /*y=*/(const int *)down_q8_1.get(),
+            /*ids_dst=*/ids_dst.get(),
+            /*expert_bounds=*/expert_bounds.get(),
+            /*dst=*/fused_down->out,
+            /*ncols_x=*/(int64_t)M,
+            /*nrows_x=*/(int64_t)fused_down->out_dim,
+            /*ncols_dst=*/ne_get_rows,
+            /*stride_row_x=*/down_s01,
+            /*ncols_y=*/ne_get_rows,
+            /*nrows_dst=*/(int64_t)fused_down->out_dim,
+            /*nchannels_x=*/(int64_t)n_experts,
+            /*nchannels_y=*/(int64_t)n_experts,
+            /*stride_channel_x=*/down_s02,
+            /*stride_channel_y=*/down_s12,
+            /*stride_channel_dst=*/(int64_t)0,
+            /*nsamples_x=*/1,
+            /*nsamples_y=*/1,
+            /*stride_sample_x=*/0,
+            /*stride_sample_y=*/ne_get_rows * down_s12,
+            /*stride_sample_dst=*/0,
+            /*use_stream_k=*/use_stream_k,
+            /*ncols_max=*/ne_get_rows,
+            /*x_soa=*/nullptr,
+            /*soa_blocks=*/0,
+        };
+        mul_mat_q_case<GGML_TYPE_Q2_K>(*ctx, down_args, stream);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "%s: fused Q2_K down launch failed: %s\n",
+                    tag, cudaGetErrorString(err));
+            return -8;
+        }
     }
     if (sanitize_out) {
         ds4_mmq_sanitize_f32(out_a, (uint64_t)M * (uint64_t)ne_get_rows, stream);
@@ -1076,6 +1202,29 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_consumer_sanitizes(
         M, K, n_tokens, n_experts, n_expert_used, stream,
         /*xa_soa=*/NULL, /*xb_soa=*/NULL, /*soa_blocks=*/0,
         /*sanitize_out=*/false);
+}
+
+extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused(
+        const void * W_gate, const void * W_up, const void * W_down,
+        const float * X, const int32_t * ids, const float * router_weights,
+        float * gate, float * up, float * mid_f32, float * down,
+        int expert_mid_dim, int expert_in_dim, int out_dim,
+        int n_tokens, int n_experts, int n_expert_used,
+        float clamp, cudaStream_t stream) {
+    const ds4_mmq_fused_down fused_down = {
+        W_down,
+        router_weights,
+        mid_f32,
+        down,
+        out_dim,
+        clamp,
+    };
+    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
+        "ds4_mmq_iq2_xxs_q2_K_moe_fused",
+        W_gate, W_up, X, ids, gate, up,
+        expert_mid_dim, expert_in_dim, n_tokens, n_experts, n_expert_used,
+        stream, /*xa_soa=*/NULL, /*xb_soa=*/NULL, /*soa_blocks=*/0,
+        /*sanitize_out=*/false, &fused_down);
 }
 
 /* ds4 (P4 Inc3): paired mmq MoE over the aligned-SoA IQ2_XXS gate/up

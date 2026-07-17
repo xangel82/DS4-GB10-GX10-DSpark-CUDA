@@ -1109,14 +1109,25 @@ Il percorso automatico esegue, nell'ordine:
 1. costruzione della mappa degli assignment top-6 in ordine expert-major;
 2. quantizzazione Q8_1 unica dell'attivazione comune e MMQ batched IQ2_XXS
    accoppiato per gate e up;
-3. SwiGLU, clamp e routing weight in un solo kernel sugli intermedi esistenti;
-4. flatten di `[token, slot]`, riordino expert-major e MMQ batched Q2_K down;
-5. somma delle sei uscite direttamente nel risultato MoE del token.
+3. clamp, SwiGLU e routing weight calcolati in una sola passata nel `mid`;
+4. gather e quantizzazione Q8_1 D2S6 tramite il quantizzatore MMQ validato;
+5. MMQ batched Q2_K down con la stessa mappa e gli stessi `expert_bounds`,
+   senza un secondo `mm_ids_helper`;
+6. somma delle sei uscite direttamente nel risultato MoE del token.
 
-Per chunk 8192 il down presenta 49152 assignment. Il launcher Entrpi usa la
-variante globale dell'`mm_ids_helper` quando la mappa non entra nella shared
-memory, evitando il precedente fallback dell'intero MoE proprio sul chunk di
-produzione.
+Per chunk 8192 il down presenta 49152 assignment. La prima versione ricostruiva
+la mappa interpretando gli assignment come 49152 token da un esperto e finiva
+nella variante globale dell'`mm_ids_helper`. La pipeline corrente conserva
+invece la mappa top-6 costruita per gate/up: `ids_dst` è già la permutazione
+esatta tra ordine expert-major e riga `[token, slot]` richiesta dal down.
+
+Il primo tentativo di scrivere direttamente la Q8_1 D2S6 dall'epilogo ha
+superato la parita' gate/up ma ha prodotto `final=7.19737 rel-rmse` sul test
+Q2_K; e' stato quindi rimosso prima del deploy. La pipeline usa il buffer `mid`
+FP32 gia' allocato e il quantizzatore D2S6 collaudato, mantenendo il vantaggio
+della mappa unica senza introdurre un layout quantizzato non validato. La Q8_1
+di gate/up viene liberata sullo stream prima di allocare quella del down,
+quindi il riuso della mappa non somma i due grandi scratch al picco del pool.
 
 Questa integrazione include intenzionalmente soltanto il percorso sui pesi
 GGUF canonici già copiati dal loader. Non chiama `ds4_repack`, non costruisce
@@ -1128,11 +1139,13 @@ particolare, non torna il repack da circa 76.5 GiB che aveva portato Athena al
 Il confine con il decode è strutturale, senza flag:
 
 - sono accettati soltanto `IQ2_XXS gate/up`, `Q2_K down`, top-6 e
-  `n_tokens >= 128`;
+  `n_tokens >= 1024`;
 - decode target a una riga e verifier DSpark da 2..6 righe restano sui kernel
   precedenti;
+- le code sotto 1024 token tornano automaticamente al routed-MoE batch
+  precedente, evitando MMQ nei batch con poca occupazione;
 - il sidecar DSpark Q4, CUDA Graph e SSD expert streaming restano invariati;
-- gate, up, mid e down riusano i quattro buffer batch già allocati da DS4;
+- gate, up, mid FP32 e down riusano i quattro buffer batch già allocati da DS4;
   soltanto mappe e attivazioni quantizzate temporanee passano dal pool CUDA
   asincrono e vengono liberate in ordine di stream.
 
@@ -1143,7 +1156,7 @@ gate, up e down mantenendo la stessa semantica dei kernel precedenti.
 Il primo chunk compatibile deve stampare:
 
 ```text
-ds4: CUDA Entrpi batched MMQ MoE prefill enabled (shared-Q8 IQ2 gate/up, expert-major Q2 down; decode excluded)
+ds4: CUDA Entrpi batched MMQ MoE prefill enabled (single-map IQ2 gate/up + Q2 down; decode excluded)
 ```
 
 Prima del deploy è obbligatorio eseguire:
@@ -1155,10 +1168,19 @@ make -B cuda-regression CUDA_ARCH=sm_121
 La regressione genera pesi IQ2_XXS/Q2_K e attivazioni deterministici non
 correlati ed esegue la stessa pipeline di produzione con il clamp reale
 `10.0`. Il log `raw-GGUF MMQ MoE parity ... rel-rmse/bad` deve riportare zero
-elementi gate/up post-clamp fuori tolleranza e concludersi con
+elementi gate/up post-clamp fuori tolleranza, `mid` e `final` sotto la soglia,
+e concludersi con
 `cuda long-context regression: OK`. MMQ usa attivazioni Q8_1, mentre il
 percorso DS4 precedente usa Q8_K: pesi, top-6, clamp, routing weight e formula
 MoE non cambiano, ma i logits non sono attesi bit-identici.
+
+Il commit locale `4eb7441` congela la prima integrazione raw-GGUF validata su
+Athena: circa 448 t/s sul chunk 8192, 413-418 t/s sull'intero prompt da
+10-13K e decode DSpark 23-26 t/s nei run osservati. La mappa unica e il
+crossover a 1024 descritti sopra sono l'incremento
+successivo e devono superare di nuovo la regressione CUDA e il test Athena
+prima di un altro commit. La fusione diretta SwiGLU-Q8 resta esclusa finche' un
+test isolato del layout D2S6 non dimostra parita'.
 
 I numeri Entrpi su PRO 6000 non vanno trasferiti direttamente alla GB10. Per
 accettare la patch servono sullo stesso prompt Athena: prefill superiore,

@@ -264,6 +264,32 @@ int ds4_mmq_iq2_xxs_moe_pair_consumer_sanitizes(
     int             n_expert_used,
     cudaStream_t    stream);
 
+// Target-prefill pipeline for the V4 Flash routed MoE. It builds the
+// expert-major assignment map once, runs the paired IQ2_XXS gate/up MMQs,
+// computes clamp + SwiGLU + router weighting in mid_f32, then gathers and
+// quantizes those rows for the Q2_K down MMQ through the same ids_dst and
+// expert_bounds. No second mm_ids_helper is launched; gate/up/mid/down keep
+// the standard pair-major output layout.
+int ds4_mmq_iq2_xxs_q2_K_moe_fused(
+    const void    * W_gate,
+    const void    * W_up,
+    const void    * W_down,
+    const float   * X_f32,
+    const int32_t * ids,
+    const float   * router_weights,
+    float         * gate_f32,
+    float         * up_f32,
+    float         * mid_f32,
+    float         * down_f32,
+    int             expert_mid_dim,
+    int             expert_in_dim,
+    int             out_dim,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    float           clamp,
+    cudaStream_t    stream);
+
 // ds4 (P4 Inc3): same contract as ds4_mmq_iq2_xxs_moe_pair but over the
 // aligned-SoA artifacts (weight server --repack-iq2-aligned); see
 // ds4_mmq_q2_K_moe_soa.

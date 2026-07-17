@@ -121,6 +121,7 @@ static int g_cublas_ready;
 static int g_mmq_prefill_ready;
 static int g_mmq_prefill_notice;
 static int g_mmq_prefill_fallback_notice;
+static constexpr uint32_t DS4_MMQ_PREFILL_MIN_TOKENS = 1024u;
 static void *g_cublas_workspace;
 static uint64_t g_cublas_workspace_bytes;
 static int g_quality_mode;
@@ -15951,31 +15952,6 @@ __global__ static void moe_mmq_sum_guard_kernel(
     out[gid] = acc;
 }
 
-__global__ static void moe_mmq_swiglu_weighted_kernel(
-        float *mid,
-        const float *gate,
-        const float *up,
-        const float *weights,
-        uint32_t mid_dim,
-        uint32_t n_expert,
-        uint32_t n_tokens,
-        float clamp) {
-    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const uint64_t pair_count = (uint64_t)n_tokens * n_expert;
-    const uint64_t n = pair_count * mid_dim;
-    if (gid >= n) return;
-    const uint64_t pair = gid / mid_dim;
-    float g = gate[gid];
-    float u = up[gid];
-    if (!isfinite(g)) g = 0.0f;
-    if (!isfinite(u)) u = 0.0f;
-    if (clamp > 1.0e-6f) {
-        g = fminf(g, clamp);
-        u = fminf(fmaxf(u, -clamp), clamp);
-    }
-    mid[gid] = (g / (1.0f + expf(-g))) * u * weights[pair];
-}
-
 __device__ static float dev_iq2_xxs_dot_f32(const cuda_block_iq2_xxs *row, const float *x, uint32_t nb) {
     float acc = 0.0f;
     for (uint32_t b = 0; b < nb; b++) {
@@ -16131,7 +16107,7 @@ static int routed_moe_mmq_prefill_allowed(
         uint32_t gate_type, uint32_t down_type,
         uint32_t n_tokens, uint32_t n_expert) {
     return gate_type == 16u && down_type == 10u &&
-           n_tokens >= 128u && n_expert == 6u;
+           n_tokens >= DS4_MMQ_PREFILL_MIN_TOKENS && n_expert == 6u;
 }
 
 static int routed_moe_mmq_prefill_launch(
@@ -16156,8 +16132,9 @@ static int routed_moe_mmq_prefill_launch(
         uint32_t n_total_expert,
         uint32_t n_expert,
         uint32_t n_tokens,
-        float clamp) {
-    if (!g_mmq_prefill_ready || n_tokens < 128u ||
+        float clamp,
+        bool *mid_is_f16) {
+    if (!g_mmq_prefill_ready || n_tokens < DS4_MMQ_PREFILL_MIN_TOKENS ||
         !out || !gate || !up || !mid || !down ||
         !gate_w || !up_w || !down_w ||
         !selected || !weights || !x || n_total_expert == 0 || n_expert == 0 ||
@@ -16187,45 +16164,30 @@ static int routed_moe_mmq_prefill_launch(
     const cudaStream_t stream = 0;
 #endif
 
-    /* Entrpi's batched MMQ path builds an expert-major assignment map and
-     * quantizes the common gate/up activation once. The existing DS4 batch
-     * tensors hold all intermediates, so this adds no persistent model copy. */
-    int rc = ds4_mmq_iq2_xxs_moe_pair_consumer_sanitizes(
-            gate_w, up_w, x, selected,
-            (float *)gate->ptr, (float *)up->ptr,
-            (int)expert_mid_dim, (int)expert_in_dim, (int)n_tokens,
-            (int)n_total_expert, (int)n_expert, stream);
+    /* One expert-major map now spans gate/up and down. The established MMQ
+     * quantizer gathers the weighted SwiGLU rows through that same map. */
+    int rc = ds4_mmq_iq2_xxs_q2_K_moe_fused(
+            gate_w, up_w, down_w, x, selected, weights,
+            (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+            (float *)down->ptr,
+            (int)expert_mid_dim, (int)expert_in_dim, (int)out_dim,
+            (int)n_tokens, (int)n_total_expert, (int)n_expert,
+            clamp, stream);
     if (rc != 0) return -1;
-
-    const uint64_t mid_values = assignment_count * expert_mid_dim;
-    moe_mmq_swiglu_weighted_kernel<<<
-            (uint32_t)((mid_values + 255u) / 256u), 256, 0, stream>>>(
-            (float *)mid->ptr,
-            (const float *)gate->ptr,
-            (const float *)up->ptr,
-            weights, expert_mid_dim, n_expert, n_tokens, clamp);
-    if (cudaGetLastError() != cudaSuccess) return -2;
-
-    /* Each weighted mid row is now an independent one-expert assignment.
-     * Flattening [token, slot] lets MMQ sort the Q2_K down work by expert. */
-    rc = ds4_mmq_q2_K_moe_consumer_sanitizes(
-            down_w, (const float *)mid->ptr, selected, (float *)down->ptr,
-            (int)out_dim, (int)expert_mid_dim, (int)assignment_count,
-            (int)n_total_expert, 1, stream);
-    if (rc != 0) return -3;
+    if (mid_is_f16) *mid_is_f16 = false;
 
     const uint64_t out_values = (uint64_t)n_tokens * out_dim;
     moe_mmq_sum_guard_kernel<<<
             (uint32_t)((out_values + 255u) / 256u), 256, 0, stream>>>(
             (float *)out->ptr, (const float *)down->ptr,
             out_dim, n_expert, n_tokens);
-    if (cudaGetLastError() != cudaSuccess) return -4;
+    if (cudaGetLastError() != cudaSuccess) return -2;
 
     if (!g_mmq_prefill_notice) {
         g_mmq_prefill_notice = 1;
         fprintf(stderr,
                 "ds4: CUDA Entrpi batched MMQ MoE prefill enabled "
-                "(shared-Q8 IQ2 gate/up, expert-major Q2 down; decode excluded)\n");
+                "(single-map IQ2 gate/up + Q2 down; decode excluded)\n");
     }
     return 1;
 }
@@ -16257,7 +16219,8 @@ static int routed_moe_launch(
         float clamp,
         const ds4_gpu_tensor *x,
         uint32_t layer_index,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        bool *mid_is_f16) {
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
@@ -16328,7 +16291,7 @@ static int routed_moe_launch(
                 expert_in_dim, expert_mid_dim, out_dim,
                 selected_ptr, (const float *)weights->ptr,
                 (const float *)x->ptr,
-                n_total_expert, n_expert, n_tokens, clamp);
+                n_total_expert, n_expert, n_tokens, clamp, mid_is_f16);
         if (mmq_rc > 0) return 1;
         if (mmq_rc < 0 && !g_mmq_prefill_fallback_notice) {
             g_mmq_prefill_fallback_notice = 1;
@@ -17030,7 +16993,7 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, 1);
+                             layer_index, 1, NULL);
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
@@ -17041,7 +17004,7 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, n_tokens);
+                             layer_index, n_tokens, mid_is_f16);
 }
 
 extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
@@ -17057,9 +17020,10 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
     if (!g_mmq_prefill_ready ||
         routed_moe_mmq_prefill_allowed(16u, 10u, 1u, n_expert) ||
         routed_moe_mmq_prefill_allowed(16u, 10u, 6u, n_expert) ||
-        routed_moe_mmq_prefill_allowed(12u, 12u, 128u, n_expert) ||
-        routed_moe_mmq_prefill_allowed(16u, 10u, 128u, 4u) ||
-        !routed_moe_mmq_prefill_allowed(16u, 10u, 128u, n_expert)) {
+        routed_moe_mmq_prefill_allowed(12u, 12u, DS4_MMQ_PREFILL_MIN_TOKENS, n_expert) ||
+        routed_moe_mmq_prefill_allowed(16u, 10u, DS4_MMQ_PREFILL_MIN_TOKENS, 4u) ||
+        routed_moe_mmq_prefill_allowed(16u, 10u, DS4_MMQ_PREFILL_MIN_TOKENS - 1u, n_expert) ||
+        !routed_moe_mmq_prefill_allowed(16u, 10u, DS4_MMQ_PREFILL_MIN_TOKENS, n_expert)) {
         return 0;
     }
 
@@ -17087,6 +17051,8 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
     std::vector<float> gate_mmq_host(pair_values);
     std::vector<float> up_ref_host(pair_values);
     std::vector<float> up_mmq_host(pair_values);
+    std::vector<float> mid_ref_host(pair_values);
+    std::vector<float> mid_mmq_host(pair_values);
     std::vector<float> out_ref_host(out_values);
     std::vector<float> out_mmq_host(out_values);
 
@@ -17205,26 +17171,14 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
     }
 
     if (ok) {
-        ok = ds4_mmq_iq2_xxs_moe_pair_consumer_sanitizes(
-                gate_w->ptr, up_w->ptr, (const float *)x->ptr,
-                (const int32_t *)selected->ptr,
+        ok = ds4_mmq_iq2_xxs_q2_K_moe_fused(
+                gate_w->ptr, up_w->ptr, down_w->ptr,
+                (const float *)x->ptr, (const int32_t *)selected->ptr,
+                (const float *)weights->ptr,
                 (float *)gate_mmq->ptr, (float *)up_mmq->ptr,
-                mid_dim, in_dim, n_tokens, n_total_expert, n_expert,
-                stream) == 0;
-    }
-    if (ok) {
-        moe_mmq_swiglu_weighted_kernel<<<
-                (uint32_t)((pair_values + 255u) / 256u), 256, 0, stream>>>(
-                (float *)mid_mmq->ptr, (const float *)gate_mmq->ptr,
-                (const float *)up_mmq->ptr, (const float *)weights->ptr,
-                mid_dim, n_expert, n_tokens, test_clamp);
-        ok = cudaGetLastError() == cudaSuccess;
-    }
-    if (ok) {
-        ok = ds4_mmq_q2_K_moe_consumer_sanitizes(
-                down_w->ptr, (const float *)mid_mmq->ptr,
-                (const int32_t *)selected->ptr, (float *)down_mmq->ptr,
-                out_dim, mid_dim, (int)pair_count, n_total_expert, 1,
+                (float *)mid_mmq->ptr, (float *)down_mmq->ptr,
+                mid_dim, in_dim, out_dim,
+                n_tokens, n_total_expert, n_expert, test_clamp,
                 stream) == 0;
     }
     if (ok) {
@@ -17238,14 +17192,15 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
     if (ok) ok = ds4_gpu_tensor_read(gate_mmq, 0, gate_mmq_host.data(), gate_mmq->bytes);
     if (ok) ok = ds4_gpu_tensor_read(up_ref, 0, up_ref_host.data(), up_ref->bytes);
     if (ok) ok = ds4_gpu_tensor_read(up_mmq, 0, up_mmq_host.data(), up_mmq->bytes);
+    if (ok) ok = ds4_gpu_tensor_read(mid_ref, 0, mid_ref_host.data(), mid_ref->bytes);
+    if (ok) ok = ds4_gpu_tensor_read(mid_mmq, 0, mid_mmq_host.data(), mid_mmq->bytes);
     if (ok) ok = ds4_gpu_tensor_read(out_ref, 0, out_ref_host.data(), out_ref->bytes);
     if (ok) ok = ds4_gpu_tensor_read(out_mmq, 0, out_mmq_host.data(), out_mmq->bytes);
 
     if (ok) {
-        /* The established fused kernel stores gate/up after applying clamp,
-         * while MMQ intentionally leaves both projections raw and applies
-         * the same clamp in moe_mmq_swiglu_weighted_kernel. Compare like with
-         * like here without adding a production GPU pass. */
+        /* The established kernel stores gate/up after applying clamp, while
+         * MMQ leaves both projections raw and clamps in the weighted SwiGLU
+         * pass. Compare like with like without adding a production GPU pass. */
         for (uint64_t i = 0; i < pair_values; ++i) {
             if (gate_mmq_host[i] > test_clamp) gate_mmq_host[i] = test_clamp;
             if (up_mmq_host[i] > test_clamp) up_mmq_host[i] = test_clamp;
@@ -17295,19 +17250,22 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
                 gate_ref_host, gate_mmq_host, iq2_abs_tol, 0.05);
         const parity_stats up_stats = analyze_parity(
                 up_ref_host, up_mmq_host, iq2_abs_tol, 0.05);
+        const parity_stats mid_stats = analyze_parity(
+                mid_ref_host, mid_mmq_host, INFINITY, INFINITY);
         const parity_stats out_stats = analyze_parity(
                 out_ref_host, out_mmq_host, INFINITY, INFINITY);
         fprintf(stderr,
                 "cuda-regression: raw-GGUF MMQ MoE parity "
-                "gate=%.5f/%llu up=%.5f/%llu final=%.5f rel-rmse/bad\n",
+                "gate=%.5f/%llu up=%.5f/%llu mid=%.5f final=%.5f rel-rmse/bad\n",
                 gate_stats.relative_rmse,
                 (unsigned long long)gate_stats.bad,
                 up_stats.relative_rmse,
                 (unsigned long long)up_stats.bad,
+                mid_stats.relative_rmse,
                 out_stats.relative_rmse);
         parity_reported = 1;
         ok = gate_stats.bad == 0 && up_stats.bad == 0 &&
-             out_stats.relative_rmse < 0.10;
+             mid_stats.relative_rmse < 0.10 && out_stats.relative_rmse < 0.10;
     }
 
     if (!ok && !parity_reported) {

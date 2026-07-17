@@ -1210,6 +1210,32 @@ sovrapposto 24.5K-57.3K il throughput aggregato e' salito da circa 364.7 a
 t/s a 24.5K. Il decode a 83K ha prodotto 401 token a 23.00 t/s, senza BOS,
 non-finite o regressioni DSpark.
 
+#### Copia iniziale CUDA pipelined
+
+Il caricamento del target da 80.76 GiB non usa piu' un unico `cudaMemcpy`
+sincrono dalla mmap. Il percorso di produzione legge il GGUF in chunk da 64
+MiB con `pread` e, quando disponibile, `O_DIRECT`; quattro buffer host pinned
+permettono di sovrapporre la lettura del chunk successivo al
+`cudaMemcpyAsync` corrente. Le pagine sorgente vengono scartate dopo che il
+contenuto e' entrato nello staging pinned, quindi resta valido il risparmio RAM
+del commit `bbaa42f`.
+
+I buffer, gli eventi e lo stream di upload sono temporanei e vengono liberati
+prima del caricamento del sidecar DSpark. Un errore di allocazione, lettura o
+copia ripristina automaticamente il precedente `cudaMemcpy` monolitico. Il log
+che dimostra l'attivazione e':
+
+```text
+ds4: CUDA pipelined model copy 80.76 GiB (chunk=64 MiB, stages=4, direct-io=1)
+```
+
+La metrica e' ora wall-clock e riporta anche i GiB/s. Il riferimento precedente
+su Athena era 419.9-478.5 secondi per la sola copia primaria; l'obiettivo di
+accettazione e' non oltre 210 secondi, senza variazioni nella memoria residente
+a server pronto. Dopo il test di startup restano obbligatori la regression CUDA
+e un controllo prefill/decode DSpark, perche' il layout dei pesi non cambia ma
+la disponibilita' dei byte sul device deve restare completa.
+
 I numeri Entrpi su PRO 6000 non vanno trasferiti direttamente alla GB10. Per
 accettare la patch servono sullo stesso prompt Athena: prefill superiore,
 nessun aumento materiale della memoria residente dopo il chunk, decode DSpark

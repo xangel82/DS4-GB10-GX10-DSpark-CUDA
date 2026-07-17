@@ -1369,8 +1369,10 @@ static void *cuda_align_ptr(void *ptr, uint64_t align) {
     return (void *)(((p + a - 1u) / a) * a);
 }
 
-static int cuda_model_stage_pool_alloc(uint64_t bytes) {
-    if (g_model_stage_bytes >= bytes) return 1;
+static void cuda_model_stage_pool_release(void) {
+    if (g_model_upload_stream) {
+        (void)cudaStreamSynchronize(g_model_upload_stream);
+    }
     for (size_t i = 0; i < 4; i++) {
         if (g_model_stage_event[i]) {
             (void)cudaEventDestroy(g_model_stage_event[i]);
@@ -1383,6 +1385,18 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
         }
     }
     g_model_stage_bytes = 0;
+    if (g_model_upload_stream) {
+        (void)cudaStreamDestroy(g_model_upload_stream);
+        g_model_upload_stream = NULL;
+    }
+}
+
+static int cuda_model_stage_pool_alloc(uint64_t bytes) {
+    if (g_model_stage_bytes >= bytes) return 1;
+    cuda_model_stage_pool_release();
+    const uint64_t align_slack = g_model_direct_align > 1 ? g_model_direct_align : 1;
+    if (bytes > (uint64_t)SIZE_MAX - align_slack) return 0;
+    const size_t alloc_bytes = (size_t)(bytes + align_slack);
     if (!g_model_upload_stream) {
         cudaError_t err = cudaStreamCreateWithFlags(&g_model_upload_stream, cudaStreamNonBlocking);
         if (err != cudaSuccess) {
@@ -1392,10 +1406,11 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
         }
     }
     for (size_t i = 0; i < 4; i++) {
-        cudaError_t err = cudaMallocHost(&g_model_stage_raw[i], (size_t)bytes);
+        cudaError_t err = cudaMallocHost(&g_model_stage_raw[i], alloc_bytes);
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: CUDA pinned model staging allocation failed: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
+            cuda_model_stage_pool_release();
             return 0;
         }
         g_model_stage[i] = cuda_align_ptr(g_model_stage_raw[i], g_model_direct_align);
@@ -1403,6 +1418,7 @@ static int cuda_model_stage_pool_alloc(uint64_t bytes) {
         if (err != cudaSuccess) {
             fprintf(stderr, "ds4: CUDA model staging event creation failed: %s\n", cudaGetErrorString(err));
             (void)cudaGetLastError();
+            cuda_model_stage_pool_release();
             return 0;
         }
     }
@@ -1681,71 +1697,105 @@ static int cuda_model_copy_chunked(const void *model_map, uint64_t model_size, u
         return 0;
     }
 
-    fprintf(stderr, "ds4: CUDA chunk-copying %.2f GiB model image\n",
-            (double)model_size / 1073741824.0);
-
     const uint64_t chunk = cuda_model_copy_chunk_bytes();
-    void *stage = NULL;
-    err = cudaMallocHost(&stage, (size_t)chunk);
-    if (err != cudaSuccess) {
-        fprintf(stderr, "ds4: CUDA pinned model staging allocation failed: %s\n", cudaGetErrorString(err));
+    const uint64_t align_slack = g_model_direct_align > 1 ? g_model_direct_align : 1;
+    if (chunk > UINT64_MAX - align_slack ||
+        !cuda_model_stage_pool_alloc(chunk + align_slack)) {
         (void)cudaFree(dev);
-        (void)cudaGetLastError();
         return 0;
     }
 
-    if (map_offset > 0) {
-        uint64_t copied_header = 0;
-        while (copied_header < map_offset) {
-            const uint64_t n = (map_offset - copied_header < chunk) ? (map_offset - copied_header) : chunk;
-            memcpy(stage, (const char *)model_map + copied_header, (size_t)n);
-            err = cudaMemcpy((char *)dev + copied_header, stage, (size_t)n, cudaMemcpyHostToDevice);
-            if (err != cudaSuccess) {
-                fprintf(stderr, "ds4: CUDA model header copy failed: %s\n", cudaGetErrorString(err));
-                (void)cudaFreeHost(stage);
-                (void)cudaFree(dev);
-                (void)cudaGetLastError();
-                return 0;
-            }
-            copied_header += n;
-        }
-    }
+    const uint64_t copy_bytes = map_offset + map_size;
+    fprintf(stderr,
+            "ds4: CUDA pipelined model copy %.2f GiB (chunk=%llu MiB, stages=4, direct-io=%d)\n",
+            (double)copy_bytes / 1073741824.0,
+            (unsigned long long)(chunk / 1048576ull),
+            g_model_direct_fd >= 0 ? 1 : 0);
 
     uint64_t copied = 0;
+    uint64_t chunk_idx = 0;
     double last_report = t0;
-    while (copied < map_size) {
-        const uint64_t n = (map_size - copied < chunk) ? (map_size - copied) : chunk;
-        const uint64_t off = map_offset + copied;
-        memcpy(stage, (const char *)model_map + off, (size_t)n);
-        err = cudaMemcpy((char *)dev + off, stage, (size_t)n, cudaMemcpyHostToDevice);
+    while (copied < copy_bytes) {
+        const uint64_t n = (copy_bytes - copied < chunk) ? (copy_bytes - copied) : chunk;
+        const uint64_t bi = chunk_idx % 4u;
+        if (chunk_idx >= 4u) {
+            err = cudaEventSynchronize(g_model_stage_event[bi]);
+            if (err != cudaSuccess) {
+                fprintf(stderr, "ds4: CUDA model staging wait failed at %.2f GiB: %s\n",
+                        (double)copied / 1073741824.0, cudaGetErrorString(err));
+                (void)cudaGetLastError();
+                cuda_model_stage_pool_release();
+                (void)cudaFree(dev);
+                return 0;
+            }
+        }
+
+        const char *payload = NULL;
+        if (g_model_fd >= 0) {
+            if (!cuda_model_stage_read(g_model_stage[bi], g_model_stage_bytes,
+                                       copied, n, &payload)) {
+                fprintf(stderr, "ds4: CUDA model read failed at %.2f GiB: %s\n",
+                        (double)copied / 1073741824.0, strerror(errno));
+                cuda_model_stage_pool_release();
+                (void)cudaFree(dev);
+                return 0;
+            }
+        } else {
+            memcpy(g_model_stage[bi], (const char *)model_map + copied, (size_t)n);
+            payload = (const char *)g_model_stage[bi];
+        }
+
+        err = cudaMemcpyAsync((char *)dev + copied, payload, (size_t)n,
+                              cudaMemcpyHostToDevice, g_model_upload_stream);
         if (err != cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA model chunk copy failed at %.2f GiB: %s\n",
+            fprintf(stderr, "ds4: CUDA model async copy failed at %.2f GiB: %s\n",
                     (double)copied / 1073741824.0, cudaGetErrorString(err));
-            (void)cudaFreeHost(stage);
-            (void)cudaFree(dev);
             (void)cudaGetLastError();
+            cuda_model_stage_pool_release();
+            (void)cudaFree(dev);
             return 0;
         }
-        cuda_model_discard_source_pages(model_map, model_size, off, n);
+        err = cudaEventRecord(g_model_stage_event[bi], g_model_upload_stream);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA model staging record failed at %.2f GiB: %s\n",
+                    (double)copied / 1073741824.0, cudaGetErrorString(err));
+            (void)cudaGetLastError();
+            cuda_model_stage_pool_release();
+            (void)cudaFree(dev);
+            return 0;
+        }
+        cuda_model_drop_file_pages_for_map(model_map, copied, n);
+        cuda_model_discard_source_pages(model_map, model_size, copied, n);
         copied += n;
+        chunk_idx++;
         const double now = cuda_wall_sec();
         if (getenv("DS4_CUDA_MODEL_COPY_VERBOSE") != NULL && now - last_report >= 2.0) {
-            fprintf(stderr, "ds4: CUDA model chunk copy %.2f/%.2f GiB\n",
+            fprintf(stderr, "ds4: CUDA pipelined model copy %.2f/%.2f GiB\n",
                     (double)copied / 1073741824.0,
-                    (double)map_size / 1073741824.0);
+                    (double)copy_bytes / 1073741824.0);
             last_report = now;
         }
     }
 
-    (void)cudaFreeHost(stage);
+    err = cudaStreamSynchronize(g_model_upload_stream);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA model upload sync failed: %s\n", cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        cuda_model_stage_pool_release();
+        (void)cudaFree(dev);
+        return 0;
+    }
+    cuda_model_stage_pool_release();
     g_model_device_base = (const char *)dev;
     g_model_device_owned = 1;
     g_model_hmm_direct = 0;
     const double t1 = cuda_wall_sec();
+    const double elapsed = t1 - t0;
     fprintf(stderr,
-            "ds4: CUDA model chunk copy complete in %.3fs (%.2f GiB tensors)\n",
-            t1 - t0,
-            (double)map_size / 1073741824.0);
+            "ds4: CUDA pipelined model copy complete in %.3fs (%.2f GiB, %.2f GiB/s)\n",
+            elapsed,
+            (double)copy_bytes / 1073741824.0,
+            elapsed > 0.0 ? ((double)copy_bytes / 1073741824.0) / elapsed : 0.0);
     return 1;
 }
 
@@ -2727,22 +2777,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_mtp_tc_scratch = NULL;
         g_mtp_tc_scratch_bytes = 0;
     }
-    for (size_t i = 0; i < 4; i++) {
-        if (g_model_stage_event[i]) {
-            (void)cudaEventDestroy(g_model_stage_event[i]);
-            g_model_stage_event[i] = NULL;
-        }
-        if (g_model_stage_raw[i]) {
-            (void)cudaFreeHost(g_model_stage_raw[i]);
-            g_model_stage_raw[i] = NULL;
-            g_model_stage[i] = NULL;
-        }
-    }
-    g_model_stage_bytes = 0;
-    if (g_model_upload_stream) {
-        (void)cudaStreamDestroy(g_model_upload_stream);
-        g_model_upload_stream = NULL;
-    }
+    cuda_model_stage_pool_release();
     if (g_model_device_owned && g_model_device_base) {
         (void)cudaFree((void *)g_model_device_base);
     }
@@ -4185,8 +4220,12 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
 
     const char *copy_env = getenv("DS4_CUDA_COPY_MODEL");
     if (copy_env && copy_env[0]) {
+        if (cuda_model_copy_chunked(model_map, model_size, 0, model_size)) {
+            return 1;
+        }
+        fprintf(stderr, "ds4: CUDA pipelined model copy unavailable; falling back to monolithic copy\n");
         void *dev = NULL;
-        const double t0 = clock() / (double)CLOCKS_PER_SEC;
+        const double t0 = cuda_wall_sec();
         cudaError_t err = cudaMalloc(&dev, (size_t)model_size);
         if (err == cudaSuccess) {
             fprintf(stderr, "ds4: CUDA copying %.2f GiB model to device memory\n",
@@ -4198,7 +4237,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
                 cuda_model_drop_copied_source_pages(model_map,
                                                      model_size,
                                                      "model");
-                const double t1 = clock() / (double)CLOCKS_PER_SEC;
+                const double t1 = cuda_wall_sec();
                 fprintf(stderr, "ds4: CUDA model copy complete in %.3fs\n", t1 - t0);
                 return 1;
             }

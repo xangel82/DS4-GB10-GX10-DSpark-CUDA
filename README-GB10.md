@@ -64,6 +64,13 @@ cuda-regression: token-tile raw/mixed attention rel-rmse=...
 cuda long-context regression: OK
 ```
 
+Un run da 99.143 token ha inoltre scoperto il confine esatto
+`n_comp=24576`: la bitmap union occupa 48 KiB dinamici, ai quali si aggiungono
+circa 2 KiB statici del kernel. Il vecchio launcher non richiedeva l'opt-in
+CUDA a questa dimensione e falliva con `invalid argument`. Il launcher
+configura ora la dimensione dinamica reale fin dal primo uso e la regressione
+esercita esplicitamente questo confine.
+
 ## Requisiti
 
 - NVIDIA GB10 / DGX Spark con Linux ARM64;

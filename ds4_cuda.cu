@@ -13752,7 +13752,7 @@ static int cuda_attention_tokentile_indexed_launch(
 
     const uint32_t bitmap_words = (n_comp + 1u) >> 1u;
     const size_t bitmap_smem = (size_t)bitmap_words * sizeof(uint32_t);
-    static size_t union_smem_configured = 48ull * 1024ull;
+    static size_t union_smem_configured;
     if (bitmap_smem > union_smem_configured) {
         if (!cuda_ok(cudaFuncSetAttribute(
                     attention_tokentile_union_build_kernel,
@@ -13909,7 +13909,9 @@ extern "C" int ds4_gpu_attention_tokentile_self_test(void) {
     const uint32_t n_tokens = 128u;
     const uint32_t n_head = 64u;
     const uint32_t head_dim = 512u;
-    const uint32_t n_comp = 1024u;
+    /* Exactly 48 KiB of union bitmap: opt-in is still required because the
+     * union kernel also owns about 2 KiB of static shared state. */
+    const uint32_t n_comp = 24576u;
     const uint32_t top_k = 512u;
     const uint32_t pos0 = 1024u;
     const uint32_t n_raw = n_tokens + kTTRawWindow - 1u;

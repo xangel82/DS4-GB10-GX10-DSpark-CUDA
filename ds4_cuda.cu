@@ -16187,7 +16187,7 @@ static int routed_moe_mmq_prefill_launch(
         g_mmq_prefill_notice = 1;
         fprintf(stderr,
                 "ds4: CUDA Entrpi batched MMQ MoE prefill enabled "
-                "(single-map IQ2 gate/up + Q2 down; decode excluded)\n");
+                "(single-map IQ2 gate/up + Q2 down, token-bound stream-K; decode excluded)\n");
     }
     return 1;
 }
@@ -17090,7 +17090,12 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
     for (uint32_t t = 0; t < n_tokens; ++t) {
         for (uint32_t s = 0; s < n_expert; ++s) {
             const uint64_t pair = (uint64_t)t * n_expert + s;
-            selected_host[pair] = (int32_t)((t + s) % n_total_expert);
+            /* Expert zero receives the maximum valid top-k load: exactly one
+             * assignment from every token. The other five slots remain
+             * distinct and rotate over the remaining experts. */
+            selected_host[pair] = s == 0u
+                ? 0
+                : (int32_t)(1u + ((t + s - 1u) % (n_total_expert - 1u)));
             weights_host[pair] = 0.20f + 0.015f * (float)s;
         }
     }

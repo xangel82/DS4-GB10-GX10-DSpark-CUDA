@@ -916,6 +916,13 @@ int ds4_mmq_moe_pair_impl(
     const bool use_stream_k =
         (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
         GGML_CUDA_CC_IS_CDNA(cc);
+    /* The fused target-prefill path receives a true top-k assignment: one
+     * token cannot select the same expert twice, so no expert bucket can
+     * exceed n_tokens rows. Keep the conservative gathered-row bound for all
+     * generic MMQ callers, including DSpark/MTP. */
+    const int64_t routed_ncols_max = fused_down
+        ? (int64_t)n_tokens
+        : ne_get_rows;
 
     /* The gate/up Q8_1 can be stream-freed before allocating the down Q8_1;
      * ids_dst and expert_bounds remain alive outside this scope. */
@@ -1004,7 +1011,7 @@ int ds4_mmq_moe_pair_impl(
         /*stride_sample_y=*/s13_mmq,
         /*stride_sample_dst=*/0,
         /*use_stream_k=*/use_stream_k,
-        /*ncols_max=*/ne_get_rows,
+        /*ncols_max=*/routed_ncols_max,
         /*x_soa=*/xa_soa,
         /*soa_blocks=*/soa_blocks,
     };
@@ -1096,7 +1103,7 @@ int ds4_mmq_moe_pair_impl(
             /*stride_sample_y=*/ne_get_rows * down_s12,
             /*stride_sample_dst=*/0,
             /*use_stream_k=*/use_stream_k,
-            /*ncols_max=*/ne_get_rows,
+            /*ncols_max=*/routed_ncols_max,
             /*x_soa=*/nullptr,
             /*soa_blocks=*/0,
         };

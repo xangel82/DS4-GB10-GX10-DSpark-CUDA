@@ -1156,7 +1156,7 @@ gate, up e down mantenendo la stessa semantica dei kernel precedenti.
 Il primo chunk compatibile deve stampare:
 
 ```text
-ds4: CUDA Entrpi batched MMQ MoE prefill enabled (single-map IQ2 gate/up + Q2 down; decode excluded)
+ds4: CUDA Entrpi batched MMQ MoE prefill enabled (single-map IQ2 gate/up + Q2 down, token-bound stream-K; decode excluded)
 ```
 
 Prima del deploy è obbligatorio eseguire:
@@ -1176,11 +1176,39 @@ MoE non cambiano, ma i logits non sono attesi bit-identici.
 
 Il commit locale `4eb7441` congela la prima integrazione raw-GGUF validata su
 Athena: circa 448 t/s sul chunk 8192, 413-418 t/s sull'intero prompt da
-10-13K e decode DSpark 23-26 t/s nei run osservati. La mappa unica e il
-crossover a 1024 descritti sopra sono l'incremento
-successivo e devono superare di nuovo la regressione CUDA e il test Athena
-prima di un altro commit. La fusione diretta SwiGLU-Q8 resta esclusa finche' un
-test isolato del layout D2S6 non dimostra parita'.
+10-13K e decode DSpark 23-26 t/s nei run osservati. Il commit locale `2cc0fcd`
+aggiunge la mappa unica e il crossover a 1024 descritti sopra. La regression
+CUDA e il run Athena da 63K hanno confermato correttezza e decode: 450.51 t/s
+sul primo chunk, 376.02 t/s medi sull'intero prefill e 20.81 t/s dopo i primi
+100 token di decode lungo. Il guadagno sul primo chunk rispetto a `4eb7441` e'
+pero' soltanto circa 0.6%, quindi `2cc0fcd` e' una base stabile ma non soddisfa
+da solo il successivo obiettivo prestazionale di almeno +10%. La fusione
+diretta SwiGLU-Q8 resta esclusa finche' un test isolato del layout D2S6 non
+dimostra parita'.
+
+#### Bound stream-K confinato al target prefill
+
+La pipeline fused usa top-6 esatto: per costruzione ciascun token seleziona un
+esperto al massimo una volta. Il numero di righe di qualsiasi bucket esperto e'
+quindi limitato da `n_tokens`, non dalle `n_tokens * 6` righe raccolte. Sul
+chunk 8192 il dominio X dello stream-K passa da 49152 a 8192 colonne logiche.
+
+Il cambio e' intenzionalmente confinato a
+`ds4_mmq_iq2_xxs_q2_K_moe_fused`. I wrapper MMQ generici, DSpark/MTP e decode
+mantengono il bound conservativo `ne_get_rows`. Questa separazione e'
+importante perche' il commit Entrpi `82b2622` aveva associato un precedente
+cambio globale a `n_tokens` a output incompleti e BOS, prima della correzione
+del write-back e dell'azzeramento del fixup stream-K ora presenti nel codice.
+
+La regression usa un routing top-6 valido ma massimamente sbilanciato: esperto
+zero compare una volta in tutti i token e raggiunge esattamente il nuovo bound;
+gli altri cinque slot restano distinti. Il log runtime che conferma il deploy
+deve contenere `token-bound stream-K`. Su Athena la regression skew ha chiuso
+con `final=0.01851 rel-rmse` e `cuda long-context regression: OK`. Nel tratto
+sovrapposto 24.5K-57.3K il throughput aggregato e' salito da circa 364.7 a
+425.9 t/s, pari a +16.8%; la richiesta calda successiva e' partita a 488.19
+t/s a 24.5K. Il decode a 83K ha prodotto 401 token a 23.00 t/s, senza BOS,
+non-finite o regressioni DSpark.
 
 I numeri Entrpi su PRO 6000 non vanno trasferiti direttamente alla GB10. Per
 accettare la patch servono sullo stesso prompt Athena: prefill superiore,

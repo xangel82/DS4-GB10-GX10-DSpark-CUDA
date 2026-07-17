@@ -7741,6 +7741,7 @@ typedef struct {
     int live_tokens;
     char *visible_text;
     size_t visible_len;
+    bool tool_checkpoint;
 } visible_live_state;
 
 static bool id_list_contains(const stop_list *ids, const char *id);
@@ -8054,6 +8055,7 @@ static void visible_live_clear_locked(visible_live_state *st) {
     st->visible_text = NULL;
     st->visible_len = 0;
     st->live_tokens = 0;
+    st->tool_checkpoint = false;
     st->valid = false;
 }
 
@@ -8070,13 +8072,15 @@ static void thinking_live_clear(server *s) {
     pthread_mutex_unlock(&s->tool_mu);
 }
 
-static void thinking_live_remember(server *s, const char *visible_text) {
+static void thinking_live_remember(server *s, const char *visible_text,
+                                   bool tool_checkpoint) {
     if (!s || !visible_text || !visible_text[0]) return;
     pthread_mutex_lock(&s->tool_mu);
     visible_live_clear_locked(&s->thinking_live);
     s->thinking_live.visible_text = xstrdup(visible_text);
     s->thinking_live.visible_len = strlen(visible_text);
     s->thinking_live.live_tokens = ds4_session_pos(s->session);
+    s->thinking_live.tool_checkpoint = tool_checkpoint;
     s->thinking_live.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -8828,7 +8832,8 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
-                                            const char *cache_text_key) {
+                                            const char *cache_text_key,
+                                            const char *protect_prompt_text) {
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
     return ds4_kvstore_store_live_prefix_text(&s->kv, s->engine, s->session,
@@ -8836,16 +8841,18 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                                               cache_text_override,
                                               cache_text_ext,
                                               cache_text_key,
+                                              protect_prompt_text,
                                               &hooks, err, sizeof(err));
 }
 
 static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
                                        int store_len, const char *reason) {
     return kv_cache_store_live_prefix_text(s, tokens, store_len, reason,
-                                           NULL, 0, NULL);
+                                           NULL, 0, NULL, NULL);
 }
 
-static void kv_cache_store_current(server *s, const char *reason) {
+static void kv_cache_store_current(server *s, const char *reason,
+                                   const char *protect_prompt_text) {
     const ds4_tokens *tokens = ds4_session_tokens(s->session);
     if (!tokens) return;
 
@@ -8879,10 +8886,12 @@ static void kv_cache_store_current(server *s, const char *reason) {
      * tokenizes only the visible suffix that follows this key. */
     if (visible_text) {
         kv_cache_store_live_prefix_text(s, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key);
+                                        visible_text, visible_ext, visible_key,
+                                        protect_prompt_text);
         free(visible_text);
     } else {
-        kv_cache_store_live_prefix(s, tokens, tokens->len, reason);
+        kv_cache_store_live_prefix_text(s, tokens, tokens->len, reason,
+                                        NULL, 0, NULL, protect_prompt_text);
     }
 }
 
@@ -9120,7 +9129,9 @@ static int responses_live_visible_prefix_prompt(server *s, const request *req,
  * token/text/disk matching. */
 static int thinking_live_visible_prefix_prompt(server *s, const request *req,
                                                int live_pos,
-                                               ds4_tokens *effective_prompt) {
+                                               ds4_tokens *effective_prompt,
+                                               bool *tool_checkpoint_out) {
+    if (tool_checkpoint_out) *tool_checkpoint_out = false;
     if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
     if (req->kind != REQ_CHAT || req->api == API_RESPONSES) return 0;
 
@@ -9135,6 +9146,8 @@ static int thinking_live_visible_prefix_prompt(server *s, const request *req,
                                 s->thinking_live.visible_text,
                                 s->thinking_live.visible_len);
     if (ok) visible_len = s->thinking_live.visible_len;
+    if (ok && tool_checkpoint_out)
+        *tool_checkpoint_out = s->thinking_live.tool_checkpoint;
     pthread_mutex_unlock(&s->tool_mu);
     if (!ok) return 0;
 
@@ -9893,6 +9906,19 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     return buf_take(&suffix);
 }
 
+static char *build_tool_checkpoint_visible_text(const request *r,
+                                                const char *content,
+                                                const char *reasoning,
+                                                const tool_calls *calls) {
+    if (!r || !r->prompt_text) return NULL;
+    char *suffix = build_tool_checkpoint_suffix(r, content, reasoning, calls);
+    buf visible = {0};
+    buf_puts(&visible, r->prompt_text);
+    buf_puts(&visible, suffix ? suffix : "");
+    free(suffix);
+    return buf_take(&visible);
+}
+
 static char *build_responses_visible_assistant_suffix(const request *r,
                                                       const char *content,
                                                       const char *reasoning,
@@ -9957,13 +9983,43 @@ static void remember_thinking_checkpoint(server *s, const job *j, const char *ct
     char *visible = build_toolless_thinking_visible_text(&j->req, content);
     if (!visible) return;
 
-    thinking_live_remember(s, visible);
+    thinking_live_remember(s, visible, false);
     server_log(DS4_LOG_KVCACHE,
                "ds4-server: thinking live checkpoint remembered ctx=%s live=%d visible=%zu",
                ctx, ds4_session_pos(s->session), strlen(visible));
     trace_event(s, trace_id,
                 "thinking live checkpoint remembered: live=%d visible=%zu",
                 ds4_session_pos(s->session), strlen(visible));
+    free(visible);
+}
+
+/* Bind the client-rendered transcript to the exact post-tool-call frontier.
+ * The payload may contain hidden reasoning from older turns and therefore need
+ * not render to these bytes itself.  Exact DSML replay makes the visible key
+ * deterministic, so the next request can retain the richer live KV and append
+ * only its new tool-result suffix. */
+static void remember_tool_checkpoint_frontier(server *s, const job *j,
+                                              const char *ctx,
+                                              uint64_t trace_id,
+                                              const char *content,
+                                              const char *reasoning,
+                                              const tool_calls *calls) {
+    if (!s || !j || !j->req.prompt_text || !calls || calls->len == 0) return;
+
+    char *visible = build_tool_checkpoint_visible_text(&j->req, content,
+                                                       reasoning, calls);
+    if (visible && visible[0]) {
+        const size_t visible_len = strlen(visible);
+        thinking_live_remember(s, visible, true);
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: tool live checkpoint remembered ctx=%s live=%d visible=%zu raw_dsml=%d",
+                   ctx, ds4_session_pos(s->session), visible_len,
+                   calls->raw_dsml && calls->raw_dsml[0] ? 1 : 0);
+        trace_event(s, trace_id,
+                    "tool live checkpoint remembered: live=%d visible=%zu raw_dsml=%d",
+                    ds4_session_pos(s->session), visible_len,
+                    calls->raw_dsml && calls->raw_dsml[0] ? 1 : 0);
+    }
     free(visible);
 }
 
@@ -10166,6 +10222,7 @@ static void generate_job(server *s, job *j) {
     bool responses_live_continuation = false;
     bool anthropic_live_continuation = false;
     bool thinking_live_continuation = false;
+    bool tool_live_continuation = false;
     const char *responses_live_match = NULL;
     int responses_live_match_ids = 0;
     int anthropic_live_match_ids = 0;
@@ -10231,10 +10288,12 @@ static void generate_job(server *s, job *j) {
     if (cached == 0 && !stream_retry_force_disk) {
         int thinking_cached =
             thinking_live_visible_prefix_prompt(s, &j->req, old_pos,
-                                                &effective_prompt);
+                                                &effective_prompt,
+                                                &tool_live_continuation);
         if (thinking_cached > 0) {
             cached = thinking_cached;
-            cache_source = "thinking-visible";
+            cache_source = tool_live_continuation ?
+                "tool-visible" : "thinking-visible";
             thinking_live_continuation = true;
             prompt_for_sync = &effective_prompt;
         }
@@ -10263,7 +10322,7 @@ static void generate_job(server *s, job *j) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
-        kv_cache_store_current(s, "evict");
+        kv_cache_store_current(s, "evict", j->req.prompt_text);
     }
     if (cached == 0) {
         disk_cached = kv_cache_try_load(s, &j->req, &effective_prompt,
@@ -10347,7 +10406,8 @@ static void generate_job(server *s, job *j) {
                    prompt_tokens);
     } else if (thinking_live_continuation) {
         server_log(DS4_LOG_PREFILL,
-                   "ds4-server: thinking live continuation match=visible-prefix cached=%d prompt=%d",
+                   "ds4-server: %s live continuation match=visible-prefix cached=%d prompt=%d",
+                   tool_live_continuation ? "tool" : "thinking",
                    cached,
                    prompt_tokens);
     }
@@ -10480,7 +10540,7 @@ static void generate_job(server *s, job *j) {
         canonical_prefill_saved = kv_cache_store_live_prefix_text(
             s, prompt_for_sync, prompt_tokens, "continued",
             j->req.prompt_text, responses_protocol ? KV_EXT_RESPONSES_VISIBLE : 0,
-            "prefill-complete");
+            "prefill-complete", NULL);
         if (canonical_prefill_saved) kv_cache_note_store(&s->kv, prompt_tokens);
         server_log(canonical_prefill_saved ? DS4_LOG_KVCACHE : DS4_LOG_WARNING,
                    "ds4-server: kv canonical prefill checkpoint tokens=%d elapsed=%.3fs persisted=%d",
@@ -11182,19 +11242,22 @@ decode_again:
     }
 
     if (j->req.kind == REQ_CHAT && parsed_calls.len &&
-        j->req.api != API_RESPONSES &&
-        should_canonicalize_tool_checkpoint(s, &parsed_calls))
+        j->req.api != API_RESPONSES)
     {
         /* Chat/completions has no protocol object that binds the next request
-         * to this live KV state.  Canonicalize only the fallback tool-call
-         * path where we lack exact sampled DSML replay; when raw DSML is known,
-         * replaying those bytes keeps future prompts aligned without rebuilding
-         * hidden reasoning.  Responses deliberately skips this path because its
-         * previous_response_id contract binds the next turn to live state. */
-        canonicalize_tool_checkpoint(s, j, ctx_span, trace_id,
-                                     parsed_content ? parsed_content : "",
-                                     parsed_reasoning, &parsed_calls);
-        thinking_live_clear(s);
+         * to this live KV state.  Canonicalize the fallback path when exact
+         * sampled DSML is unavailable, then retain a visible transcript key in
+         * both cases.  That key remains reusable even when older hidden
+         * reasoning makes the live token history differ from client replay.
+         * Responses has its own previous_response_id binding. */
+        if (should_canonicalize_tool_checkpoint(s, &parsed_calls)) {
+            canonicalize_tool_checkpoint(s, j, ctx_span, trace_id,
+                                         parsed_content ? parsed_content : "",
+                                         parsed_reasoning, &parsed_calls);
+        }
+        remember_tool_checkpoint_frontier(s, j, ctx_span, trace_id,
+                                          parsed_content ? parsed_content : "",
+                                          parsed_reasoning, &parsed_calls);
     } else if (parsed_calls.len) {
         thinking_live_clear(s);
     } else if (!parsed_calls.len &&
@@ -12188,7 +12251,7 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: persisting current KV cache before shutdown tokens=%d",
                    tokens->len);
-        kv_cache_store_current(&s, "shutdown");
+        kv_cache_store_current(&s, "shutdown", NULL);
     }
     server_close_resources(&s);
     return 0;
@@ -13996,6 +14059,7 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
     r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = xstrdup(prompt_text);
     r.tool_orders = orders;
     memset(&orders, 0, sizeof(orders));
     char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
@@ -14005,6 +14069,11 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     buf canonical = {0};
     buf_puts(&canonical, prompt_text);
     buf_puts(&canonical, suffix);
+    char *visible = build_tool_checkpoint_visible_text(&r, content, reasoning,
+                                                       &calls);
+    TEST_ASSERT(visible != NULL);
+    TEST_ASSERT(!strcmp(visible, canonical.ptr));
+    free(visible);
 
     chat_msgs history_msgs = {0};
     chat_msg user2 = {0};
@@ -15799,6 +15868,50 @@ static void test_kv_cache_eviction_keeps_smaller_context_prefix(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_eviction_protects_next_request_prefix(void) {
+    char tmpl[] = "/tmp/ds4-kv-protected-prefix-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *continued_text = "long canonical conversation frontier";
+    const char *anchor_text = "short unrelated cold anchor";
+    test_kv_text_stub_file(dir, continued_text, KV_REASON_CONTINUED,
+                           85790, 8192);
+    test_kv_text_stub_file(dir, anchor_text, KV_REASON_COLD,
+                           24576, 2048);
+
+    char continued_sha[41], anchor_sha[41];
+    sha1_bytes_hex(continued_text, strlen(continued_text), continued_sha);
+    sha1_bytes_hex(anchor_text, strlen(anchor_text), anchor_sha);
+    char continued_name[44], anchor_name[44];
+    snprintf(continued_name, sizeof(continued_name), "%.40s.kv", continued_sha);
+    snprintf(anchor_name, sizeof(anchor_name), "%.40s.kv", anchor_sha);
+    char *continued_path = path_join(dir, continued_name);
+    char *anchor_path = path_join(dir, anchor_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = KV_CACHE_FIXED_HEADER + 4u +
+                      strlen(continued_text) + 8192u + 16u;
+    ds4_kvstore_eviction_context incoming = {
+        .protected_sha = continued_sha,
+    };
+    kv_cache_evict(&kc, NULL, 0, &incoming);
+
+    TEST_ASSERT(access(continued_path, F_OK) == 0);
+    TEST_ASSERT(access(anchor_path, F_OK) != 0);
+
+    kv_cache_close(&kc);
+    unlink(continued_path);
+    unlink(anchor_path);
+    free(continued_path);
+    free(anchor_path);
+    rmdir(dir);
+}
+
 static void test_kv_cache_eviction_score_decays_stale_hits(void) {
     /* stale: lower tokens-per-byte (e.g. tool-heavy prompt) but boosted by
      * 10 hits well in the past.  fresh: higher tokens-per-byte and zero hits,
@@ -16254,6 +16367,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_ignores_oversize_incoming();
     test_kv_cache_eviction_prefers_superseded_continued_prefix();
     test_kv_cache_eviction_keeps_smaller_context_prefix();
+    test_kv_cache_eviction_protects_next_request_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();

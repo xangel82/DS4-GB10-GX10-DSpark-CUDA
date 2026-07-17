@@ -70,9 +70,10 @@ on a single GB10/GX10 machine without changing the target model distribution.
   - 16 GiB default disk budget for persisted KV checkpoints.
 - Append-prefill optimization for long chats: canonical KV checkpoints are
   retained near long stable prompt boundaries, so subsequent requests with the
-  same exact prefix can resume from disk and process only the new tail. Tool
-  canonicalization can still produce a token mismatch and fall back to an
-  older anchor; this remaining TTFT issue is documented in `README-GB10.md`.
+  same exact prefix can resume from disk and process only the new tail. On tool
+  canonicalization mismatches, eviction now protects the longest checkpoint
+  reusable by the incoming prompt instead of falling back to an older anchor.
+  Direct post-tool RAM continuation remains a follow-up in `README-GB10.md`.
 - `/v1/models` now advertises both `context_length` and `max_input_tokens`;
   `max_input_tokens` reserves the configured completion budget so clients can
   compact before generation runs into the physical context ceiling.

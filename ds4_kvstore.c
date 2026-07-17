@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <float.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -541,6 +542,11 @@ double ds4_kvstore_entry_eviction_score(
         const ds4_kvstore_eviction_context *incoming) {
     if (!e || e->file_size == 0) return 0.0;
     (void)live;
+    if (incoming && incoming->protected_sha &&
+        !strcmp(e->sha, incoming->protected_sha))
+    {
+        return DBL_MAX;
+    }
     double effective_hits = (double)e->hits;
     uint64_t used_at = e->last_used ? e->last_used : e->created_at;
     if (used_at == 0) {
@@ -944,6 +950,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         const char *cache_text_override,
                                         uint8_t cache_text_ext,
                                         const char *cache_text_key,
+                                        const char *protect_prompt_text,
                                         const ds4_kvstore_trailer_hooks *hooks,
                                         char *err,
                                         size_t err_len) {
@@ -1056,9 +1063,25 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         return false;
     }
 
+    char protected_sha[41] = {0};
+    if (protect_prompt_text && protect_prompt_text[0]) {
+        int protected_idx = ds4_kvstore_find_text_prefix(
+            kc, protect_prompt_text, model_id, quant_bits,
+            ds4_session_ctx(session));
+        if (protected_idx >= 0) {
+            memcpy(protected_sha, kc->entry[protected_idx].sha,
+                   sizeof(protected_sha));
+            kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
+                    "%s: kv cache protecting next-request prefix tokens=%u file=%s",
+                    kv_log_name(kc), kc->entry[protected_idx].tokens,
+                    kc->entry[protected_idx].path ?
+                        kc->entry[protected_idx].path : "?");
+        }
+    }
     ds4_kvstore_eviction_context incoming = {
         .text = text,
         .text_len = text_len,
+        .protected_sha = protected_sha[0] ? protected_sha : NULL,
         .model_id = (uint8_t)model_id,
         .quant_bits = (uint8_t)quant_bits,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
@@ -1180,7 +1203,7 @@ bool ds4_kvstore_store_live_prefix(ds4_kvstore *kc,
                                    size_t err_len) {
     return ds4_kvstore_store_live_prefix_text(kc, engine, session, tokens,
                                               store_len, reason, NULL, 0, NULL,
-                                              hooks, err, err_len);
+                                              NULL, hooks, err, err_len);
 }
 
 bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,

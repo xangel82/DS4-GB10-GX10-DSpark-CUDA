@@ -20,6 +20,7 @@ Stato al 17 luglio 2026:
 - target e sidecar DSpark copiati in device memory;
 - pagine sorgente GGUF rilasciate dopo la copia CUDA;
 - append prefill, checkpoint canonico e long anchor NVMe attivi;
+- binding visibile RAM post-tool e protezione del checkpoint NVMe entrante;
 - routed-MoE prefill MMQ sui GGUF canonici, senza artifact SoA da 76,5 GiB;
 - stream-K MMQ limitato strutturalmente dal numero di token;
 - CUDA Graph DSpark K-aware e verifier target `K+1`;
@@ -839,7 +840,7 @@ uno snapshot su NVMe nella directory `--kv-disk-dir`. Il trim si puo' aumentare
 se la parte variabile e' piu' lunga, oppure disabilitare mettendo
 `DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS=0`.
 
-### Residuo osservato dopo tool call
+### Frontier visibile dopo tool call
 
 Il run del 17 luglio conferma che il nuovo kernel riduce il costo del prefill,
 ma non risolve la frontier delle tool call. Dopo 802 token generati il prompt
@@ -853,9 +854,43 @@ chat ctx=24576..86821:62245 TOOLS prompt start
 
 La canonicalizzazione ha quindi invalidato la frontier viva e il checkpoint
 da 85.790 token e' stato anche espulso per budget disco; il server ha ripreso
-dal vecchio anchor 24.576 e rifatto 62.245 token. Token-tile rende questo replay
-molto piu' veloce, ma il prossimo intervento TTFT deve migliorare retention e
-ripristino della frontier senza copiare o riallocare gli scratch del decode.
+dal vecchio anchor 24.576 e rifatto 62.245 token.
+
+L'intervento non copia KV, scratch o buffer CUDA. Dopo una tool call il server
+lega il transcript previsto alla frontier esatta gia' in RAM, anche se il
+payload conserva reasoning nascosto di turni precedenti. Se il client estende
+esattamente quella chiave, possono essere processati soltanto i nuovi tool
+result. Il percorso e' riconoscibile da:
+
+```text
+tool live checkpoint remembered ... live=... visible=... raw_dsml=1
+tool live continuation match=visible-prefix cached=... prompt=...
+```
+
+Nel client Athena provato il binding viene registrato, ma il prompt successivo
+non coincide ancora con quella rappresentazione e compare `live kv cache miss`.
+Entra quindi in funzione la seconda rete di sicurezza: il salvataggio
+`reason=evict` identifica il piu' lungo checkpoint testuale compatibile con la
+richiesta entrante e lo espelle solo dopo tutti i candidati non correlati. Il
+log osservato e':
+
+```text
+kv cache protecting next-request prefix tokens=...
+kv cache hit text tokens=...
+```
+
+Il run Athena del 17 luglio ha protetto e ricaricato in successione i checkpoint
+25.231, 28.902 e 30.911. Non si e' piu' verificato il ritorno all'anchor 24.576.
+I replay sono rimasti limitati alle code effettivamente nuove: 3.671 token in
+7,755 s, 2.009 token in 4,657 s e, dopo tre risultati `Read` molto grandi,
+13.928 token in 27,784 s. Il decode delle tre tool call successive e' rimasto
+tra 21,86 e 23,05 t/s.
+
+La suite server copre sia la costruzione del transcript post-tool sia la
+retention del prefisso lungo contro un anchor favorito dall'euristica. Rimane
+un'ottimizzazione separata: accettare anche la rappresentazione senza reasoning
+usata dal client e trasformare il fallback NVMe nel vero hit RAM
+`tool live continuation`.
 
 ### Nota storica sul deploy
 
@@ -1668,10 +1703,12 @@ rsync non tocca la directory `.git` remota.
 
 L'integrazione DSpark è completa e token-tile HMMA ha superato il gate con
 +25,88%, mantenendo 23,58 t/s di decode. Restano da registrare la memoria
-residente e da ridurre il replay dopo `token-mismatch`: nel run corrente la
-tool call ha ripreso dal checkpoint 24.576 e rifatto oltre 62K token. Dopo
-questo intervento TTFT, profilare nuovamente MoE e attenzione stabilirà quale
-costo residuo può giustificare un altro incremento end-to-end significativo.
+residente e da estendere il binding post-tool alla rappresentazione senza
+reasoning del client Athena. La protezione NVMe ha gia' eliminato il replay dal
+vecchio anchor 24.576 senza regressioni di decode; il passo successivo puo'
+rimuovere anche i circa 100-240 ms di caricamento del checkpoint. In seguito,
+un nuovo profilo MoE/attention stabilira' quale costo residuo puo' giustificare
+un altro incremento end-to-end significativo.
 
 ### Graph interamente persistente senza prepare in background
 

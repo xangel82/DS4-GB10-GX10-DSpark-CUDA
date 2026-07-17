@@ -153,6 +153,11 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 cuda-regression: NVCCFLAGS += --default-stream per-thread -DDS4_CUDA_TOKEN_GRAPH_BUILD
 cuda-regression: tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
+
+# The generic server unit-test binary intentionally omits CUDA Graph support.
+# Graph-only globals and diagnostics therefore appear unused to nvcc even
+# though the production GB10 target references them.
+ds4_test: NVCCFLAGS += -diag-suppress 177 -diag-suppress 550
 endif
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h

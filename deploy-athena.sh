@@ -6,7 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 ATHENA_HOST="${ATHENA_HOST:-}"
 ATHENA_USER="${ATHENA_USER:-athena}"
-ATHENA_DEST="${ATHENA_DEST:-/tmp/ds4-gb10-lab/}"
+ATHENA_DEST="${ATHENA_DEST:-/home/athena/DS4-GB10-GX10-DSpark-CUDA/}"
 SSH_KEY="${SSH_KEY:-}"
 
 if [[ -z "$ATHENA_HOST" ]]; then
@@ -38,6 +38,7 @@ rsync -az --progress \
   --exclude='ds4_test' \
   --exclude='ds4_agent_test' \
   --exclude='tests/test_q4k_dot' \
+  --exclude='tests/cuda_long_context_smoke' \
   --exclude='gguf-tools/deepseek4-quantize' \
   "$ROOT/" \
   "$ATHENA_USER@$ATHENA_HOST:$ATHENA_DEST"
@@ -45,6 +46,6 @@ rsync -az --progress \
 echo
 echo "Deploy complete: $ATHENA_USER@$ATHENA_HOST:$ATHENA_DEST"
 echo "Next on Athena:"
-echo "  cd $ATHENA_DEST && make cuda-spark-graph-sm121"
-echo "  cd $ATHENA_DEST && ./build-dspark-sidecar.sh"
-echo "  cd $ATHENA_DEST && ./run-dspark-server.sh"
+echo "  cd $ATHENA_DEST && make -B cuda-regression CUDA_ARCH=sm_121"
+echo "  cd $ATHENA_DEST && make -B cuda-spark-graph-sm121"
+echo "  cd $ATHENA_DEST && ./run-dspark-server.sh 2>&1 | tee /tmp/ds4-dspark-server.log"

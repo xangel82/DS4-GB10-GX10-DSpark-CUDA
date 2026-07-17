@@ -30,6 +30,10 @@ void ds4_gpu_cleanup(void);
  * DS4's established IQ2_XXS/Q2_K kernels on deterministic packed weights. */
 int ds4_gpu_mmq_prefill_self_test(void);
 
+/* CUDA regression hook: compare token-tile HMMA indexed attention with the
+ * established exact Top-K online kernel on a deterministic wide batch. */
+int ds4_gpu_attention_tokentile_self_test(void);
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);

@@ -1,150 +1,251 @@
-# ds4 GB10 Lab — DeepSeek V4 Flash su una singola DGX Spark
+# DS4 GB10 + DeepSeek V4 Flash + DSpark
 
-Questo documento descrive il ramo sperimentale usato per eseguire
-`DeepSeek-V4-Flash` quantizzato Q2/imatrix con `ds4` su una singola NVIDIA GB10.
-L'obiettivo è aumentare i token/s senza ridurre il contesto, cambiare modello o
-alterare l'installazione originale di ds4 presente su Athena.
+Questa guida descrive la configurazione corrente del fork GB10 per eseguire
+DeepSeek V4 Flash con il sidecar DSpark su una singola NVIDIA GB10. La priorità
+è mantenere invariata la qualità del modello target, aumentare il prefill e
+conservare il throughput DSpark sui contesti lunghi.
 
-Stato al 14 luglio 2026: CUDA Graph, compressor fuso, F16 coalescente, Q8 U16 e
-pipeline look-ahead hanno portato il riferimento lungo senza MTP a **14,689
-t/s** su 1.316 token generati, partendo da circa 5.876 token di contesto. Il
-decode corto resta nell'ordine di **15,5–16,1 t/s**. La variante MoE GB10 più
-larga è risultata neutra (`14,54 t/s`) e resta disattivata.
+La sezione **Avvio rapido** è la procedura operativa aggiornata. Le sezioni
+successive conservano la cronologia tecnica, comprese prove scartate e rollback.
 
-Il primo run DSpark completo ha prodotto **9,322 t/s**: non è il riferimento
-finale, perché includeva replay sequenziale su ogni partial accept (cicli fino
-a 500 ms), K=5 fisso, cache F16 limitata a 6 GiB e nessun graph verifier
-dedicato. Questi quattro limiti sono corretti nel codice corrente; il nuovo
-percorso deve ancora essere misurato su Athena.
+## Stato corrente
 
-La variante attention `heads2` ha invece prodotto una regressione netta: dopo
-l'attivazione a 384 righe il decode è sceso immediatamente e, sul percorso
-indexed a 640 righe, si è stabilizzato a **12,09 t/s**, circa **-17,7%** rispetto
-al riferimento. La variante è quindi scartata e deve restare disabilitata. MTP
-+ Tensor Core ha raggiunto `15,13 t/s` nel run migliore, ma non in modo stabile:
-il verifier da 67–120 ms continua a dominare il ciclo. La prossima direzione ad
-alto potenziale è l'integrazione del modulo ufficiale DeepSeek-V4-Flash-DSpark.
+Stato al 17 luglio 2026:
 
-## Ambiente di riferimento
+- contesto fisico: 131072 token;
+- contesto pubblicizzato ai client: 85%;
+- profilo predefinito: `DS4_MEMORY_PROFILE=balanced`;
+- cache calda Q8→F16: 12288 MiB;
+- prefill chunk: 8192;
+- target e sidecar DSpark copiati in device memory;
+- pagine sorgente GGUF rilasciate dopo la copia CUDA;
+- append prefill, checkpoint canonico e long anchor NVMe attivi;
+- routed-MoE prefill MMQ sui GGUF canonici, senza artifact SoA da 76,5 GiB;
+- stream-K MMQ limitato strutturalmente dal numero di token;
+- CUDA Graph DSpark K-aware e verifier target `K+1`;
+- sampling speculativo lossless p/q;
+- context guard HTTP coerente con l'85% pubblicizzato.
 
-- Host: `<gb10-user>@<gb10-host>`
-- GPU: NVIDIA GB10, compute capability riportata da ds4 `sm_121`
-- CUDA runtime usato nei test: CUDA 13.0
-- Modello: `/home/athena/ds4/ds4flash.gguf`
-- Dimensione copiata sulla GPU: circa 80,76 GiB
-- Checkout originale: `/home/athena/ds4`
-- Checkout sperimentale: `/tmp/ds4-gb10-lab`
-- Porta API durante i test: `30007`
-- KV disk cache sperimentale: `/tmp/ds4-gb10-experiment-kv`
+Il riferimento validato prima dell'ultimo intervento attention è circa
+`399,92 t/s` medi su 58,5K token di append prefill. Sul tratto confrontabile
+24,5K–57,3K sono stati misurati circa `425,9 t/s`; il decode DSpark a 83K ha
+prodotto 401 token a `23,00 t/s`.
 
-Il checkout originale non viene modificato. Usare la stessa porta consente di
-provare il server con i client esistenti, ma richiede che il server originale
-sia fermo durante il test.
+### Token-tile HMMA: gate prestazionale superato
+
+Il worktree corrente aggiunge token-tile HMMA per l'attenzione prefill:
+
+- tile di 16 token e due head per CTA;
+- stessa selezione Top-K esatta da 512 righe nel percorso indexed ratio-4;
+- unione dei candidati per tile senza sort globale dei Top-K;
+- variante dense per i layer raw e mixed;
+- mirror KV F16 temporanei, senza copie permanenti dei pesi;
+- scratch dedicato con high-water massimo di circa 168 MiB;
+- guardie strutturali: almeno 128 token, 64 head, head dimension 512 e window
+  128. Decode a token singolo e verifier DSpark da 2–6 righe sono esclusi.
+
+Il run Athena del 17 luglio ha attivato entrambi i percorsi e ha superato
+ampiamente il gate prestazionale. Sullo stesso intervallo assoluto
+`24576..81920` (57.344 token) il throughput pesato e' passato da 404,46 a
+509,14 t/s, pari a **+25,88%**. I sette chunk completi migliorano tutti, in una
+banda compresa tra +23,25% e +26,52%. L'intera richiesta da 61.214 token ha
+chiuso a 496,57 t/s; il decode successivo a circa 86K ha prodotto 802 token a
+23,58 t/s, contro il riferimento di 23,00 t/s.
+
+Non sono comparsi BOS, non-finite o errori CUDA e la risposta ha concluso 11
+tool call valide. Resta da annotare il dato di memoria residente del processo;
+il codice limita lo scratch aggiuntivo a circa 168 MiB. I log di regressione
+richiesti sono:
+
+```text
+cuda-regression: token-tile indexed attention rel-rmse=...
+cuda-regression: token-tile raw/mixed attention rel-rmse=...
+cuda long-context regression: OK
+```
+
+## Requisiti
+
+- NVIDIA GB10 / DGX Spark con Linux ARM64;
+- CUDA Toolkit 13 con `/usr/local/cuda/bin/nvcc` e supporto `sm_121`;
+- toolchain C/C++ (`make`, `cc`, `git`);
+- almeno 128 GB di memoria unificata per il profilo `balanced`;
+- spazio disco per target GGUF, sidecar DSpark e KV cache;
+- porta TCP 30007 libera.
+
+Verifica minima:
+
+```bash
+/usr/local/cuda/bin/nvcc --version && nvidia-smi && git --version && make --version
+```
+
+## Avvio rapido
+
+### 1. Checkout
+
+Nuova installazione:
+
+```bash
+git clone https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA.git ~/DS4-GB10-GX10-DSpark-CUDA && cd ~/DS4-GB10-GX10-DSpark-CUDA
+```
+
+Aggiornamento di un checkout pulito:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && git fetch origin && git pull --ff-only origin main
+```
+
+Non usare `git pull` sopra modifiche locali. Durante lo sviluppo dal Mac usare
+il deploy rsync descritto sotto.
+
+### 2. Modelli
+
+Il launcher predefinito richiede:
+
+```text
+/home/athena/ds4/ds4flash.gguf
+/home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf
+```
+
+Il target Q2/imatrix può essere scaricato con:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && mkdir -p /home/athena/ds4 && DS4_GGUF_DIR=/home/athena/ds4 ./download_model.sh q2-imatrix
+```
+
+Dopo il download, creare o aggiornare il collegamento atteso dal launcher:
+
+```bash
+ln -sfn /home/athena/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf /home/athena/ds4/ds4flash.gguf
+```
+
+Per costruire il sidecar servono gli shard Hugging Face 46–48 e
+`model.safetensors.index.json` in
+`/home/athena/ds4/dspark-v4flash-hf`. Quando sono presenti:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && ./build-dspark-sidecar.sh 2>&1 | tee /tmp/ds4-dspark-convert.log
+```
+
+Percorsi differenti possono essere passati con `DS4_MODEL`,
+`DS4_DSPARK_MODEL`, `DS4_DSPARK_HF_DIR` e `DS4_DSPARK_GGUF`.
+
+### 3. Regressione CUDA obbligatoria
+
+Fermare il server prima del test per evitare pressione di memoria, quindi:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && make -B cuda-regression CUDA_ARCH=sm_121
+```
+
+Il comando compila anche gli oggetti `cuda/mmq`. L'esito valido termina con
+`cuda long-context regression: OK`; warning, errori di parità, non-finite o
+fallimenti precedenti a quella riga bloccano il deploy.
+
+### 4. Build del server
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && make -B cuda-spark-graph-sm121
+```
+
+La riga NVCC deve contenere `-arch=sm_121`,
+`--default-stream per-thread` e `-DDS4_CUDA_TOKEN_GRAPH_BUILD`.
+
+### 5. Avvio
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && ./run-dspark-server.sh 2>&1 | tee /tmp/ds4-dspark-server.log
+```
+
+Il launcher usa per default `balanced`, chunk 8192, context 131072, advertise
+85%, cache Q8→F16 da 12 GiB, porta 30007 e KV cache in
+`/tmp/ds4-gb10-dspark-kv`.
+
+Verifica:
+
+```bash
+curl -fsS http://127.0.0.1:30007/v1/models
+```
+
+Log principali attesi durante startup e primo prompt:
+
+```text
+ds4: CUDA pipelined model copy ...
+ds4: CUDA Entrpi batched MMQ MoE prefill enabled (... token-bound stream-K; decode excluded)
+ds4: CUDA token-tile HMMA raw/mixed prefill enabled ...
+ds4: CUDA token-tile HMMA indexed prefill enabled ...
+```
+
+Gli ultimi due messaggi appartengono all'intervento in validazione e compaiono
+solo quando una forma eleggibile viene realmente eseguita.
+
+## Deploy dal Mac
+
+Lo script usa `rsync` e non modifica il repository Git su Athena:
+
+```bash
+cd "<local-ds4-checkout>" && ATHENA_HOST=192.168.254.62 ATHENA_USER=athena ATHENA_DEST=/home/athena/DS4-GB10-GX10-DSpark-CUDA/ SSH_KEY=~/.ssh/id_ed25519 ./deploy-athena.sh
+```
+
+Per trasferire esclusivamente i file tracciati da Git, il comando verificato è:
+
+```bash
+cd "<local-ds4-checkout>" && git ls-files -z | rsync -avi --from0 --files-from=- ./ -e "ssh -i ~/.ssh/id_ed25519" athena@192.168.254.62:~/DS4-GB10-GX10-DSpark-CUDA/
+```
+
+Non aggiungere `-n`: in rsync significa dry-run e non trasferisce alcun file.
+Un file sorgente nuovo deve essere tracciato da Git oppure incluso
+esplicitamente, altrimenti `git ls-files` non lo invia.
 
 ## Configurazione corrente
 
-La configurazione usata per il test completo è:
+`run-dspark-server.sh` è la fonte autorevole dei default. Il profilo
+`balanced` imposta:
 
 ```text
-DS4_CUDA_COPY_MODEL=1
-DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=96
-DS4_CUDA_Q8_F16_CACHE_MB=12288
-DS4_CUDA_DEFER_END_SYNC=1
-DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS=0
-DS4_CUDA_FUSED_COMPRESSOR_UPDATE=1
-DS4_CUDA_TOKEN_GRAPH=1
-DS4_CUDA_TOKEN_GRAPH_PIPELINE=1
-DS4_CUDA_COALESCED_F16_MATMUL=1
-DS4_CUDA_Q8_U16_LOADS=1
-DS4_CUDA_GREEDY_ARGMAX=1
-```
-
-`12288 MiB` corrispondono a `12 GiB`, non a 12 MiB.
-
-### Paracadute compact / limite client
-
-Il contesto fisico resta configurato con `DS4_CTX`, ma il launcher GB10 pubblica
-ai client solo l'85% del contesto:
-
-```text
+DS4_CTX=131072
 DS4_ADVERTISE_CONTEXT_PCT=85
+DS4_MEMORY_PROFILE=balanced
+DS4_PREFILL_CHUNK=8192
+DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=112
+DS4_CUDA_Q8_F16_CACHE_MB=12288
+DS4_CUDA_COPY_SECONDARY_MODEL=1
+DS4_CUDA_DROP_COPIED_MODEL_PAGES=1
+DS4_CUDA_DSPARK_CACHE_PRIORITY=1
+DS4_CUDA_TOKEN_GRAPH=1
+DS4_CUDA_DSPARK_GRAPH=1
+DS4_DSPARK_ALWAYS_DRAFT=1
+DS4_DSPARK_NO_CIRCUIT_BREAKER=1
+DS4_PREFILL_FINAL_LOGITS_ONLY=1
+DS4_KV_PREFILL_CHECKPOINT_POLICY=canonical-only
+DS4_KV_CACHE_COLD_MAX_TOKENS=131072
+DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS=65536
+DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS=8192
 ```
 
-Con `DS4_CTX=131072`, l'85% espone circa `111411` token in `/v1/models`;
-con `DS4_MAX_TOKENS=2200` pubblica inoltre `max_input_tokens` attorno a
-`109211`. Il guard rail HTTP usa lo stesso budget,
-contando sia il prompt sia il `max_tokens` richiesto dal client. Questo lascia
-margine per la compaction del client prima del limite reale del modello e
-impedisce il caso patologico in cui il prompt occupa quasi tutto il contesto
-fisico, lasciando solo pochi token di risposta (`finish=length`). Per testare
-il contesto pieno senza paracadute usare `DS4_ADVERTISE_CONTEXT_PCT=100`.
+Il context guard pubblica circa 111411 token e sottrae anche il budget di
+output, 2200 token per default. Questo lascia margine per la compaction del
+client prima del limite fisico.
 
-Per il solo ciclo diagnostico aggiungere:
+## Criteri di accettazione
 
-```text
-DS4_CUDA_TOKEN_GRAPH_TIMING=1
-DS4_CUDA_TOKEN_GRAPH_TIMING_EVERY=500
-```
+Con lo stesso prompt, stessa posizione assoluta e server appena avviato:
 
-### Comando di build su Athena
+1. `cuda-regression` deve terminare con `OK`;
+2. nessun BOS inatteso, non-finite o errore CUDA;
+3. qualità della risposta coerente con il target precedente;
+4. almeno `440 t/s` medi sul test da 58,5K, oppure almeno `469 t/s` sul
+   tratto 24,5K–57,3K;
+5. decode DSpark vicino al riferimento di `23 t/s` e comunque non sotto
+   18–20 t/s;
+6. aumento memoria dovuto al token-tile non oltre circa 168 MiB;
+7. secondo turno append/canonical senza full prefill quando il prefisso è
+   riutilizzabile.
 
-Il percorso CUDA Graph richiede il default stream per thread e una build
-dedicata:
+## Cronologia tecnica
 
-```bash
-cd /tmp/ds4-gb10-lab && make cuda-spark-graph-sm121
-```
-
-Il target aggiunge a NVCC:
-
-```text
---default-stream per-thread -DDS4_CUDA_TOKEN_GRAPH_BUILD
-```
-
-Il log Nsight del 13 luglio ha inoltre mostrato che il target precedente
-invocava `nvcc` senza `-arch`. Con CUDA 13 il default è `sm_75`, mentre GB10 ha
-compute capability 12.1. Per produrre un cubin nativo senza sostituire il
-target precedente è disponibile:
-
-```bash
-make cuda-spark-graph-sm121
-```
-
-La riga NVCC deve contenere `-arch=sm_121`. Questo test elimina il PTX Turing
-come target di compilazione e permette a `ptxas` di ottimizzare direttamente
-per GB10; il beneficio sul decode va comunque misurato, perché i kernel non
-usano automaticamente Tensor Core soltanto cambiando architettura.
-
-### Comando di avvio
-
-Il comando è intenzionalmente su una sola riga, per evitare il prompt `>`
-causato da una continuazione multilinea incompleta:
-
-```bash
-cd /tmp/ds4-gb10-lab && DS4_ENABLE_ATTN_HEADS2=0 ./run-experimental-server.sh 2>&1 | tee /tmp/ds4-gb10-pipeline.log
-```
-
-`DS4_ENABLE_ATTN_HEADS2=0` è esplicito perché lo script conserva ancora il
-percorso fallimentare per riprodurre l'A/B; non va abilitato nella
-configurazione consigliata.
-
-La copia iniziale del modello può richiedere diversi minuti. In una misura ha
-impiegato circa 512 secondi; il server apre la porta solo dopo aver completato
-copia, preparazione del modello e allocazione dei buffer di contesto.
-
-Verifica locale su Athena:
-
-```bash
-ss -ltnp | grep 30007
-```
-
-Verifica da una macchina client nella stessa LAN:
-
-```bash
-curl http://<gb10-host>:30007/v1/models
-```
-
-## Migliorie implementate
+Le sezioni seguenti documentano l'evoluzione del lab. Quando un valore storico
+contrasta con **Avvio rapido**, prevalgono sempre i default correnti riportati
+all'inizio del documento e in `run-dspark-server.sh`.
 
 ### 1. Modello residente nella memoria della GB10
 
@@ -738,29 +839,29 @@ uno snapshot su NVMe nella directory `--kv-disk-dir`. Il trim si puo' aumentare
 se la parte variabile e' piu' lunga, oppure disabilitare mettendo
 `DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS=0`.
 
-## Deploy dal Mac senza toccare l'installazione originale
+### Residuo osservato dopo tool call
 
-Il comando compatibile con il `rsync` incluso in macOS è già raccolto nello
-script:
+Il run del 17 luglio conferma che il nuovo kernel riduce il costo del prefill,
+ma non risolve la frontier delle tool call. Dopo 802 token generati il prompt
+successivo ha riportato:
 
-```bash
-cd "<local-ds4-checkout>" && ./deploy-athena.sh
+```text
+live kv cache miss live=86593 prompt=86821 common=28336 reason=token-mismatch
+kv cache hit text tokens=24576 ...
+chat ctx=24576..86821:62245 TOOLS prompt start
 ```
 
-Sincronizzazione dell'intero checkout sperimentale:
+La canonicalizzazione ha quindi invalidato la frontier viva e il checkpoint
+da 85.790 token e' stato anche espulso per budget disco; il server ha ripreso
+dal vecchio anchor 24.576 e rifatto 62.245 token. Token-tile rende questo replay
+molto piu' veloce, ma il prossimo intervento TTFT deve migliorare retention e
+ripristino della frontier senza copiare o riallocare gli scratch del decode.
 
-```bash
-rsync -az --progress -e "ssh -i ~/.ssh/<your-key>" --exclude='.git' --exclude='*.o' --exclude='ds4' --exclude='ds4-server' --exclude='ds4-bench' --exclude='ds4-eval' --exclude='ds4-agent' --exclude='ds4_test' --exclude='ds4_agent_test' --exclude='tests/test_q4k_dot' "<local-ds4-checkout>/" "<gb10-user>@<gb10-host>:/tmp/ds4-gb10-lab/"
-```
+### Nota storica sul deploy
 
-Il `rsync` fornito da macOS non supporta sempre `--info=progress2`; usare
-`--progress` per compatibilità.
-
-Per sincronizzare soltanto il backend CUDA dopo una patch:
-
-```bash
-rsync -az -e "ssh -i ~/.ssh/<your-key>" "<local-ds4-checkout>/ds4_cuda.cu" "<gb10-user>@<gb10-host>:/tmp/ds4-gb10-lab/ds4_cuda.cu"
-```
+I primi esperimenti usavano `/tmp/ds4-gb10-lab`. La procedura corrente e la
+destinazione persistente sono documentate in **Deploy dal Mac** all'inizio del
+README; non usare i vecchi comandi `/tmp` per il server DSpark di produzione.
 
 ## Esperimento MTP + Tensor Core
 
@@ -1210,6 +1311,63 @@ sovrapposto 24.5K-57.3K il throughput aggregato e' salito da circa 364.7 a
 t/s a 24.5K. Il decode a 83K ha prodotto 401 token a 23.00 t/s, senza BOS,
 non-finite o regressioni DSpark.
 
+#### Token-tile HMMA per attenzione prefill
+
+Il percorso validato sul throughput porta nel fork single-session il token-tile
+HMMA dei commit Entrpi `47438d7` e `9de3044`, senza importare serving multi-sequence,
+KV FP8 o artifact SoA. Sedici token e due head condividono una CTA; query e KV
+vengono convertite tile per tile in F16 e score/PV usano
+`mma.sync.m16n8k16` con accumulo FP32.
+
+Nel percorso ratio-4 indexed, ogni tile costruisce l'unione delle 512 righe
+Top-K esatte dei suoi token e conserva una mask a 16 bit per riga compressa.
+Non cambia K, non approssima la selezione e non materializza un nuovo score
+matrix. La variante raw/mixed genera invece l'intervallo compresso causale con
+lo stesso formato di record e riusa il medesimo kernel HMMA.
+
+Le KV del modello restano nel formato e nei buffer esistenti. Due mirror F16 e
+i record per tile vivono in uno scratch CUDA dedicato, separato dall'arena
+referenziata dai graph del decode. Con chunk 8192 e `n_comp <= 32768` il suo
+high-water e' circa 168 MiB; viene allocato una volta e non cresce a ogni
+chunk.
+
+Il confine prestazionale e' strutturale, senza flag runtime: servono almeno 128
+token, 64 head, dimensione 512 e raw window 128. L'indexed richiede inoltre
+Top-K 512 e ratio non nullo. Decode monoriga, verifier DSpark 2–6 e forme non
+supportate continuano sui kernel precedenti.
+
+La regressione confronta indexed e raw/mixed con i rispettivi kernel online
+precedenti su input deterministici, controlla finitezza, relative RMSE e
+massimo errore assoluto. La conversione F16 cambia l'ordine numerico e non e'
+bit-identica; prima dell'accettazione restano obbligatori controllo qualitativo
+reale, prefill almeno +10%, memoria entro il budget e decode DSpark invariato.
+
+Log runtime attesi quando entrambi i percorsi diventano eleggibili:
+
+```text
+ds4: CUDA token-tile HMMA raw/mixed prefill enabled (tile=16, heads=2)
+ds4: CUDA token-tile HMMA indexed prefill enabled (tile=16, heads=2, exact-topk=512)
+```
+
+Risultato Athena del 17 luglio, confronto alla stessa posizione assoluta:
+
+```text
+Intervallo ctx          Prima      Token-tile   Delta
+24576..32768          412.63 t/s   508.57 t/s  +23.25%
+32768..40960          451.08 t/s   569.65 t/s  +26.29%
+40960..49152          432.05 t/s   546.17 t/s  +26.41%
+49152..57344          410.39 t/s   517.30 t/s  +26.05%
+57344..65536          395.45 t/s   500.24 t/s  +26.50%
+65536..73728          378.16 t/s   478.44 t/s  +26.52%
+73728..81920          364.65 t/s   460.02 t/s  +26.15%
+Pesato 57.344 token   404.46 t/s   509.14 t/s  +25.88%
+```
+
+La richiesta completa, leggermente piu' lunga del riferimento precedente, ha
+chiuso 61.214 token in 123,273 secondi, pari a 496,57 t/s. Il decode a circa
+86K e' rimasto integro e ha chiuso 802 token a 23,58 t/s; il costo iniziale di
+warm-up dei graph si riassorbe entro i primi blocchi da 50 token.
+
 #### Copia iniziale CUDA pipelined
 
 Il caricamento del target da 80.76 GiB non usa piu' un unico `cudaMemcpy`
@@ -1235,6 +1393,12 @@ accettazione e' non oltre 210 secondi, senza variazioni nella memoria residente
 a server pronto. Dopo il test di startup restano obbligatori la regression CUDA
 e un controllo prefill/decode DSpark, perche' il layout dei pesi non cambia ma
 la disponibilita' dei byte sul device deve restare completa.
+
+Nel run del 17 luglio la copia primaria da 80,76 GiB ha impiegato 19,076
+secondi, pari a 4,23 GiB/s. La copia separata del sidecar da 10,70 GiB ha
+impiegato 69,999 secondi ed e' ora la parte dominante del caricamento modelli;
+non influisce sul risultato token-tile ma identifica il prossimo costo di
+startup misurabile.
 
 I numeri Entrpi su PRO 6000 non vanno trasferiti direttamente alla GB10. Per
 accettare la patch servono sullo stesso prompt Athena: prefill superiore,
@@ -1480,50 +1644,34 @@ artificiali `p=(0.7,0.3)` e `q=(0.2,0.8)`, draft + rejection devono ricostruire
 
 ## Rollback
 
-Quasi tutte le ottimizzazioni sperimentali sono opt-in. Il routed-MoE MMQ è
-l'eccezione intenzionale: la selezione è automatica e strutturale per il solo
-prefill target da almeno 128 token. Le possibilità di rollback sono:
+MMQ e token-tile usano guardie strutturali e non hanno flag runtime nel launcher.
+Il rollback corretto è quindi conservare il binario stabile precedente oppure
+ricompilare il commit stabile `59a5614` in un checkout separato. Non ripristinare
+singoli file CUDA: MMQ coinvolge anche `cuda/mmq`, header e test di regressione.
 
-1. non impostare `DS4_CUDA_TOKEN_GRAPH` per usare il percorso CUDA normale;
-2. avviare con `DS4_ENABLE_TOKEN_PIPELINE=0 ./run-experimental-server.sh` per
-   mantenere il token graph senza look-ahead;
-3. avviare con `DS4_ENABLE_GREEDY_ARGMAX=0 ./run-experimental-server.sh` per
-   forzare il readback completo anche nelle richieste greedy;
-4. avviare con `DS4_ENABLE_ATTN_HEADS2=0 ./run-experimental-server.sh`; questa
-   è la configurazione raccomandata dopo la regressione misurata;
-5. impostare `DS4_ENABLE_MTP_GRAPH=0` per disabilitare i graph MTP di drafter e
-   verifier;
-6. impostare `DS4_ENABLE_MTP_TC=0` per mantenere MTP senza il nuovo percorso
-   Tensor Core;
-7. non passare `--mtp` per tornare al decode target senza speculazione;
-8. non passare `--dspark` oppure impostare `DS4_DSPARK_SPEC_DISABLE=1` per
-   mantenere il sidecar fuori dal percorso di generazione;
-   `DS4_DSPARK_REJECTION_DISABLE=1` conserva DSpark ma ripristina il precedente
-   exact-match; `DS4_DSPARK_ALWAYS_DRAFT=0 DS4_DSPARK_CIRCUIT_BREAKER=1`
-   ripristina gate storico e breaker;
-9. non impostare `DS4_CUDA_DSPARK_GRAPH` per mantenere DSpark con verifier
-   CUDA normale; non impostare `DS4_CUDA_DSPARK_CACHE_PRIORITY` per tornare
-   alla preparazione Q8→F16 in ordine di file;
-10. non impostare `DS4_CUDA_FUSED_COMPRESSOR_UPDATE` per usare il compressor
-   generico;
-11. per il routed-MoE MMQ usare il precedente binario stabile o ripristinare
-   insieme `Makefile`, `ds4_cuda.cu`, `ds4_gpu.h`, il test CUDA e `cuda/mmq`;
-   non esiste un flag runtime per evitare due percorsi di produzione ambigui;
-12. compilare con `make cuda-spark` invece di `make cuda-spark-graph-sm121`;
-13. fermare il processo in `/tmp/ds4-gb10-lab` e riavviare il binario originale
-   in `/home/athena/ds4`.
+Rollback e diagnostica ancora supportati:
 
-Modello, checkout originale e vecchia KV cache non vengono modificati dal lab.
+1. `DS4_CUDA_DROP_COPIED_MODEL_PAGES=0` conserva le pagine sorgente GGUF;
+2. `DS4_MEMORY_PROFILE=lean` riduce cache e chunk mantenendo il sidecar copiato;
+3. `DS4_MEMORY_PROFILE=prefill-fast` non copia il sidecar, solo per A/B;
+4. `DS4_DSPARK_REJECTION_DISABLE=1` ripristina l'exact-match speculativo;
+5. `DS4_DSPARK_ALWAYS_DRAFT=0 DS4_DSPARK_CIRCUIT_BREAKER=1` ripristina gate e
+   circuit breaker storici;
+6. `DS4_CUDA_DSPARK_TENSOR_CORES=0` disabilita il tiny-batch Tensor Core;
+7. avviare direttamente `ds4-server` senza `--dspark` esclude il sidecar;
+8. `DS4_ADVERTISE_CONTEXT_PCT=100` rimuove il guard client, solo per diagnosi.
+
+Target, sidecar e KV cache non vengono modificati dalla compilazione. Il deploy
+rsync non tocca la directory `.git` remota.
 
 ## Prossimi interventi ad alto potenziale
 
-L'integrazione DSpark è completa nel codice a livello di stato pending,
-sampling, scheduler, KV persistente e graph CUDA K+1. Prima di considerarla
-validata in produzione serve la build CUDA nativa su Athena e il confronto di
-tre numeri con lo stesso prompt lungo: throughput pesato senza DSpark,
-throughput DSpark quiet e
-distribuzione dei K con telemetria. Le ottimizzazioni seguenti restano
-secondarie finché questi dati non mostrano quale costo residuo domina.
+L'integrazione DSpark è completa e token-tile HMMA ha superato il gate con
++25,88%, mantenendo 23,58 t/s di decode. Restano da registrare la memoria
+residente e da ridurre il replay dopo `token-mismatch`: nel run corrente la
+tool call ha ripreso dal checkpoint 24.576 e rifatto oltre 62K token. Dopo
+questo intervento TTFT, profilare nuovamente MoE e attenzione stabilirà quale
+costo residuo può giustificare un altro incremento end-to-end significativo.
 
 ### Graph interamente persistente senza prepare in background
 
@@ -1566,10 +1714,10 @@ lavoro utile per verifier ma anche il costo dei draft rifiutati.
 
 - `Makefile`: target CUDA Graph, build nativa `sm_121` e oggetti MMQ Entrpi.
 - `ds4.c`: DSpark, confidence scheduler, commit diretto, ring rollback e payload KV.
-- `ds4_cuda.cu`: residenza multi-GGUF, kernel DSpark, graph K-aware e routed-MoE
-  MMQ confinato al prefill target.
+- `ds4_cuda.cu`: residenza multi-GGUF, kernel DSpark, graph K-aware, routed-MoE
+  MMQ e token-tile HMMA confinati al prefill target.
 - `ds4_gpu.h`: API interne per token graph, ring backup, verifier DSpark e test
-  di parità MMQ.
+  di parità MMQ/token-tile.
 - `cuda/mmq/`: kernel llama.cpp e adattatore CUDA importati dal fork Entrpi.
 - `ds4_server.c`: speculative sampling DSpark anche con temperatura non nulla.
 - `ds4_kvstore.c`: ABI payload 3 per rifiutare checkpoint incompleti.
@@ -1578,7 +1726,8 @@ lavoro utile per verifier ma anche il costo dei draft rifiutati.
 - `build-dspark-sidecar.sh`: conversione riproducibile dei soli shard DSpark.
 - `run-dspark-server.sh`: configurazione DSpark conservativa per Athena.
 - `analyze-dspark-log.sh`: acceptance, K scelti, circuit breaker e throughput.
-- `deploy-athena.sh`: rsync compatibile con macOS verso il checkout lab.
+- `deploy-athena.sh`: rsync compatibile con macOS verso il checkout persistente
+  di Athena, seguito da regressione, build e avvio.
 
 Le modifiche sono deliberatamente circoscritte al backend CUDA. I percorsi
 esistenti restano regolabili tramite variabili d'ambiente; MMQ usa invece il

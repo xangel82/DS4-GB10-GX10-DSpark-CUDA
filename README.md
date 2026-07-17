@@ -36,8 +36,14 @@ on a single GB10/GX10 machine without changing the target model distribution.
 - Added DSpark-specific CUDA Graph variants for drafter and verifier paths.
 - Added GB10-oriented Tensor Core tiny-batch experiments.
 - Added Q8 tiny-batch reuse and Q8/F16 hot-cache launch profiles.
+- Added raw-GGUF routed-MoE MMQ prefill with paired IQ2_XXS gate/up, Q2_K
+  down projection and a token-bounded stream-K schedule.
+- Added token-tile HMMA attention for exact Top-K indexed and dense raw/mixed
+  prefill batches, structurally excluding decode and the DSpark verifier.
+- Added pipelined direct-I/O model upload and release of copied GGUF source
+  pages to reduce startup time and host page residency.
 - Added long-prefix KV reuse so repeated tool turns can prefill only the
-  appended suffix instead of replaying the whole prompt.
+  appended suffix when the canonical token prefix still matches.
 - Added a client-visible context guard so frontends compact before the physical
   DS4 context is exhausted.
 - Added reproducible run scripts, benchmark analyzers and release-oriented
@@ -59,18 +65,22 @@ on a single GB10/GX10 machine without changing the target model distribution.
   - Q8 tiny-batch reuse;
   - DSpark Tensor Core tiny-batch path enabled by default;
   - always-on DSpark drafting for a single active GB10 decode stream;
+  - `balanced` memory profile, 8192-token prefill chunks and copied sidecar;
   - 131k physical context with an 85% advertised context guard;
   - 16 GiB default disk budget for persisted KV checkpoints.
 - Append-prefill optimization for long chats: canonical KV checkpoints are
   retained near long stable prompt boundaries, so subsequent requests with the
-  same prefix can resume from disk and process only the new tail.
+  same exact prefix can resume from disk and process only the new tail. Tool
+  canonicalization can still produce a token mismatch and fall back to an
+  older anchor; this remaining TTFT issue is documented in `README-GB10.md`.
 - `/v1/models` now advertises both `context_length` and `max_input_tokens`;
   `max_input_tokens` reserves the configured completion budget so clients can
   compact before generation runs into the physical context ceiling.
 
-The best measured profile in this lab reached about 18 token/s weighted decode
-throughput, with K4 becoming the stable scheduler champion.  Exact numbers vary
-with prompt, seed, sampling and telemetry.
+The current measured profile reached 509.14 prefill token/s over the same
+57,344-token absolute-context interval used by the previous baseline, and
+23.58 token/s over an 802-token DSpark decode at about 86k context. Exact
+numbers vary with prompt, seed, sampling and telemetry.
 
 ## Measured GB10 results
 
@@ -85,9 +95,12 @@ They are useful as a sanity check, not as a guaranteed benchmark.
 | MTP sidecar experiments | ~15.1 t/s | Worked, but verifier cost limited the gain. |
 | DSpark exact-match verifier, early versions | ~13-14.5 t/s | Too many fallback/bypass cycles; not the final algorithm. |
 | DSpark p/q rejection sampling, always drafting | ~16.8-17.6 t/s | First correct speculative sampling path with consistent gain. |
-| DSpark p/q rejection + GPU verifier + Tensor Core tiny batches | ~18.2 t/s weighted decode | Best release profile measured; chunks can reach about 19 t/s. |
+| DSpark p/q rejection + GPU verifier + Tensor Core tiny batches | ~18.2 t/s weighted decode | Earlier release milestone; chunks reached about 19 t/s. |
+| Raw-GGUF MMQ MoE + token-bounded stream-K | 404.46 t/s prefill | Weighted baseline over `ctx=24576..81920`; decode remained 23.00 t/s at 83k. |
+| Token-tile HMMA indexed + raw/mixed attention | 509.14 t/s prefill | Same 57,344-token interval, **+25.88%**; full 61,214-token request averaged 496.57 t/s. |
+| Current DSpark decode after token-tile prefill | 23.58 t/s | 802 generated tokens at about 86k context; no decode regression. |
 
-Representative final analyzer output:
+Representative earlier DSpark analyzer output (kept as scheduler history):
 
 ```text
 Fused verifier cycles:     1029
@@ -105,6 +118,12 @@ Weighted request decode:   18.274 t/s
 The important qualitative result is not only the raw t/s number: the final path
 uses true speculative rejection sampling, so accepted drafts preserve the target
 model sampling distribution instead of using a lossy exact-match shortcut.
+
+The current prefill comparison is position matched. Across its seven complete
+8192-token chunks, every chunk improved by 23.25-26.52%; elapsed time for the
+57,344-token interval fell from 141.78 to 112.63 seconds. The primary 80.76 GiB
+model upload completed in 19.076 seconds at 4.23 GiB/s; the separate 10.70 GiB
+sidecar copy took 69.999 seconds and is now the dominant model-load stage.
 
 ## Install on GB10/GX10
 
@@ -131,16 +150,19 @@ Install/build dependencies expected by this fork:
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential git wget python3
+sudo apt install -y build-essential git curl wget rsync python3
 ```
 
-CUDA must already be installed and visible at `/usr/local/cuda`.  On GB10 the
-native build target is:
+CUDA must already be installed and visible at `/usr/local/cuda`. Verify the
+native GB10 toolchain, run the CUDA regression, then build the server:
 
 ```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA
-make cuda-spark-graph-sm121
+cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && /usr/local/cuda/bin/nvcc --version && make -B cuda-regression CUDA_ARCH=sm_121 && make -B cuda-spark-graph-sm121
 ```
+
+The regression must end with `cuda long-context regression: OK`. It validates
+large exact Top-K, raw-GGUF MMQ MoE and both token-tile attention variants.
+Stop an already running server first if memory is close to the GB10 limit.
 
 ### 2. Prepare model directory
 
@@ -157,7 +179,14 @@ The two model files expected by the default launcher are:
 /home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf
 ```
 
-Copy or build the main DeepSeek-V4-Flash GGUF as:
+The recommended Q2/imatrix target can be downloaded with the repository
+helper:
+
+```bash
+cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && DS4_GGUF_DIR=/home/athena/ds4 ./download_model.sh q2-imatrix && ln -sfn /home/athena/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf /home/athena/ds4/ds4flash.gguf
+```
+
+Alternatively, copy or build a compatible DeepSeek-V4-Flash GGUF as:
 
 ```text
 /home/athena/ds4/ds4flash.gguf
@@ -256,7 +285,11 @@ DS4_CTX=131072
 DS4_ADVERTISE_CONTEXT_PCT=85
 DS4_MAX_TOKENS=2200
 DS4_KV_DISK_SPACE_MB=16384
-DS4_MEMORY_PROFILE=prefill-fast
+DS4_MEMORY_PROFILE=balanced
+DS4_PREFILL_CHUNK=8192
+DS4_CUDA_Q8_F16_CACHE_MB=12288
+DS4_CUDA_COPY_SECONDARY_MODEL=1
+DS4_CUDA_DROP_COPIED_MODEL_PAGES=1
 DS4_KV_PREFILL_CHECKPOINT_POLICY=canonical-only
 DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS=$((DS4_CTX / 2))
 DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS=$((DS4_CTX / 16))
@@ -283,6 +316,12 @@ The detailed lab notes, memory accounting and longer A/B history live in
 `README-GB10.md`.
 
 ## Useful rollback switches
+
+The routed-MoE MMQ and token-tile HMMA prefill paths are selected by structural
+shape guards and intentionally have no launcher flag. For a full rollback,
+keep the previous binary or build stable commit `59a5614` in a separate
+checkout; do not restore only `ds4_cuda.cu` because MMQ also depends on
+`cuda/mmq`, `ds4_gpu.h` and the CUDA regression test.
 
 Disable Tensor Core tiny-batch completely:
 
@@ -318,6 +357,14 @@ Ordinary/fallback cycles: 0
 P/Q rejection cycles close to fused verifier cycles
 Pre-draft history bypasses: 0
 K4 or K5 as dominant scheduler choice
+```
+
+The first eligible long prefill should also show:
+
+```text
+ds4: CUDA Entrpi batched MMQ MoE prefill enabled (... token-bound stream-K; decode excluded)
+ds4: CUDA token-tile HMMA raw/mixed prefill enabled (tile=16, heads=2)
+ds4: CUDA token-tile HMMA indexed prefill enabled (tile=16, heads=2, exact-topk=512)
 ```
 
 For Tensor Core confirmation:

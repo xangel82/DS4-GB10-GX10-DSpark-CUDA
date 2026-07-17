@@ -26,6 +26,9 @@ typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
+/* CUDA regression hook: compare the prefill-only MMQ routed-MoE path with
+ * DS4's established IQ2_XXS/Q2_K kernels on deterministic packed weights. */
+int ds4_gpu_mmq_prefill_self_test(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);

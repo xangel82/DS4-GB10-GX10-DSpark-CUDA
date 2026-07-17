@@ -1096,6 +1096,75 @@ buffer attention. Con Flash, chunk 4096, questo vale circa altri 850 MiB. Il
 risparmio scala a circa 1.7 GiB con chunk 8192. Il rollback diagnostico è
 `DS4_PREFILL_NO_SCRATCH_ALIAS=1`.
 
+### Routed MoE prefill MMQ Entrpi sui GGUF originali
+
+Il collo di bottiglia MoE del target usa ora il backend CUDA MMQ già validato
+nel fork [Entrpi/ds4](https://github.com/Entrpi/ds4). I sorgenti importati sono
+descritti in `cuda/mmq/VENDOR.md`: i kernel MMQ derivano dallo snapshot
+llama.cpp `5c0e9468`, mentre `ds4_mmq.*` e gli adattatori sono il raccordo
+Entrpi per DS4.
+
+Il percorso automatico esegue, nell'ordine:
+
+1. costruzione della mappa degli assignment top-6 in ordine expert-major;
+2. quantizzazione Q8_1 unica dell'attivazione comune e MMQ batched IQ2_XXS
+   accoppiato per gate e up;
+3. SwiGLU, clamp e routing weight in un solo kernel sugli intermedi esistenti;
+4. flatten di `[token, slot]`, riordino expert-major e MMQ batched Q2_K down;
+5. somma delle sei uscite direttamente nel risultato MoE del token.
+
+Per chunk 8192 il down presenta 49152 assignment. Il launcher Entrpi usa la
+variante globale dell'`mm_ids_helper` quando la mappa non entra nella shared
+memory, evitando il precedente fallback dell'intero MoE proprio sul chunk di
+produzione.
+
+Questa integrazione include intenzionalmente soltanto il percorso sui pesi
+GGUF canonici già copiati dal loader. Non chiama `ds4_repack`, non costruisce
+artifact SoA/aligned, non sostituisce le range del modello e non cambia la
+copia CUDA o la policy già esistente di rilascio delle pagine sorgente. In
+particolare, non torna il repack da circa 76.5 GiB che aveva portato Athena al
+99.6% di memoria e azzerato il decode.
+
+Il confine con il decode è strutturale, senza flag:
+
+- sono accettati soltanto `IQ2_XXS gate/up`, `Q2_K down`, top-6 e
+  `n_tokens >= 128`;
+- decode target a una riga e verifier DSpark da 2..6 righe restano sui kernel
+  precedenti;
+- il sidecar DSpark Q4, CUDA Graph e SSD expert streaming restano invariati;
+- gate, up, mid e down riusano i quattro buffer batch già allocati da DS4;
+  soltanto mappe e attivazioni quantizzate temporanee passano dal pool CUDA
+  asincrono e vengono liberate in ordine di stream.
+
+Gli epiloghi SwiGLU e sum azzerano i non-finiti mentre leggono gli intermedi.
+Le entry `consumer_sanitizes` possono quindi saltare tre passate standalone su
+gate, up e down mantenendo la stessa semantica dei kernel precedenti.
+
+Il primo chunk compatibile deve stampare:
+
+```text
+ds4: CUDA Entrpi batched MMQ MoE prefill enabled (shared-Q8 IQ2 gate/up, expert-major Q2 down; decode excluded)
+```
+
+Prima del deploy è obbligatorio eseguire:
+
+```bash
+make -B cuda-regression CUDA_ARCH=sm_121
+```
+
+La regressione genera pesi IQ2_XXS/Q2_K e attivazioni deterministici non
+correlati ed esegue la stessa pipeline di produzione con il clamp reale
+`10.0`. Il log `raw-GGUF MMQ MoE parity ... rel-rmse/bad` deve riportare zero
+elementi gate/up post-clamp fuori tolleranza e concludersi con
+`cuda long-context regression: OK`. MMQ usa attivazioni Q8_1, mentre il
+percorso DS4 precedente usa Q8_K: pesi, top-6, clamp, routing weight e formula
+MoE non cambiano, ma i logits non sono attesi bit-identici.
+
+I numeri Entrpi su PRO 6000 non vanno trasferiti direttamente alla GB10. Per
+accettare la patch servono sullo stesso prompt Athena: prefill superiore,
+nessun aumento materiale della memoria residente dopo il chunk, decode DSpark
+invariato rispetto al riferimento 18-20 t/s e nessuna anomalia qualitativa.
+
 `DS4_CUDA_DSPARK_GRAPH=1` usa graph dedicati sia per il drafter sia per il
 verifier: dieci famiglie K-aware (drafter K=1..5 e verifier con 2..6 righe),
 ciascuna con quattro varianti di posizione e quattro per il passaggio del
@@ -1335,7 +1404,9 @@ artificiali `p=(0.7,0.3)` e `q=(0.2,0.8)`, draft + rejection devono ricostruire
 
 ## Rollback
 
-Ogni ottimizzazione sperimentale è opt-in. Le possibilità di rollback sono:
+Quasi tutte le ottimizzazioni sperimentali sono opt-in. Il routed-MoE MMQ è
+l'eccezione intenzionale: la selezione è automatica e strutturale per il solo
+prefill target da almeno 128 token. Le possibilità di rollback sono:
 
 1. non impostare `DS4_CUDA_TOKEN_GRAPH` per usare il percorso CUDA normale;
 2. avviare con `DS4_ENABLE_TOKEN_PIPELINE=0 ./run-experimental-server.sh` per
@@ -1359,8 +1430,11 @@ Ogni ottimizzazione sperimentale è opt-in. Le possibilità di rollback sono:
    alla preparazione Q8→F16 in ordine di file;
 10. non impostare `DS4_CUDA_FUSED_COMPRESSOR_UPDATE` per usare il compressor
    generico;
-11. compilare con `make cuda-spark` invece di `make cuda-spark-graph-sm121`;
-12. fermare il processo in `/tmp/ds4-gb10-lab` e riavviare il binario originale
+11. per il routed-MoE MMQ usare il precedente binario stabile o ripristinare
+   insieme `Makefile`, `ds4_cuda.cu`, `ds4_gpu.h`, il test CUDA e `cuda/mmq`;
+   non esiste un flag runtime per evitare due percorsi di produzione ambigui;
+12. compilare con `make cuda-spark` invece di `make cuda-spark-graph-sm121`;
+13. fermare il processo in `/tmp/ds4-gb10-lab` e riavviare il binario originale
    in `/home/athena/ds4`.
 
 Modello, checkout originale e vecchia KV cache non vengono modificati dal lab.
@@ -1414,10 +1488,13 @@ lavoro utile per verifier ma anche il costo dei draft rifiutati.
 
 ## File modificati
 
-- `Makefile`: target CUDA Graph e build nativa GB10/MTP `sm_121`.
+- `Makefile`: target CUDA Graph, build nativa `sm_121` e oggetti MMQ Entrpi.
 - `ds4.c`: DSpark, confidence scheduler, commit diretto, ring rollback e payload KV.
-- `ds4_cuda.cu`: residenza multi-GGUF, kernel DSpark, graph K-aware e telemetria.
-- `ds4_gpu.h`: API interne per token graph, ring backup e verifier DSpark.
+- `ds4_cuda.cu`: residenza multi-GGUF, kernel DSpark, graph K-aware e routed-MoE
+  MMQ confinato al prefill target.
+- `ds4_gpu.h`: API interne per token graph, ring backup, verifier DSpark e test
+  di parità MMQ.
+- `cuda/mmq/`: kernel llama.cpp e adattatore CUDA importati dal fork Entrpi.
 - `ds4_server.c`: speculative sampling DSpark anche con temperatura non nulla.
 - `ds4_kvstore.c`: ABI payload 3 per rifiutare checkpoint incompleti.
 - `run-mtp-tc-server.sh`: configurazione riproducibile su porta 30007.
@@ -1427,6 +1504,6 @@ lavoro utile per verifier ma anche il costo dei draft rifiutati.
 - `analyze-dspark-log.sh`: acceptance, K scelti, circuit breaker e throughput.
 - `deploy-athena.sh`: rsync compatibile con macOS verso il checkout lab.
 
-Le modifiche sono deliberatamente circoscritte al backend CUDA e attivate
-tramite variabili d'ambiente, così il codice originale e gli altri backend
-restano utilizzabili.
+Le modifiche sono deliberatamente circoscritte al backend CUDA. I percorsi
+esistenti restano regolabili tramite variabili d'ambiente; MMQ usa invece il
+guard strutturale descritto sopra. Gli altri backend restano utilizzabili.

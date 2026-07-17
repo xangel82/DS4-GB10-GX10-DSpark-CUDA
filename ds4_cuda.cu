@@ -11,6 +11,7 @@
 #include <cub/block/block_radix_sort.cuh>
 
 #include <stdint.h>
+#include <stddef.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
@@ -25,6 +26,7 @@
 #include <vector>
 
 #include "ds4_gpu.h"
+#include "cuda/mmq/ds4_mmq.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -80,6 +82,17 @@ typedef struct {
     uint16_t qs[CUDA_QK_K / 8];
 } cuda_block_iq2_xxs;
 
+static_assert(sizeof(cuda_block_iq2_xxs) == 66, "unexpected IQ2_XXS block layout");
+static_assert(sizeof(cuda_block_q2_K) == 84, "unexpected Q2_K block layout");
+static_assert(offsetof(cuda_block_iq2_xxs, d) == 0 &&
+              offsetof(cuda_block_iq2_xxs, qs) == 2,
+              "unexpected IQ2_XXS field order");
+static_assert(offsetof(cuda_block_q2_K, scales) == 0 &&
+              offsetof(cuda_block_q2_K, qs) == 16 &&
+              offsetof(cuda_block_q2_K, d) == 80 &&
+              offsetof(cuda_block_q2_K, dmin) == 82,
+              "unexpected Q2_K field order");
+
 #include "ds4_iq2_tables_cuda.inc"
 
 /* The canonical IQ2 grid lives in constant memory for scalar lookup paths.
@@ -105,12 +118,26 @@ static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static cublasHandle_t g_cublas;
 static int g_cublas_ready;
+static int g_mmq_prefill_ready;
+static int g_mmq_prefill_notice;
+static int g_mmq_prefill_fallback_notice;
 static void *g_cublas_workspace;
 static uint64_t g_cublas_workspace_bytes;
 static int g_quality_mode;
 static int g_ssd_streaming_mode;
 static int g_attn_heads2_dense_notice;
 static int g_attn_heads2_indexed_notice;
+
+/* The imported Entrpi adapter can consume producer-folded Q8_1 activations
+ * in its decode paths. This integration calls MMQ only for target prefill,
+ * so no activation is published through that optional registry. */
+extern "C" int ds4_cuda_q8_fold_take_q81(
+        const void *src, uint64_t in_dim, const void **q81) {
+    (void)src;
+    (void)in_dim;
+    if (q81) *q81 = NULL;
+    return 0;
+}
 
 /* Three compressor topologies, two alternating executable slots (so the
  * background update never touches the graph currently executing), and two
@@ -2591,6 +2618,9 @@ extern "C" int ds4_gpu_init(void) {
         fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
     }
+    if (!g_mmq_prefill_ready) {
+        g_mmq_prefill_ready = ds4_mmq_init(dev) == 0;
+    }
     if (!g_cublas_ready) {
         if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
 #ifdef DS4_CUDA_TOKEN_GRAPH_BUILD
@@ -2658,6 +2688,9 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    g_mmq_prefill_ready = 0;
+    g_mmq_prefill_notice = 0;
+    g_mmq_prefill_fallback_notice = 0;
     cuda_token_graph_release();
     if (g_cublas_ready) {
         (void)cublasDestroy(g_cublas);
@@ -15899,6 +15932,50 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
     out[gid] = acc;
 }
 
+__global__ static void moe_mmq_sum_guard_kernel(
+        float *out,
+        const float *down,
+        uint32_t out_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (gid >= n) return;
+    const uint32_t tok = (uint32_t)(gid / out_dim);
+    const uint32_t row = (uint32_t)(gid - (uint64_t)tok * out_dim);
+    float acc = 0.0f;
+    for (uint32_t e = 0; e < n_expert; ++e) {
+        const float v = down[((uint64_t)tok * n_expert + e) * out_dim + row];
+        if (isfinite(v)) acc += v;
+    }
+    out[gid] = acc;
+}
+
+__global__ static void moe_mmq_swiglu_weighted_kernel(
+        float *mid,
+        const float *gate,
+        const float *up,
+        const float *weights,
+        uint32_t mid_dim,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        float clamp) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t pair_count = (uint64_t)n_tokens * n_expert;
+    const uint64_t n = pair_count * mid_dim;
+    if (gid >= n) return;
+    const uint64_t pair = gid / mid_dim;
+    float g = gate[gid];
+    float u = up[gid];
+    if (!isfinite(g)) g = 0.0f;
+    if (!isfinite(u)) u = 0.0f;
+    if (clamp > 1.0e-6f) {
+        g = fminf(g, clamp);
+        u = fminf(fmaxf(u, -clamp), clamp);
+    }
+    mid[gid] = (g / (1.0f + expf(-g))) * u * weights[pair];
+}
+
 __device__ static float dev_iq2_xxs_dot_f32(const cuda_block_iq2_xxs *row, const float *x, uint32_t nb) {
     float acc = 0.0f;
     for (uint32_t b = 0; b < nb; b++) {
@@ -16050,6 +16127,109 @@ __global__ static void moe_down_f32_kernel(
     if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
 }
 
+static int routed_moe_mmq_prefill_allowed(
+        uint32_t gate_type, uint32_t down_type,
+        uint32_t n_tokens, uint32_t n_expert) {
+    return gate_type == 16u && down_type == 10u &&
+           n_tokens >= 128u && n_expert == 6u;
+}
+
+static int routed_moe_mmq_prefill_launch(
+        ds4_gpu_tensor *out,
+        ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up,
+        ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down,
+        const char *gate_w,
+        const char *up_w,
+        const char *down_w,
+        uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t expert_in_dim,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        const int32_t *selected,
+        const float *weights,
+        const float *x,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        uint32_t n_tokens,
+        float clamp) {
+    if (!g_mmq_prefill_ready || n_tokens < 128u ||
+        !out || !gate || !up || !mid || !down ||
+        !gate_w || !up_w || !down_w ||
+        !selected || !weights || !x || n_total_expert == 0 || n_expert == 0 ||
+        n_total_expert > (uint32_t)INT_MAX || n_expert > (uint32_t)INT_MAX ||
+        n_tokens > (uint32_t)INT_MAX || expert_in_dim > (uint32_t)INT_MAX ||
+        expert_mid_dim > (uint32_t)INT_MAX || out_dim > (uint32_t)INT_MAX) {
+        return 0;
+    }
+
+    const uint64_t expected_gate_row =
+        (uint64_t)(expert_in_dim / CUDA_QK_K) * sizeof(cuda_block_iq2_xxs);
+    const uint64_t expected_down_row =
+        (uint64_t)(expert_mid_dim / CUDA_QK_K) * sizeof(cuda_block_q2_K);
+    if (gate_row_bytes != expected_gate_row ||
+        gate_expert_bytes != (uint64_t)expert_mid_dim * expected_gate_row ||
+        down_row_bytes != expected_down_row ||
+        down_expert_bytes != (uint64_t)out_dim * expected_down_row) {
+        return 0;
+    }
+
+    const uint64_t assignment_count = (uint64_t)n_tokens * n_expert;
+    if (n_expert != 6u || assignment_count > (uint64_t)INT_MAX) return 0;
+
+#ifdef DS4_CUDA_TOKEN_GRAPH_BUILD
+    const cudaStream_t stream = cudaStreamPerThread;
+#else
+    const cudaStream_t stream = 0;
+#endif
+
+    /* Entrpi's batched MMQ path builds an expert-major assignment map and
+     * quantizes the common gate/up activation once. The existing DS4 batch
+     * tensors hold all intermediates, so this adds no persistent model copy. */
+    int rc = ds4_mmq_iq2_xxs_moe_pair_consumer_sanitizes(
+            gate_w, up_w, x, selected,
+            (float *)gate->ptr, (float *)up->ptr,
+            (int)expert_mid_dim, (int)expert_in_dim, (int)n_tokens,
+            (int)n_total_expert, (int)n_expert, stream);
+    if (rc != 0) return -1;
+
+    const uint64_t mid_values = assignment_count * expert_mid_dim;
+    moe_mmq_swiglu_weighted_kernel<<<
+            (uint32_t)((mid_values + 255u) / 256u), 256, 0, stream>>>(
+            (float *)mid->ptr,
+            (const float *)gate->ptr,
+            (const float *)up->ptr,
+            weights, expert_mid_dim, n_expert, n_tokens, clamp);
+    if (cudaGetLastError() != cudaSuccess) return -2;
+
+    /* Each weighted mid row is now an independent one-expert assignment.
+     * Flattening [token, slot] lets MMQ sort the Q2_K down work by expert. */
+    rc = ds4_mmq_q2_K_moe_consumer_sanitizes(
+            down_w, (const float *)mid->ptr, selected, (float *)down->ptr,
+            (int)out_dim, (int)expert_mid_dim, (int)assignment_count,
+            (int)n_total_expert, 1, stream);
+    if (rc != 0) return -3;
+
+    const uint64_t out_values = (uint64_t)n_tokens * out_dim;
+    moe_mmq_sum_guard_kernel<<<
+            (uint32_t)((out_values + 255u) / 256u), 256, 0, stream>>>(
+            (float *)out->ptr, (const float *)down->ptr,
+            out_dim, n_expert, n_tokens);
+    if (cudaGetLastError() != cudaSuccess) return -4;
+
+    if (!g_mmq_prefill_notice) {
+        g_mmq_prefill_notice = 1;
+        fprintf(stderr,
+                "ds4: CUDA Entrpi batched MMQ MoE prefill enabled "
+                "(shared-Q8 IQ2 gate/up, expert-major Q2 down; decode excluded)\n");
+    }
+    return 1;
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -16133,6 +16313,31 @@ static int routed_moe_launch(
         ? g_stream_selected_cache.down_ptr
         : cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
     if (!gate_w || !up_w || !down_w) return 0;
+
+    /* This path is deliberately target-prefill-only. The Q4 DSpark sidecar,
+     * token decode, K+1 verifier batches, CUDA graph capture, and SSD expert
+     * cache retain the established kernels and memory topology. */
+    if (routed_moe_mmq_prefill_allowed(
+                gate_type, down_type, n_tokens, n_expert) &&
+        !g_ssd_streaming_mode && !use_stream_selected_cache) {
+        const int mmq_rc = routed_moe_mmq_prefill_launch(
+                out, gate, up, mid, down,
+                gate_w, up_w, down_w,
+                gate_expert_bytes, gate_row_bytes,
+                down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim,
+                selected_ptr, (const float *)weights->ptr,
+                (const float *)x->ptr,
+                n_total_expert, n_expert, n_tokens, clamp);
+        if (mmq_rc > 0) return 1;
+        if (mmq_rc < 0 && !g_mmq_prefill_fallback_notice) {
+            g_mmq_prefill_fallback_notice = 1;
+            fprintf(stderr,
+                    "ds4: CUDA raw-GGUF MMQ MoE prefill launch failed "
+                    "(stage=%d); using legacy prefill kernels\n",
+                    -mmq_rc);
+        }
+    }
 
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
@@ -16838,6 +17043,282 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              selected, weights, n_total_expert, n_expert, clamp, x,
                              layer_index, n_tokens);
 }
+
+extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
+    enum {
+        n_tokens = 128,
+        n_total_expert = 8,
+        n_expert = 6,
+        in_dim = 512,
+        mid_dim = 256,
+        out_dim = 256
+    };
+    const float test_clamp = 10.0f;
+    if (!g_mmq_prefill_ready ||
+        routed_moe_mmq_prefill_allowed(16u, 10u, 1u, n_expert) ||
+        routed_moe_mmq_prefill_allowed(16u, 10u, 6u, n_expert) ||
+        routed_moe_mmq_prefill_allowed(12u, 12u, 128u, n_expert) ||
+        routed_moe_mmq_prefill_allowed(16u, 10u, 128u, 4u) ||
+        !routed_moe_mmq_prefill_allowed(16u, 10u, 128u, n_expert)) {
+        return 0;
+    }
+
+    const uint64_t pair_count = (uint64_t)n_tokens * n_expert;
+    const uint64_t gate_row_bytes =
+        (uint64_t)(in_dim / CUDA_QK_K) * sizeof(cuda_block_iq2_xxs);
+    const uint64_t gate_expert_bytes = (uint64_t)mid_dim * gate_row_bytes;
+    const uint64_t down_row_bytes =
+        (uint64_t)(mid_dim / CUDA_QK_K) * sizeof(cuda_block_q2_K);
+    const uint64_t down_expert_bytes = (uint64_t)out_dim * down_row_bytes;
+    const uint64_t gate_block_count =
+        (uint64_t)n_total_expert * mid_dim * (in_dim / CUDA_QK_K);
+    const uint64_t down_block_count =
+        (uint64_t)n_total_expert * out_dim * (mid_dim / CUDA_QK_K);
+    const uint64_t pair_values = pair_count * mid_dim;
+    const uint64_t out_values = (uint64_t)n_tokens * out_dim;
+
+    std::vector<cuda_block_iq2_xxs> gate_host(gate_block_count);
+    std::vector<cuda_block_iq2_xxs> up_host(gate_block_count);
+    std::vector<cuda_block_q2_K> down_host(down_block_count);
+    std::vector<float> x_host((uint64_t)n_tokens * in_dim);
+    std::vector<int32_t> selected_host(pair_count);
+    std::vector<float> weights_host(pair_count);
+    std::vector<float> gate_ref_host(pair_values);
+    std::vector<float> gate_mmq_host(pair_values);
+    std::vector<float> up_ref_host(pair_values);
+    std::vector<float> up_mmq_host(pair_values);
+    std::vector<float> out_ref_host(out_values);
+    std::vector<float> out_mmq_host(out_values);
+
+    uint32_t rng = 0x6d2b79f5u;
+    auto next_u32 = [&rng]() -> uint32_t {
+        rng = rng * 1664525u + 1013904223u;
+        return rng;
+    };
+    const uint16_t iq2_scales[] = {0x2a66u, 0x2d1fu, 0x2e66u, 0x30cdu};
+    const uint16_t q2_scales[] = {0x251fu, 0x2a66u, 0x2d1fu, 0x2e66u};
+    for (uint64_t b = 0; b < gate_block_count; ++b) {
+        gate_host[b].d = iq2_scales[next_u32() & 3u];
+        up_host[b].d = iq2_scales[next_u32() & 3u];
+        for (uint32_t q = 0; q < CUDA_QK_K / 8; ++q) {
+            gate_host[b].qs[q] = (uint16_t)(next_u32() >> 16u);
+            up_host[b].qs[q] = (uint16_t)(next_u32() >> 16u);
+        }
+    }
+    for (uint64_t b = 0; b < down_block_count; ++b) {
+        down_host[b].d = q2_scales[next_u32() & 3u];
+        down_host[b].dmin = q2_scales[next_u32() & 3u];
+        for (uint32_t s = 0; s < CUDA_QK_K / 16; ++s) {
+            const uint8_t lo = (uint8_t)(next_u32() & 0x0fu);
+            const uint8_t hi = (uint8_t)(next_u32() & 0x0fu);
+            down_host[b].scales[s] = (uint8_t)(lo | (hi << 4u));
+        }
+        for (uint32_t q = 0; q < CUDA_QK_K / 4; ++q) {
+            down_host[b].qs[q] = (uint8_t)(next_u32() >> 24u);
+        }
+    }
+    for (uint64_t i = 0; i < x_host.size(); ++i) {
+        const float unit = (float)(next_u32() >> 8u) * (1.0f / 16777216.0f);
+        x_host[i] = 2.0f * unit - 1.0f;
+    }
+    for (uint32_t t = 0; t < n_tokens; ++t) {
+        for (uint32_t s = 0; s < n_expert; ++s) {
+            const uint64_t pair = (uint64_t)t * n_expert + s;
+            selected_host[pair] = (int32_t)((t + s) % n_total_expert);
+            weights_host[pair] = 0.20f + 0.015f * (float)s;
+        }
+    }
+
+    std::vector<ds4_gpu_tensor *> allocations;
+    auto alloc = [&allocations](uint64_t bytes) -> ds4_gpu_tensor * {
+        ds4_gpu_tensor *tensor = ds4_gpu_tensor_alloc(bytes);
+        if (tensor) allocations.push_back(tensor);
+        return tensor;
+    };
+
+    ds4_gpu_tensor *gate_w = alloc(gate_block_count * sizeof(cuda_block_iq2_xxs));
+    ds4_gpu_tensor *up_w = alloc(gate_block_count * sizeof(cuda_block_iq2_xxs));
+    ds4_gpu_tensor *down_w = alloc(down_block_count * sizeof(cuda_block_q2_K));
+    ds4_gpu_tensor *x = alloc(x_host.size() * sizeof(float));
+    ds4_gpu_tensor *selected = alloc(pair_count * sizeof(int32_t));
+    ds4_gpu_tensor *weights = alloc(pair_count * sizeof(float));
+    ds4_gpu_tensor *xq = alloc((uint64_t)n_tokens * (in_dim / CUDA_QK_K) * sizeof(cuda_block_q8_K));
+    ds4_gpu_tensor *midq = alloc(pair_count * (mid_dim / CUDA_QK_K) * sizeof(cuda_block_q8_K));
+    ds4_gpu_tensor *gate_ref = alloc(pair_values * sizeof(float));
+    ds4_gpu_tensor *up_ref = alloc(pair_values * sizeof(float));
+    ds4_gpu_tensor *mid_ref = alloc(pair_values * sizeof(float));
+    ds4_gpu_tensor *down_ref = alloc(pair_count * out_dim * sizeof(float));
+    ds4_gpu_tensor *out_ref = alloc(out_values * sizeof(float));
+    ds4_gpu_tensor *gate_mmq = alloc(pair_values * sizeof(float));
+    ds4_gpu_tensor *up_mmq = alloc(pair_values * sizeof(float));
+    ds4_gpu_tensor *mid_mmq = alloc(pair_values * sizeof(float));
+    ds4_gpu_tensor *down_mmq = alloc(pair_count * out_dim * sizeof(float));
+    ds4_gpu_tensor *out_mmq = alloc(out_values * sizeof(float));
+
+    int ok = allocations.size() == 18u;
+    if (ok) ok = ds4_gpu_tensor_write(gate_w, 0, gate_host.data(), gate_w->bytes);
+    if (ok) ok = ds4_gpu_tensor_write(up_w, 0, up_host.data(), up_w->bytes);
+    if (ok) ok = ds4_gpu_tensor_write(down_w, 0, down_host.data(), down_w->bytes);
+    if (ok) ok = ds4_gpu_tensor_write(x, 0, x_host.data(), x->bytes);
+    if (ok) ok = ds4_gpu_tensor_write(selected, 0, selected_host.data(), selected->bytes);
+    if (ok) ok = ds4_gpu_tensor_write(weights, 0, weights_host.data(), weights->bytes);
+
+#ifdef DS4_CUDA_TOKEN_GRAPH_BUILD
+    const cudaStream_t stream = cudaStreamPerThread;
+#else
+    const cudaStream_t stream = 0;
+#endif
+
+    if (ok) {
+        q8_K_quantize_kernel<<<dim3(in_dim / CUDA_QK_K, n_tokens), 256, 0, stream>>>(
+                (cuda_block_q8_K *)xq->ptr, (const float *)x->ptr, in_dim, n_tokens);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    if (ok) {
+        moe_gate_up_mid_qwarp32_kernel<<<dim3((mid_dim + 127u) / 128u, (uint32_t)pair_count), 256, 0, stream>>>(
+                (float *)gate_ref->ptr, (float *)up_ref->ptr, (float *)mid_ref->ptr,
+                (const char *)gate_w->ptr, (const char *)up_w->ptr,
+                (const cuda_block_q8_K *)xq->ptr, (const int32_t *)selected->ptr,
+                (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                in_dim / CUDA_QK_K, mid_dim, n_expert, test_clamp);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    if (ok) {
+        q8_K_quantize_kernel<<<dim3(mid_dim / CUDA_QK_K, (uint32_t)pair_count), 256, 0, stream>>>(
+                (cuda_block_q8_K *)midq->ptr, (const float *)mid_ref->ptr,
+                mid_dim, (uint32_t)pair_count);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    if (ok) {
+        moe_down_qwarp32_kernel<<<dim3((out_dim + 31u) / 32u, (uint32_t)pair_count), 256, 0, stream>>>(
+                (float *)down_ref->ptr, (const char *)down_w->ptr,
+                (const cuda_block_q8_K *)midq->ptr, (const int32_t *)selected->ptr,
+                down_expert_bytes, down_row_bytes, mid_dim / CUDA_QK_K,
+                out_dim, n_expert);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    if (ok) {
+        moe_sum_kernel<<<(uint32_t)((out_values + 255u) / 256u), 256, 0, stream>>>(
+                (float *)out_ref->ptr, (const float *)down_ref->ptr,
+                out_dim, n_expert, n_tokens);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+
+    if (ok) {
+        ok = ds4_mmq_iq2_xxs_moe_pair_consumer_sanitizes(
+                gate_w->ptr, up_w->ptr, (const float *)x->ptr,
+                (const int32_t *)selected->ptr,
+                (float *)gate_mmq->ptr, (float *)up_mmq->ptr,
+                mid_dim, in_dim, n_tokens, n_total_expert, n_expert,
+                stream) == 0;
+    }
+    if (ok) {
+        moe_mmq_swiglu_weighted_kernel<<<
+                (uint32_t)((pair_values + 255u) / 256u), 256, 0, stream>>>(
+                (float *)mid_mmq->ptr, (const float *)gate_mmq->ptr,
+                (const float *)up_mmq->ptr, (const float *)weights->ptr,
+                mid_dim, n_expert, n_tokens, test_clamp);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    if (ok) {
+        ok = ds4_mmq_q2_K_moe_consumer_sanitizes(
+                down_w->ptr, (const float *)mid_mmq->ptr,
+                (const int32_t *)selected->ptr, (float *)down_mmq->ptr,
+                out_dim, mid_dim, (int)pair_count, n_total_expert, 1,
+                stream) == 0;
+    }
+    if (ok) {
+        moe_mmq_sum_guard_kernel<<<(uint32_t)((out_values + 255u) / 256u), 256, 0, stream>>>(
+                (float *)out_mmq->ptr, (const float *)down_mmq->ptr,
+                out_dim, n_expert, n_tokens);
+        ok = cudaGetLastError() == cudaSuccess && cudaStreamSynchronize(stream) == cudaSuccess;
+    }
+
+    if (ok) ok = ds4_gpu_tensor_read(gate_ref, 0, gate_ref_host.data(), gate_ref->bytes);
+    if (ok) ok = ds4_gpu_tensor_read(gate_mmq, 0, gate_mmq_host.data(), gate_mmq->bytes);
+    if (ok) ok = ds4_gpu_tensor_read(up_ref, 0, up_ref_host.data(), up_ref->bytes);
+    if (ok) ok = ds4_gpu_tensor_read(up_mmq, 0, up_mmq_host.data(), up_mmq->bytes);
+    if (ok) ok = ds4_gpu_tensor_read(out_ref, 0, out_ref_host.data(), out_ref->bytes);
+    if (ok) ok = ds4_gpu_tensor_read(out_mmq, 0, out_mmq_host.data(), out_mmq->bytes);
+
+    if (ok) {
+        /* The established fused kernel stores gate/up after applying clamp,
+         * while MMQ intentionally leaves both projections raw and applies
+         * the same clamp in moe_mmq_swiglu_weighted_kernel. Compare like with
+         * like here without adding a production GPU pass. */
+        for (uint64_t i = 0; i < pair_values; ++i) {
+            if (gate_mmq_host[i] > test_clamp) gate_mmq_host[i] = test_clamp;
+            if (up_mmq_host[i] > test_clamp) up_mmq_host[i] = test_clamp;
+            if (up_mmq_host[i] < -test_clamp) up_mmq_host[i] = -test_clamp;
+        }
+    }
+
+    struct parity_stats {
+        double relative_rmse;
+        double max_abs;
+        uint64_t bad;
+    };
+    auto analyze_parity = [](const std::vector<float> &ref,
+                             const std::vector<float> &candidate,
+                             double abs_tol,
+                             double rel_tol) -> parity_stats {
+        double error = 0.0;
+        double signal = 0.0;
+        double max_abs = 0.0;
+        uint64_t bad = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            if (!isfinite(ref[i]) || !isfinite(candidate[i])) {
+                return {INFINITY, INFINITY, UINT64_MAX};
+            }
+            const double d = (double)candidate[i] - ref[i];
+            const double ae = fabs(d);
+            const double re = fabs((double)ref[i]) > 1.0e-12
+                ? ae / fabs((double)ref[i])
+                : (ae > 0.0 ? INFINITY : 0.0);
+            error += d * d;
+            signal += (double)ref[i] * ref[i];
+            max_abs = fmax(max_abs, ae);
+            if (ae > abs_tol && re > rel_tol) ++bad;
+        }
+        return {sqrt(error / fmax(signal, 1.0e-30)), max_abs, bad};
+    };
+    int parity_reported = 0;
+    if (ok) {
+        /* IQ2 MMQ and the established DS4 path quantize activations as Q8_1
+         * and Q8_K respectively. Entrpi's parity harness therefore uses an
+         * absolute tolerance scaled by sqrt(K), combined with a relative
+         * tolerance, instead of rejecting near-zero accumulations on relative
+         * error alone. The final MoE output remains the strict integration
+         * criterion and uses the model's real clamp value. */
+        const double iq2_abs_tol = 0.20 * sqrt((double)in_dim);
+        const parity_stats gate_stats = analyze_parity(
+                gate_ref_host, gate_mmq_host, iq2_abs_tol, 0.05);
+        const parity_stats up_stats = analyze_parity(
+                up_ref_host, up_mmq_host, iq2_abs_tol, 0.05);
+        const parity_stats out_stats = analyze_parity(
+                out_ref_host, out_mmq_host, INFINITY, INFINITY);
+        fprintf(stderr,
+                "cuda-regression: raw-GGUF MMQ MoE parity "
+                "gate=%.5f/%llu up=%.5f/%llu final=%.5f rel-rmse/bad\n",
+                gate_stats.relative_rmse,
+                (unsigned long long)gate_stats.bad,
+                up_stats.relative_rmse,
+                (unsigned long long)up_stats.bad,
+                out_stats.relative_rmse);
+        parity_reported = 1;
+        ok = gate_stats.bad == 0 && up_stats.bad == 0 &&
+             out_stats.relative_rmse < 0.10;
+    }
+
+    if (!ok && !parity_reported) {
+        fprintf(stderr,
+                "cuda-regression: raw-GGUF MMQ MoE self-test failed before parity comparison\n");
+    }
+
+    for (ds4_gpu_tensor *tensor : allocations) ds4_gpu_tensor_free(tensor);
+    return ok;
+}
+
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
     const uint64_t mix_bytes = 24ull * sizeof(float);

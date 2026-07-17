@@ -159,6 +159,7 @@ static int check_decode_attention_overflow_path(void) {
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
+    if (!ds4_gpu_mmq_prefill_self_test()) rc = 1;
     if (check_decode_attention_overflow_path() != 0) rc = 1;
     ds4_gpu_cleanup();
     if (rc == 0) puts("cuda long-context regression: OK");

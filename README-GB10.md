@@ -284,6 +284,49 @@ con una pipeline Blackwell realmente fusa, basata su TMA/TMEM, MMA asincrono,
 warp specializzati e passaggio diretto alla sparse attention, e soltanto con un
 guadagno end-to-end superiore al 10% a parita' di qualità, memoria e decode.
 
+### Esperimento scartato: Packed QAT E2M1 con HMMA F16
+
+Il 18 luglio e' stato provato un percorso prefill-only che conservava le query
+QAT in forma packed. Ogni riga da 128 valori passava da 512 byte F32 a 80 byte:
+64 byte di codici E2M1 FP4 e quattro scale FP32. Lo scorer espandeva i valori
+direttamente nella tile F16 in shared memory e lasciava invariati K, HMMA,
+ReLU, routing weights, causal mask e Top-K. I batch sotto 128 token, incluso il
+decode e il verifier DSpark, restavano sul percorso precedente; il buffer
+packed riusava lo scratch token-tile senza aumentare il context buffer.
+
+La correttezza numerica era esatta nel test CUDA:
+
+```text
+cuda-regression: packed QAT indexer scores different=0 rel-rmse=0.000000000 max-abs=0.000000000
+```
+
+Il gate prestazionale e' pero' fallito nettamente sullo stesso prompt freddo da
+25.280 token, con lo stesso cold anchor a 24.576:
+
+```text
+Intervallo ctx          Baseline    Packed QAT    Delta
+0..8192                 687.28 t/s  511.33 t/s   -25.6%
+8192..16384             680.90 t/s  598.84 t/s   -12.1%
+16384..24576            635.66 t/s  568.92 t/s   -10.5%
+Media 0..24576          667.13 t/s  557.27 t/s   -16.5%
+Richiesta 0..25280      633.34 t/s  532.79 t/s   -15.9%
+```
+
+Il tempo totale e' salito da 39,916 a 47,448 secondi, pari a circa +18,9%.
+Il decode non mostrava un cedimento strutturale e ha raggiunto 21,44 t/s in un
+turno successivo, ma il deficit prefill rendeva inutile proseguire il test.
+
+L'esito indica che lo scorer corrente non e' limitato dalla lettura DRAM delle
+query: la tile Q F32 viene gia' riutilizzata efficacemente dalla L2 mentre le
+CTA attraversano le tile compresse. Il packing aggiunge invece una passata
+completa di lettura/scrittura e, soprattutto, dequantizzazione E2M1 software,
+shuffle, scale e pressione sui registri dentro ogni CTA. L'HMMA F16 corrente
+non consuma FP4 direttamente, quindi il costo di espansione supera il risparmio
+di banda. L'implementazione e il relativo self-test sono stati rimossi
+integralmente. Questa strada va riaperta solo con MMA FP4 block-scaled nativo o
+un kernel CUTLASS equivalente realmente fuso, non con dequantizzazione software
+anteposta allo stesso HMMA.
+
 ### 1. Modello residente nella memoria della GB10
 
 `DS4_CUDA_COPY_MODEL=1` copia il modello sulla memoria del device invece di

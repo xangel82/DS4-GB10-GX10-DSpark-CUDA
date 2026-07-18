@@ -10,7 +10,7 @@ successive conservano la cronologia tecnica, comprese prove scartate e rollback.
 
 ## Stato corrente
 
-Stato al 17 luglio 2026:
+Stato al 18 luglio 2026:
 
 - contesto fisico: 131072 token;
 - contesto pubblicizzato ai client: 85%;
@@ -183,8 +183,8 @@ ds4: CUDA token-tile HMMA raw/mixed prefill enabled ...
 ds4: CUDA token-tile HMMA indexed prefill enabled ...
 ```
 
-Gli ultimi due messaggi appartengono all'intervento in validazione e compaiono
-solo quando una forma eleggibile viene realmente eseguita.
+Gli ultimi due messaggi compaiono soltanto quando una forma token-tile
+eleggibile viene realmente eseguita.
 
 ## Deploy dal Mac
 
@@ -254,6 +254,35 @@ Con lo stesso prompt, stessa posizione assoluta e server appena avviato:
 Le sezioni seguenti documentano l'evoluzione del lab. Quando un valore storico
 contrasta con **Avvio rapido**, prevalgono sempre i default correnti riportati
 all'inizio del documento e in `run-dspark-server.sh`.
+
+### Esperimento scartato: LiteTopK ratio-4
+
+Il 18 luglio e' stato implementato e verificato un percorso LiteTopK esatto
+per il prefill ratio-4, attivo da `n_comp >= 16384`. Usava un campione di 1536
+righe frequenti, soglia conservativa a 256 bin, scan single-owner, selezione
+radix della frontiera e repair GPU batched. La regressione confermava lo stesso
+set Top-K da 512 elementi e il run non mostrava regressioni qualitative o di
+decode DSpark, rimasto intorno a 22,4 t/s.
+
+Il gate prestazionale non e' stato superato. Sullo stesso chunk assoluto
+73728..81920 il baseline token-tile ha misurato 461,96 t/s, mentre LiteTopK ha
+misurato 424,13 t/s, pari a -8,2%. Nei primi chunk dopo l'attivazione la
+regressione arrivava a circa -22%. Non e' emersa neppure una riduzione
+materiale della memoria residente, perche' la matrice score completa restava
+allocata per fallback e repair.
+
+L'audit ha mostrato che il prototipo eliminava la materializzazione completa
+degli score ma continuava a calcolare l'intero prodotto Q x KV. A questo
+aggiungeva uno score pass separato sul campione, conteggi atomici delle
+frequenze, selezione radix e record candidati a 64 bit. La scan riduceva inoltre
+la griglia da molte CTA brevi a 512 CTA lunghe che serializzavano le tile KV.
+Indexer, Top-K e token-tile attention restavano kernel separati, quindi mancava
+la fusione che avrebbe dovuto compensare questi costi.
+
+L'implementazione e' stata rimossa integralmente. La strada va riaperta solo
+con una pipeline Blackwell realmente fusa, basata su TMA/TMEM, MMA asincrono,
+warp specializzati e passaggio diretto alla sparse attention, e soltanto con un
+guadagno end-to-end superiore al 10% a parita' di qualità, memoria e decode.
 
 ### 1. Modello residente nella memoria della GB10
 

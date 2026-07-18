@@ -19029,7 +19029,9 @@ static int routed_moe_aligned_launch(
             rc = ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
                     gate_art->device_ptr, up_art->device_ptr,
                     down_art->device_ptr, x, selected, weights,
-                    gate->ptr, (size_t)gate->bytes, (float *)down->ptr,
+                    up->ptr, (size_t)up->bytes,
+                    gate->ptr, (size_t)gate->bytes,
+                    mid->ptr, (size_t)mid->bytes, (float *)down->ptr,
                     (int)expert_mid_dim, (int)expert_in_dim, (int)out_dim,
                     (int)n_tokens, (int)n_total_expert, (int)n_expert,
                     clamp, stream);
@@ -19037,7 +19039,7 @@ static int routed_moe_aligned_launch(
                 g_moe_complete_fused_notice = 1;
                 fprintf(stderr,
                         "ds4: CUDA complete fused MoE D2R prefill enabled "
-                        "(shared Q8 input, register gate/up, direct SwiGLU Q8 down)\n");
+                        "(preallocated workspace, register gate/up, direct SwiGLU Q8 down)\n");
             }
         } else {
             rc = -1;
@@ -20062,8 +20064,13 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
     ds4_gpu_tensor *mid_mmq = alloc(pair_values * sizeof(float));
     ds4_gpu_tensor *down_mmq = alloc(pair_count * out_dim * sizeof(float));
     ds4_gpu_tensor *out_mmq = alloc(out_values * sizeof(float));
+    /* The synthetic K=1024, M=256 shape has a smaller FP32 up tensor than
+     * its gathered Q8_1 input. Production Flash uses K=4096, M=2048 and
+     * safely reuses up; keep the capacity guard strict and give only this
+     * regression shape a dedicated oversized input workspace. */
+    ds4_gpu_tensor *direct_input_q8 = alloc(pair_count * in_dim * sizeof(float));
 
-    int ok = allocations.size() == 21u;
+    int ok = allocations.size() == 22u;
     if (ok) ok = ds4_gpu_tensor_write(gate_w, 0, gate_host.data(), gate_w->bytes);
     if (ok) ok = ds4_gpu_tensor_write(up_w, 0, up_host.data(), up_w->bytes);
     if (ok) ok = ds4_gpu_tensor_write(down_w, 0, down_host.data(), down_w->bytes);
@@ -20176,15 +20183,23 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
     if (ok) ok = ds4_gpu_tensor_read(out_mmq, 0, out_soa_host.data(), out_mmq->bytes);
 
     if (ok) {
-        ok = ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
+        const int direct_rc = ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
                 gate_soa->ptr, up_soa->ptr, down_soa->ptr,
                 (const float *)x->ptr, (const int32_t *)selected->ptr,
                 (const float *)weights->ptr,
+                direct_input_q8->ptr, (size_t)direct_input_q8->bytes,
                 gate_mmq->ptr, (size_t)gate_mmq->bytes,
+                mid_mmq->ptr, (size_t)mid_mmq->bytes,
                 (float *)down_mmq->ptr,
                 mid_dim, in_dim, out_dim,
                 n_tokens, n_total_expert, n_expert, test_clamp,
-                stream) == 0;
+                stream);
+        ok = direct_rc == 0;
+        if (!ok) {
+            fprintf(stderr,
+                    "cuda-regression: complete fused D2R launch failed rc=%d\n",
+                    direct_rc);
+        }
     }
     if (ok) {
         moe_mmq_sum_guard_kernel<<<

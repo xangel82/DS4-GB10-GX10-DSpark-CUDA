@@ -161,7 +161,7 @@ cuda long-context regression: OK
 Durante un prefill reale deve inoltre comparire una sola volta:
 
 ```text
-ds4: CUDA complete fused MoE D2R prefill enabled (shared Q8 input, register gate/up, direct SwiGLU Q8 down)
+ds4: CUDA complete fused MoE D2R prefill enabled (preallocated workspace, register gate/up, direct SwiGLU Q8 down)
 ```
 
 Su tre chunk con gli stessi intervalli di contesto del riferimento, il
@@ -179,6 +179,45 @@ a 2,618 secondi (`-3,0%`): il kernel combinato costa 38,88 ms/layer contro
 Il risultato e' quindi promosso come miglioramento incrementale a qualita',
 memoria e decode invariati; non rappresenta da solo un incremento macro del
 prefill.
+
+### Workspace MoE D2R senza allocazioni validato su Athena
+
+Il profilo Nsight successivo alla fusione completa ha attribuito 1,003 secondi
+dei 10,478 secondi del chunk a 258 chiamate `cudaMallocAsync`: esattamente sei
+allocazioni per ciascuno dei 43 layer. Il fast path target con piu' di 16 token
+ora riusa buffer batch che in quel ramo erano gia' residenti ma inutilizzati:
+
+1. `up` contiene il Q8_1 dell'attivazione raccolta;
+2. `gate` contiene il Q8_1 prodotto direttamente da gate/up + SwiGLU;
+3. `mid` ospita `ids_src1`, `ids_dst`, confini esperto e una sola worklist
+   condivisa in sequenza da gate/up e down.
+
+Capienza e non sovrapposizione delle quattro regioni, incluso l'output down,
+vengono controllate prima di accodare i kernel. Se una forma non e' compatibile,
+il dispatcher conserva il fallback materializzato precedente. Non cambiano i
+kernel D2R, l'ordine delle riduzioni, i pesi, i routing weight o il decode
+DSpark; non viene inoltre riservata memoria aggiuntiva. Il gate Athena e':
+
+```text
+cuda-regression: complete fused D2R MoE parity final=0.00000000 max=0 bad=0
+cuda long-context regression: OK
+```
+
+Il trace Nsight sullo stesso chunk da 8192 token ha confermato che le 258
+`cudaMallocAsync`, pari a 1,003 secondi, sono scomparse completamente. Il tempo
+host del range `mmq_fused` e' sceso da 1,019 secondi a 4,45 ms, mentre il tempo
+GPU MoE e' rimasto sostanzialmente invariato, da 2,618 a 2,615 secondi. Questo
+conferma che sono state eliminate attese di allocator senza modificare i
+kernel numerici.
+
+Una parte dell'attesa si e' spostata sul `cudaDeviceSynchronize` finale, salito
+da 9,326 a 9,919 secondi. Il bilancio resta positivo: il chunk profilato e'
+passato da 10,475 a 10,040 secondi (`-4,15%`, equivalente a circa `+4,33%` di
+throughput). Nel run ordinario, quattro intervalli globali direttamente
+confrontabili fra 24.576 e 57.344 token migliorano in media del `+3,0%`; il
+chunk 73.728..81.920 passa da 727,01 a 757,28 t/s (`+4,16%`). Il decode resta
+sopra il target, con 22,68 t/s a 64K e 21,97 t/s a 91K, e i context buffer
+restano invariati a 2.453,90 MiB.
 
 ## Requisiti
 

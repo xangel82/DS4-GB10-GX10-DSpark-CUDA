@@ -840,9 +840,40 @@ struct ds4_mmq_fused_down {
     int           out_dim;
     float         clamp;
     bool          direct_gateup_q8;
+    void        * input_q8_scratch;
+    size_t        input_q8_scratch_bytes;
     void        * q8_scratch;
     size_t        q8_scratch_bytes;
+    void        * work_scratch;
+    size_t        work_scratch_bytes;
 };
+
+static bool ds4_mmq_take_scratch(
+        void *base, size_t capacity, size_t *offset,
+        size_t bytes, size_t alignment, void **result) {
+    if (!base || !offset || !result || alignment == 0 ||
+        (alignment & (alignment - 1)) != 0) {
+        return false;
+    }
+    if (*offset > capacity) return false;
+    const uintptr_t address = (uintptr_t)base + *offset;
+    const size_t padding = (size_t)(-(uintptr_t)address) & (alignment - 1);
+    if (padding > capacity - *offset) return false;
+    const size_t aligned = *offset + padding;
+    if (bytes > capacity - aligned) return false;
+    *result = (char *)base + aligned;
+    *offset = aligned + bytes;
+    return true;
+}
+
+static bool ds4_mmq_scratch_overlaps(
+        const void *a, size_t a_bytes, const void *b, size_t b_bytes) {
+    const uintptr_t a_addr = (uintptr_t)a;
+    const uintptr_t b_addr = (uintptr_t)b;
+    return a_addr <= b_addr
+        ? b_addr - a_addr < a_bytes
+        : a_addr - b_addr < b_bytes;
+}
 
 // Produce the weighted SwiGLU rows in their canonical pair-major order. The
 // proven upstream quantizer below gathers them through the already available
@@ -923,7 +954,10 @@ int ds4_mmq_moe_pair_impl(
          (!direct_gateup_q8 && !fused_down->mid_f32) ||
          (direct_gateup_q8 &&
           (!xa_soa || !xb_soa || !fused_down->W_soa ||
-           !fused_down->q8_scratch || fused_down->q8_scratch_bytes == 0)) ||
+           !fused_down->input_q8_scratch ||
+           fused_down->input_q8_scratch_bytes == 0 ||
+           !fused_down->q8_scratch || fused_down->q8_scratch_bytes == 0 ||
+           !fused_down->work_scratch || fused_down->work_scratch_bytes == 0)) ||
          !fused_down->out || fused_down->out_dim <= 0 || M % 256 != 0)) {
         fprintf(stderr, "%s: invalid fused Q2_K down configuration\n", tag);
         return -1;
@@ -958,9 +992,71 @@ int ds4_mmq_moe_pair_impl(
     const int64_t s01          = (int64_t)K / blck;
     const int64_t s02          = (int64_t)M * s01;
 
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx->pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx->pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx->pool(), n_experts + 1);
+    ggml_cuda_pool_alloc<int32_t> ids_src1_alloc;
+    ggml_cuda_pool_alloc<int32_t> ids_dst_alloc;
+    ggml_cuda_pool_alloc<int32_t> expert_bounds_alloc;
+    int32_t *ids_src1 = nullptr;
+    int32_t *ids_dst = nullptr;
+    int32_t *expert_bounds = nullptr;
+    void *direct_work = nullptr;
+    size_t direct_work_bytes = 0;
+
+    const size_t nbytes_src1_q8_1 =
+        ne_get_rows * ne10_padded * sizeof(block_q8_1) / QK8_1 +
+        get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
+    size_t direct_down_q8_bytes = 0;
+    if (direct_gateup_q8) {
+        const int64_t down_ne10_padded = GGML_PAD((int64_t)M, MATRIX_ROW_PADDING);
+        direct_down_q8_bytes =
+            (size_t)ne_get_rows * (size_t)down_ne10_padded *
+                sizeof(block_q8_1) / QK8_1 +
+            (size_t)get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
+        const size_t gateup_work_bytes =
+            ds4_mmq_iq2_xxs_moe_d2r_fused_scratch_bytes(
+                ne_get_rows, n_experts);
+        const size_t down_work_bytes =
+            ds4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
+        if (fused_down->input_q8_scratch_bytes < nbytes_src1_q8_1 ||
+            fused_down->q8_scratch_bytes < direct_down_q8_bytes ||
+            gateup_work_bytes == 0 || down_work_bytes == 0 ||
+            !d2r_enabled() || !d2r_iq2_enabled() ||
+            ne_get_rows < d2r_min_cols() ||
+            !ds4_mmq_iq2_xxs_moe_d2r_available(cc) ||
+            !ds4_mmq_q2_K_moe_d2r_available(cc)) {
+            return -9;
+        }
+
+        size_t offset = 0;
+        void *ids_src1_raw = nullptr;
+        void *ids_dst_raw = nullptr;
+        void *expert_bounds_raw = nullptr;
+        direct_work_bytes = gateup_work_bytes > down_work_bytes
+            ? gateup_work_bytes : down_work_bytes;
+        if (!ds4_mmq_take_scratch(
+                fused_down->work_scratch, fused_down->work_scratch_bytes,
+                &offset, (size_t)ne_get_rows * sizeof(int32_t), 256,
+                &ids_src1_raw) ||
+            !ds4_mmq_take_scratch(
+                fused_down->work_scratch, fused_down->work_scratch_bytes,
+                &offset, (size_t)ne_get_rows * sizeof(int32_t), 256,
+                &ids_dst_raw) ||
+            !ds4_mmq_take_scratch(
+                fused_down->work_scratch, fused_down->work_scratch_bytes,
+                &offset, (size_t)(n_experts + 1) * sizeof(int32_t), 256,
+                &expert_bounds_raw) ||
+            !ds4_mmq_take_scratch(
+                fused_down->work_scratch, fused_down->work_scratch_bytes,
+                &offset, direct_work_bytes, 256, &direct_work)) {
+            return -9;
+        }
+        ids_src1 = (int32_t *)ids_src1_raw;
+        ids_dst = (int32_t *)ids_dst_raw;
+        expert_bounds = (int32_t *)expert_bounds_raw;
+    } else {
+        ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
+        ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
+        expert_bounds = expert_bounds_alloc.alloc(ctx->pool(), n_experts + 1);
+    }
 
     const int si1  = n_expert_used;
     const int sis1 = 1;
@@ -982,10 +1078,10 @@ int ds4_mmq_moe_pair_impl(
                 nvtx_prefill);
         // Task #22 root-cause fix (same as ds4_mmq_moe_impl): zero the id maps
         // so entries dropped by mm_ids_helper never expose stale pool memory.
-        cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows * sizeof(int32_t), stream);
-        cudaMemsetAsync(ids_dst.get(),  0, ne_get_rows * sizeof(int32_t), stream);
+        cudaMemsetAsync(ids_src1, 0, ne_get_rows * sizeof(int32_t), stream);
+        cudaMemsetAsync(ids_dst,  0, ne_get_rows * sizeof(int32_t), stream);
         ggml_cuda_launch_mm_ids_helper(
-            ids, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+            ids, ids_src1, ids_dst, expert_bounds,
             n_experts, n_tokens, n_expert_used, /*nchannels_y=*/(int)ne11,
             si1, sis1, stream);
 
@@ -1011,10 +1107,10 @@ int ds4_mmq_moe_pair_impl(
      * down Q8_1. The direct path needs both simultaneously, but writes down
      * Q8_1 into caller-owned gate scratch instead of growing the CUDA pool. */
     {
-    const size_t nbytes_src1_q8_1 =
-        ne_get_rows * ne10_padded * sizeof(block_q8_1) / QK8_1 +
-        get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
+    ggml_cuda_pool_alloc<char> src1_q8_1_alloc;
+    char *src1_q8_1 = direct_gateup_q8
+        ? (char *)fused_down->input_q8_scratch
+        : src1_q8_1_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
 
     // S1.1a fix (same as the dense/moe paths): zero the over-allocated mmq Y buffer
     // so the kernel's unconditional masked-out tail-tile read (mmq.cuh:3528) returns
@@ -1027,9 +1123,9 @@ int ds4_mmq_moe_pair_impl(
                 "ds4/prefill/moe/input_quant_q8_1",
                 ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)K),
                 nvtx_prefill);
-        cudaMemsetAsync(src1_q8_1.get(), 0, nbytes_src1_q8_1, stream);
+        cudaMemsetAsync(src1_q8_1, 0, nbytes_src1_q8_1, stream);
         quantize_mmq_q8_1_cuda(
-            X_f32, ids_src1.get(), (void *)src1_q8_1.get(),
+            X_f32, ids_src1, (void *)src1_q8_1,
             type, /*ne00=*/K, s11_src, s12_src, s13_src,
             /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
             stream);
@@ -1042,23 +1138,8 @@ int ds4_mmq_moe_pair_impl(
     }
 
     if (direct_gateup_q8) {
-        const int64_t down_ne10_padded = GGML_PAD((int64_t)M, MATRIX_ROW_PADDING);
-        const size_t logical_q8_bytes =
-            (size_t)ne_get_rows * (size_t)down_ne10_padded *
-            sizeof(block_q8_1) / QK8_1;
-        const size_t tail_q8_bytes =
-            (size_t)get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
-        const size_t down_q8_bytes = logical_q8_bytes + tail_q8_bytes;
-        if (fused_down->q8_scratch_bytes < down_q8_bytes ||
-            !d2r_enabled() || !d2r_iq2_enabled() ||
-            ne_get_rows < d2r_min_cols() ||
-            !ds4_mmq_iq2_xxs_moe_d2r_available(cc) ||
-            !ds4_mmq_q2_K_moe_d2r_available(cc)) {
-            return -9;
-        }
-
         err = cudaMemsetAsync(
-            fused_down->q8_scratch, 0, down_q8_bytes, stream);
+            fused_down->q8_scratch, 0, direct_down_q8_bytes, stream);
         if (err != cudaSuccess) {
             return -9;
         }
@@ -1068,8 +1149,6 @@ int ds4_mmq_moe_pair_impl(
         if (gateup_work_bytes == 0) {
             return -9;
         }
-        ggml_cuda_pool_alloc<char> gateup_work(
-            ctx->pool(), gateup_work_bytes);
         {
             ds4_mmq_nvtx_scope stage(
                     "ds4/prefill/moe/iq2_gate_up_swiglu_q8_d2r",
@@ -1077,10 +1156,10 @@ int ds4_mmq_moe_pair_impl(
                     nvtx_prefill);
             const int d2r_rc = ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
                     xa_soa, xb_soa, soa_blocks,
-                    src1_q8_1.get(), ids_dst.get(), expert_bounds.get(),
+                    src1_q8_1, ids_dst, expert_bounds,
                     fused_down->router_weights, fused_down->q8_scratch,
                     M, K, ne_get_rows, n_experts, fused_down->clamp,
-                    gateup_work.get(), gateup_work_bytes, stream);
+                    direct_work, gateup_work_bytes, stream);
             if (d2r_rc != 0) {
                 return -10;
             }
@@ -1096,7 +1175,6 @@ int ds4_mmq_moe_pair_impl(
         if (down_work_bytes == 0) {
             return -11;
         }
-        ggml_cuda_pool_alloc<char> down_work(ctx->pool(), down_work_bytes);
         {
             ds4_mmq_nvtx_scope stage(
                     "ds4/prefill/moe/q2_down_d2r",
@@ -1107,10 +1185,10 @@ int ds4_mmq_moe_pair_impl(
                     fused_down->W_soa,
                     fused_down->soa_blocks,
                     fused_down->q8_scratch,
-                    ids_dst.get(), expert_bounds.get(),
+                    ids_dst, expert_bounds,
                     fused_down->out,
                     fused_down->out_dim, M, ne_get_rows, n_experts,
-                    down_work.get(), down_work_bytes, stream);
+                    direct_work, down_work_bytes, stream);
             if (down_rc != 0) {
                 return -12;
             }
@@ -1147,8 +1225,8 @@ int ds4_mmq_moe_pair_impl(
                         ds4_mmq_nvtx_payload((uint32_t)ne_get_rows, (uint32_t)M),
                         nvtx_prefill);
                 const int d2r_rc = ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
-                        xa_soa, xb_soa, soa_blocks, src1_q8_1.get(), ids_dst.get(),
-                        expert_bounds.get(), out_a, out_b, M, K, ne_get_rows, n_experts,
+                        xa_soa, xb_soa, soa_blocks, src1_q8_1, ids_dst,
+                        expert_bounds, out_a, out_b, M, K, ne_get_rows, n_experts,
                         d2r_work.get(), d2r_work_bytes, stream);
                 if (d2r_rc == 0) {
                     gate_up_done = true;
@@ -1161,9 +1239,9 @@ int ds4_mmq_moe_pair_impl(
     mmq_args args = {
         /*x=*/(const char *)W_a,
         /*type_x=*/type,
-        /*y=*/(const int *)src1_q8_1.get(),
-        /*ids_dst=*/ids_dst.get(),
-        /*expert_bounds=*/expert_bounds.get(),
+        /*y=*/(const int *)src1_q8_1,
+        /*ids_dst=*/ids_dst,
+        /*expert_bounds=*/expert_bounds,
         /*dst=*/out_a,
         /*ncols_x=*/ne00,
         /*nrows_x=*/(int64_t)M,
@@ -1247,7 +1325,7 @@ int ds4_mmq_moe_pair_impl(
             }
 
             quantize_mmq_q8_1_cuda(
-                fused_down->mid_f32, ids_dst.get(), (void *)down_q8_1.get(),
+                fused_down->mid_f32, ids_dst, (void *)down_q8_1.get(),
                 GGML_TYPE_Q2_K, /*ne00=*/M, /*s01=*/M,
                 /*s02=*/(int64_t)M, /*s03=*/(int64_t)M * ne_get_rows,
                 /*ne0=*/down_ne10_padded, /*ne1=*/ne_get_rows,
@@ -1273,8 +1351,8 @@ int ds4_mmq_moe_pair_impl(
             /*x=*/(const char *)fused_down->W,
             /*type_x=*/GGML_TYPE_Q2_K,
             /*y=*/(const int *)down_q8_1.get(),
-            /*ids_dst=*/ids_dst.get(),
-            /*expert_bounds=*/expert_bounds.get(),
+            /*ids_dst=*/ids_dst,
+            /*expert_bounds=*/expert_bounds,
             /*dst=*/fused_down->out,
             /*ncols_x=*/(int64_t)M,
             /*nrows_x=*/(int64_t)fused_down->out_dim,
@@ -1314,8 +1392,8 @@ int ds4_mmq_moe_pair_impl(
                         fused_down->W_soa,
                         fused_down->soa_blocks,
                         down_q8_1.get(),
-                        ids_dst.get(),
-                        expert_bounds.get(),
+                        ids_dst,
+                        expert_bounds,
                         fused_down->out,
                         fused_down->out_dim,
                         M,
@@ -1456,6 +1534,10 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused(
         false,
         nullptr,
         0,
+        nullptr,
+        0,
+        nullptr,
+        0,
     };
     return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
         "ds4_mmq_iq2_xxs_q2_K_moe_fused",
@@ -1473,7 +1555,8 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         int n_tokens, int n_experts, int n_expert_used,
         float clamp, cudaStream_t stream) {
     if (expert_mid_dim <= 0 || expert_in_dim <= 0 || out_dim <= 0 ||
-        n_experts <= 0 || expert_in_dim % 256 != 0 ||
+        n_tokens <= 0 || n_experts <= 0 || n_expert_used <= 0 ||
+        n_expert_used > n_experts || expert_in_dim % 256 != 0 ||
         expert_mid_dim % 256 != 0 || out_dim % 2 != 0) {
         return -1;
     }
@@ -1493,6 +1576,10 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         false,
         nullptr,
         0,
+        nullptr,
+        0,
+        nullptr,
+        0,
     };
     return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
         "ds4_mmq_iq2_xxs_q2_K_moe_fused_soa",
@@ -1506,14 +1593,39 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
 extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
         const void * W_gate, const void * W_up, const void * W_down,
         const float * X, const int32_t * ids, const float * router_weights,
-        void * q8_scratch, size_t q8_scratch_bytes, float * down,
+        void * input_q8_scratch, size_t input_q8_scratch_bytes,
+        void * down_q8_scratch, size_t down_q8_scratch_bytes,
+        void * work_scratch, size_t work_scratch_bytes, float * down,
         int expert_mid_dim, int expert_in_dim, int out_dim,
         int n_tokens, int n_experts, int n_expert_used,
         float clamp, cudaStream_t stream) {
     if (expert_mid_dim <= 0 || expert_in_dim <= 0 || out_dim <= 0 ||
-        n_experts <= 0 || expert_in_dim % 256 != 0 ||
+        n_tokens <= 0 || n_experts <= 0 || n_expert_used <= 0 ||
+        n_expert_used > n_experts || expert_in_dim % 256 != 0 ||
         expert_mid_dim % 256 != 0 || out_dim % 2 != 0 ||
-        !q8_scratch || q8_scratch_bytes == 0) {
+        !input_q8_scratch || input_q8_scratch_bytes == 0 ||
+        !down_q8_scratch || down_q8_scratch_bytes == 0 ||
+        !work_scratch || work_scratch_bytes == 0 || !down) {
+        return -1;
+    }
+    const size_t down_bytes =
+        (size_t)n_tokens * (size_t)n_expert_used *
+        (size_t)out_dim * sizeof(float);
+    if (ds4_mmq_scratch_overlaps(
+            input_q8_scratch, input_q8_scratch_bytes,
+            down_q8_scratch, down_q8_scratch_bytes) ||
+        ds4_mmq_scratch_overlaps(
+            input_q8_scratch, input_q8_scratch_bytes,
+            work_scratch, work_scratch_bytes) ||
+        ds4_mmq_scratch_overlaps(
+            down_q8_scratch, down_q8_scratch_bytes,
+            work_scratch, work_scratch_bytes) ||
+        ds4_mmq_scratch_overlaps(
+            input_q8_scratch, input_q8_scratch_bytes, down, down_bytes) ||
+        ds4_mmq_scratch_overlaps(
+            down_q8_scratch, down_q8_scratch_bytes, down, down_bytes) ||
+        ds4_mmq_scratch_overlaps(
+            work_scratch, work_scratch_bytes, down, down_bytes)) {
         return -1;
     }
     const int64_t iq2_blocks =
@@ -1530,8 +1642,12 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
         out_dim,
         clamp,
         true,
-        q8_scratch,
-        q8_scratch_bytes,
+        input_q8_scratch,
+        input_q8_scratch_bytes,
+        down_q8_scratch,
+        down_q8_scratch_bytes,
+        work_scratch,
+        work_scratch_bytes,
     };
     return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
         "ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa",

@@ -152,6 +152,21 @@ static int check_gvr_topk(void) {
         goto cleanup;
     }
 
+    /* n_tokens=2 and n_comp>8192 must exercise the parallel small-batch
+     * chunk tree rather than the prefill Radix path.  The synthetic rows are
+     * strictly descending, so this is also an independent exact-order check. */
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t rank = 0; rank < top_k; rank++) {
+            const uint32_t value = hint_host[(uint64_t)t * top_k + rank];
+            if (value != rank) {
+                fprintf(stderr,
+                        "small-batch top-k mismatch token=%u rank=%u got=%u\n",
+                        t, rank, value);
+                goto cleanup;
+            }
+        }
+    }
+
     /* Token zero exercises the temporal fast path. Token one deliberately
      * corrupts one hint so the exact masked-Radix fallback is also covered. */
     hint_host[top_k] = n_comp;
@@ -185,7 +200,8 @@ static int check_gvr_topk(void) {
         goto cleanup;
     }
     fprintf(stderr,
-            "cuda-regression: exact GVR Top-512 fast-path+fallback OK\n");
+            "cuda-regression: exact small-batch chunk-tree + GVR Top-512 "
+            "fast-path/fallback OK\n");
     rc = 0;
 
 cleanup:

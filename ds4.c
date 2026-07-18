@@ -13709,10 +13709,11 @@ static bool metal_graph_capture_prefix_gvr_hint(
     return ok;
 }
 
-/* Exact Top-512 dispatch with temporal feedback.  GVR is intentionally limited
- * to ordinary one-token decode at deep context; speculative verifier rows stay
- * parallel on Radix, but their exact results still populate prefix snapshots so
- * partial accept and rollback promote the matching hint. */
+/* Exact Top-512 dispatch with temporal feedback.  GVR is limited to genuinely
+ * serial one-token work at deep context.  Speculative frontier snapshots save
+ * and restore the hint alongside the compressor state, so those serial rows
+ * can use GVR safely as well.  Parallel verifier batches retain the exact
+ * multi-CTA Top-K path and still populate every matching prefix snapshot. */
 static bool metal_graph_indexer_topk_exact(
         ds4_gpu_graph *g,
         uint32_t       il,
@@ -13728,7 +13729,6 @@ static bool metal_graph_indexer_topk_exact(
     const bool use_gvr = DS4_GPU_INDEXER_PACKED &&
                          n_tokens == 1u &&
                          n_comp >= 12288u &&
-                         g->spec_capture_prefixes == 0u &&
                          g->layer_gvr_hint_valid[il] &&
                          g->layer_gvr_hint[il] &&
                          g->gvr_fallback;

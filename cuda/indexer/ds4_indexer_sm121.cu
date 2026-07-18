@@ -349,6 +349,137 @@ __global__ void indexer_scores_mxfp4_kernel(
 #endif
 }
 
+/* Decode/verifier specialization.  The m16 dimension is occupied by sixteen
+ * indexer heads from one token instead of padding a 1..6 token batch to 16.
+ * Each warp owns eight compressed rows.  Contributions are staged and added
+ * in ascending head order so the FP32 reduction matches the token-tile kernel. */
+__global__ void indexer_scores_mxfp4_small_kernel(
+        float         *scores,
+        const uint8_t *q,
+        const float   *weights,
+        const uint8_t *keys,
+        uint32_t       n_comp,
+        uint32_t       n_tokens,
+        uint32_t       pos0,
+        uint32_t       n_head,
+        uint32_t       ratio,
+        float          scale,
+        int            causal) {
+#if defined(DS4_CUDA_SM121A_MXF4_MMA) && \
+    defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+    const uint32_t tid = threadIdx.x;
+    const uint32_t lane = tid & 31u;
+    const uint32_t warp = tid >> 5u;
+    const uint32_t token = blockIdx.y;
+    const uint32_t tile_comp = blockIdx.x * 64u;
+    const uint32_t comp_base = tile_comp + warp * 8u;
+    if (token >= n_tokens) return;
+
+    __shared__ __align__(16) uint8_t q_shared[16 * DS4_INDEXER_FP4_ROW_BYTES];
+    __shared__ float weight_shared[16];
+    __shared__ float contribution[8][8][16];
+
+    const uint32_t n = comp_base + (lane >> 2u);
+    const uint32_t k_byte = (lane & 3u) * 4u;
+    uint32_t b00 = 0, b01 = 0, b10 = 0, b11 = 0;
+    uint32_t sfb0 = 0, sfb1 = 0;
+    if (n < n_comp) {
+        const uint8_t *key = keys + (uint64_t)n * DS4_INDEXER_FP4_ROW_BYTES;
+        b00 = load_u32(key + k_byte);
+        b01 = load_u32(key + 16u + k_byte);
+        b10 = load_u32(key + 32u + k_byte);
+        b11 = load_u32(key + 48u + k_byte);
+        sfb0 = load_scale_pair(key, 0u);
+        sfb1 = load_scale_pair(key, 1u);
+    }
+
+    float total = 0.0f;
+    for (uint32_t h0 = 0; h0 < n_head; h0 += 16u) {
+        for (uint32_t i = tid; i < 16u * 17u; i += blockDim.x) {
+            const uint32_t m = i / 17u;
+            const uint32_t word = i - m * 17u;
+            uint32_t value = 0u;
+            if (h0 + m < n_head) {
+                const uint8_t *src = q +
+                    ((uint64_t)token * n_head + h0 + m) *
+                    DS4_INDEXER_FP4_ROW_BYTES;
+                value = load_u32(src + word * 4u);
+            }
+            reinterpret_cast<uint32_t *>(q_shared +
+                (uint64_t)m * DS4_INDEXER_FP4_ROW_BYTES)[word] = value;
+        }
+        if (tid < 16u) {
+            weight_shared[tid] = h0 + tid < n_head
+                ? weights[(uint64_t)token * n_head + h0 + tid]
+                : 0.0f;
+        }
+        __syncthreads();
+
+        const uint32_t m0 = lane >> 2u;
+        const uint32_t m1 = m0 + 8u;
+        const uint32_t scale_m = (lane & 1u) * 8u + (lane >> 2u);
+        const uint8_t *a_row0 = q_shared +
+            (uint64_t)m0 * DS4_INDEXER_FP4_ROW_BYTES;
+        const uint8_t *a_row1 = q_shared +
+            (uint64_t)m1 * DS4_INDEXER_FP4_ROW_BYTES;
+        const uint8_t *a_scale = q_shared +
+            (uint64_t)scale_m * DS4_INDEXER_FP4_ROW_BYTES;
+
+        float d0, d1, d2, d3;
+        mxfp4_mma_m16n8k64(
+            d0, d1, d2, d3,
+            load_u32(a_row0 + k_byte),
+            load_u32(a_row1 + k_byte),
+            load_u32(a_row0 + 16u + k_byte),
+            load_u32(a_row1 + 16u + k_byte),
+            b00, b01,
+            0.0f, 0.0f, 0.0f, 0.0f,
+            load_scale_pair(a_scale, 0u), sfb0);
+        mxfp4_mma_m16n8k64(
+            d0, d1, d2, d3,
+            load_u32(a_row0 + 32u + k_byte),
+            load_u32(a_row1 + 32u + k_byte),
+            load_u32(a_row0 + 48u + k_byte),
+            load_u32(a_row1 + 48u + k_byte),
+            b10, b11,
+            d0, d1, d2, d3,
+            load_scale_pair(a_scale, 1u), sfb1);
+
+        const uint32_t col0 = (lane & 3u) * 2u;
+        contribution[warp][col0][m0] =
+            fmaxf(d0, 0.0f) * weight_shared[m0];
+        contribution[warp][col0 + 1u][m0] =
+            fmaxf(d1, 0.0f) * weight_shared[m0];
+        contribution[warp][col0][m1] =
+            fmaxf(d2, 0.0f) * weight_shared[m1];
+        contribution[warp][col0 + 1u][m1] =
+            fmaxf(d3, 0.0f) * weight_shared[m1];
+        __syncwarp();
+        if (lane < 8u) {
+            #pragma unroll
+            for (uint32_t m = 0; m < 16u; m++) {
+                total += contribution[warp][lane][m];
+            }
+        }
+        __syncwarp();
+        __syncthreads();
+    }
+
+    if (lane < 8u) {
+        const uint32_t comp = comp_base + lane;
+        if (comp < n_comp) {
+            scores[(uint64_t)token * n_comp + comp] =
+                causal && comp >= (pos0 + token + 1u) / ratio
+                    ? -CUDART_INF_F : total * scale;
+        }
+    }
+#else
+    (void)scores; (void)q; (void)weights; (void)keys;
+    (void)n_comp; (void)n_tokens; (void)pos0; (void)n_head;
+    (void)ratio; (void)scale; (void)causal;
+#endif
+}
+
 } // namespace
 
 extern "C" cudaError_t ds4_indexer_sm121_pack(
@@ -417,13 +548,23 @@ extern "C" cudaError_t ds4_indexer_sm121_scores(
 #endif
     }
     if (cached_native) {
-        const dim3 grid((n_comp + 63u) / 64u, (n_tokens + 15u) / 16u, 1u);
-        indexer_scores_mxfp4_kernel<<<grid, 256, 0, stream>>>(
-            scores,
-            static_cast<const uint8_t *>(q_packed),
-            weights,
-            static_cast<const uint8_t *>(key_packed),
-            n_comp, n_tokens, pos0, n_head, ratio, scale, causal);
+        if (n_tokens <= 6u) {
+            const dim3 grid((n_comp + 63u) / 64u, n_tokens, 1u);
+            indexer_scores_mxfp4_small_kernel<<<grid, 256, 0, stream>>>(
+                scores,
+                static_cast<const uint8_t *>(q_packed),
+                weights,
+                static_cast<const uint8_t *>(key_packed),
+                n_comp, n_tokens, pos0, n_head, ratio, scale, causal);
+        } else {
+            const dim3 grid((n_comp + 63u) / 64u, (n_tokens + 15u) / 16u, 1u);
+            indexer_scores_mxfp4_kernel<<<grid, 256, 0, stream>>>(
+                scores,
+                static_cast<const uint8_t *>(q_packed),
+                weights,
+                static_cast<const uint8_t *>(key_packed),
+                n_comp, n_tokens, pos0, n_head, ratio, scale, causal);
+        }
     } else {
         const dim3 grid(n_comp, n_tokens, 1u);
         indexer_scores_packed_scalar_kernel<<<grid, 128, 0, stream>>>(

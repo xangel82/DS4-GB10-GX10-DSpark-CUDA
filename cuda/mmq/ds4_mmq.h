@@ -5,12 +5,8 @@
 // without C++ compilation. Functions return 0 on success and non-zero on
 // failure (with stderr error message). Device pointers are caller-owned.
 //
-// Phase 0: skeleton only. Q8_0 dense entry compiles and instantiates
-// mul_mat_q_case<Q8_0> but is not yet wired into ds4_cuda.cu.
-// Phase 1: Q8_1 activation quantizer wrapper added.
-// Phase 2: Q8_0 dense entry verified against cublas+dequant baseline.
-// Phase 3: Q2_K + IQ2_XXS dense entries.
-// Phase 4: MoE _id variants of all three.
+// The ABI exposes raw quantized GEMM, routed MoE, aligned-SoA D2R, and fused
+// decode/prefill epilogues used by ds4_cuda.cu.
 
 #pragma once
 
@@ -118,8 +114,8 @@ int ds4_mmq_q4_K_dense(
 //
 // where col = token * n_expert_used + slot, row in [0, M).  The caller is
 // responsible for any downstream sum-weighted-by-router-weights reduction
-// across the n_expert_used dimension (Phase 5 wires this into ds4's
-// existing moe_sum_kernel).
+// across the n_expert_used dimension. Fused variants declared below perform
+// the SwiGLU/router weighting and deterministic top-6 reduction directly.
 //
 // Layouts:
 //   W:       device pointer, [n_experts, M rows, K cols] in the
@@ -290,6 +286,29 @@ int ds4_mmq_iq2_xxs_q2_K_moe_fused(
     float           clamp,
     cudaStream_t    stream);
 
+/* Same fused target-prefill pipeline over byte-neutral aligned-SoA IQ2_XXS
+ * and Q2_K replacement artifacts. Gate/up and down automatically dispatch
+ * to the native D2R kernels on SM121. */
+int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
+    const void    * W_gate_soa,
+    const void    * W_up_soa,
+    const void    * W_down_soa,
+    const float   * X_f32,
+    const int32_t * ids,
+    const float   * router_weights,
+    float         * gate_f32,
+    float         * up_f32,
+    float         * mid_f32,
+    float         * down_f32,
+    int             expert_mid_dim,
+    int             expert_in_dim,
+    int             out_dim,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    float           clamp,
+    cudaStream_t    stream);
+
 // ds4 (P4 Inc3): same contract as ds4_mmq_iq2_xxs_moe_pair but over the
 // aligned-SoA artifacts (weight server --repack-iq2-aligned); see
 // ds4_mmq_q2_K_moe_soa.
@@ -438,6 +457,21 @@ int ds4_mmq_iq2_xxs_aligned_derepack(
 uint64_t ds4_mmq_q2_k_aligned_bytes(int M, int K, int n_experts);
 
 int ds4_mmq_q2_K_aligned_moe_vec(
+    const void    * W_aligned,
+    const float   * X_f32,
+    const int32_t * ids,
+    float         * out_f32,
+    int             M,
+    int             K,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    cudaStream_t    stream);
+
+/* Deterministic top-6 down projection for decode/verifier rows. The six
+ * assignment contributions are reduced in slot order directly into out_f32;
+ * no [token,slot,out_dim] intermediate is materialized. */
+int ds4_mmq_q2_K_aligned_moe_down_sum6_vec(
     const void    * W_aligned,
     const float   * X_f32,
     const int32_t * ids,

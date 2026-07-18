@@ -243,12 +243,47 @@ int ds4_gpu_indexer_scores_decode_batch_tensor(
         uint32_t                ratio,
         float                   scale);
 
+#define DS4_GPU_INDEXER_FP4_ROW_BYTES UINT32_C(68)
+
+/* CUDA SM121 compact indexer representation: 64 E2M1 data bytes plus four
+ * UE8M0 block scales for each transformed 128-value row. */
+int ds4_gpu_dsv4_indexer_pack_tensor(
+        ds4_gpu_tensor       *packed,
+        const ds4_gpu_tensor *src,
+        uint32_t                n_rows);
+
+int ds4_gpu_dsv4_indexer_unpack_tensor(
+        ds4_gpu_tensor       *dst,
+        const ds4_gpu_tensor *packed,
+        uint32_t                n_rows);
+
+int ds4_gpu_indexer_scores_packed_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q_packed,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp_packed,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                pos0,
+        uint32_t                n_head,
+        uint32_t                ratio,
+        float                   scale,
+        uint32_t                causal);
+
 int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
         const ds4_gpu_tensor *scores,
         uint32_t                n_comp,
         uint32_t                n_tokens,
         uint32_t                top_k);
+
+int ds4_gpu_indexer_topk_gvr_tensor(
+        ds4_gpu_tensor       *selected,
+        const ds4_gpu_tensor *scores,
+        const ds4_gpu_tensor *previous,
+        ds4_gpu_tensor       *fallback_mask,
+        uint32_t                n_comp,
+        uint32_t                n_tokens);
 
 /* GPU argmax over n_vocab F32 logits. Writes the winning index as int32 at
  * out_idx[0]. Tie-break: lower index wins (matches host sample_argmax). */

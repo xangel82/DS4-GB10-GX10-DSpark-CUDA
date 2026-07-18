@@ -40,6 +40,15 @@ on a single GB10/GX10 machine without changing the target model distribution.
   down projection and a token-bounded stream-K schedule.
 - Added token-tile HMMA attention for exact Top-K indexed and dense raw/mixed
   prefill batches, structurally excluding decode and the DSpark verifier.
+- Added a compact 68-byte MXFP4 indexer cache, native SM121a block-scaled
+  scoring, exact Radix Top-512 and exact GVR with Radix fallback.
+- Added byte-neutral in-place SoA replacement for target routed-MoE weights,
+  with vector and D2R/MMQ consumers covering prefill, decode and verification.
+- Stored FP8-rounded compressed attention KV directly as F16 and consumed it
+  from the stage-32 token-tile path without a persistent F32 duplicate.
+- Added reproducible cold/append GB10 sweeps with DSpark decode, process-memory
+  high-water marks and deterministic token hashes. These new paths remain
+  pending end-to-end performance validation on Athena.
 - Added pipelined direct-I/O model upload and release of copied GGUF source
   pages to reduce startup time and host page residency.
 - Added long-prefix KV reuse so repeated tool turns can prefill only the
@@ -158,7 +167,7 @@ CUDA must already be installed and visible at `/usr/local/cuda`. Verify the
 native GB10 toolchain, run the CUDA regression, then build the server:
 
 ```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && /usr/local/cuda/bin/nvcc --version && make -B cuda-regression CUDA_ARCH=sm_121 && make -B cuda-spark-graph-sm121
+cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && /usr/local/cuda/bin/nvcc --version && make -B cuda-regression CUDA_ARCH=sm_121a && make -B cuda-spark-graph-sm121
 ```
 
 The regression must end with `cuda long-context regression: OK`. It validates

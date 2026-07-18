@@ -399,6 +399,49 @@ __global__ static void repack_q2_k_aligned_kernel(
     }
 }
 
+bool ds4_repack_iq2_aligned_device(
+        void *dst, const void *raw, uint64_t in_dim, uint64_t out_dim,
+        uint32_t group_count, cudaStream_t stream) {
+    if (!dst || !raw || in_dim == 0 || out_dim == 0 || group_count == 0 ||
+        in_dim % 256u != 0) {
+        return false;
+    }
+    const uint64_t nblk = (uint64_t)group_count * out_dim * (in_dim / 256u);
+    const uint64_t dq_bytes = repack_align_up(nblk * 2u, 64u);
+    repack_iq2_xxs_aligned_kernel<<<
+            (unsigned)((nblk * 8u + 255u) / 256u), 256, 0, stream>>>(
+            (__half *)dst,
+            (uint2 *)((char *)dst + dq_bytes),
+            (const unsigned char *)raw,
+            nblk);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+bool ds4_repack_q2k_aligned_device(
+        void *dst, const void *raw, uint64_t in_dim, uint64_t out_dim,
+        uint32_t group_count, cudaStream_t stream) {
+    if (!dst || !raw || in_dim == 0 || out_dim == 0 || group_count == 0 ||
+        in_dim % 256u != 0 || out_dim % 2u != 0) {
+        return false;
+    }
+    const uint64_t nb_row = in_dim / 256u;
+    const uint64_t nblk = (uint64_t)group_count * out_dim * nb_row;
+    const uint64_t npair = nblk / 2u;
+    const uint64_t dm_bytes = repack_align_up(npair * 8u, 64u);
+    const uint64_t sc_bytes = repack_align_up(npair * 32u, 64u);
+    repack_q2_k_aligned_kernel<<<
+            (unsigned)((nblk * 16u + 255u) / 256u), 256, 0, stream>>>(
+            (uint32_t *)dst,
+            (uint32_t *)((char *)dst + dm_bytes),
+            (uint32_t *)((char *)dst + dm_bytes + sc_bytes),
+            (const unsigned char *)raw,
+            0u,
+            nblk,
+            (uint32_t)nb_row,
+            (uint32_t)out_dim);
+    return cudaGetLastError() == cudaSuccess;
+}
+
 /* One thread per (block, 16B half of the 32B code payload); p==0 additionally
  * splits out the block scale.  Source raw block_q8_0 is 34 bytes =
  * [half d][32 x int8 codes]. */
@@ -755,9 +798,9 @@ bool ds4_repack_build_q8_aligned(const ds4_repack_build_args &a,
 /* Aligned-SoA IQ2_XXS routed-expert artifacts.  Byte-neutral: [__half
  * dq[nblk]][pad to 64B][uint2 qs[nblk*8]], block order identical to the raw
  * tensor byte order.  Layout contract shared with
- * ds4_mmq_iq2_xxs_aligned_moe_vec (cuda/mmq/ds4_mmq.h).  These REPLACE the
- * raw residency of their source tensors (the producer stops serving/pinning
- * the raw spans); raw-layout consumers fall back to the host mmap. */
+ * ds4_mmq_iq2_xxs_aligned_moe_vec (cuda/mmq/ds4_mmq.h).  Complete primary
+ * target catalogs replace their raw residency in place; sidecar, streaming,
+ * and distributed mappings keep the established raw-layout path. */
 bool ds4_repack_build_iq2_aligned(const ds4_repack_build_args &a,
                                   std::vector<ds4_repack_artifact> &out,
                                   uint64_t *repacked_bytes_out) {

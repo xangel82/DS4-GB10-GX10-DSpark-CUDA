@@ -172,8 +172,8 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     if (full) {
         if (tool != DS4_HELP_BENCH) {
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
-            opt(fp, c, "--dspark FILE", "Optional DeepSeek V4 Flash DSpark sidecar GGUF.");
         }
+        opt(fp, c, "--dspark FILE", "Optional DeepSeek V4 Flash DSpark sidecar GGUF.");
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_SERVER) {
             opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
             opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
@@ -347,10 +347,13 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Benchmark Sweep");
     opt(fp, c, "--ctx-start N", "First measured frontier. Default: 2048");
     opt(fp, c, "--ctx-max N", "Last measured frontier. Default: 32768");
+    opt(fp, c, "--frontiers LIST", "Strictly increasing comma-separated frontiers; overrides start/max stepping.");
+    opt(fp, c, "--cold-sweep", "Create a fresh session for every frontier instead of append-prefilling.");
     opt(fp, c, "--ctx-alloc N", "Allocated context. Default: ctx-max + gen-tokens + 1");
     opt(fp, c, "--step-mul F", "Multiplicative step. Default: 1");
     opt(fp, c, "--step-incr N", "Linear step when --step-mul is 1. Default: 2048");
     opt(fp, c, "--gen-tokens N", "Greedy decode tokens per frontier. 0 for pure prefill. Default: 128");
+    opt(fp, c, "--dspark-draft N", "Maximum DSpark depth, 1..5. Default: model/runtime default.");
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write one full-logit JSON file per frontier.");
     fputc('\n', fp);

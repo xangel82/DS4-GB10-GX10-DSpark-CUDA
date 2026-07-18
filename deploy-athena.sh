@@ -29,6 +29,8 @@ fi
 rsync -az --progress \
   -e "ssh -i $SSH_KEY -o ConnectTimeout=8" \
   --exclude='.git' \
+  --exclude='__pycache__' \
+  --exclude='*.pyc' \
   --exclude='*.o' \
   --exclude='ds4' \
   --exclude='ds4-server' \
@@ -40,12 +42,13 @@ rsync -az --progress \
   --exclude='tests/test_q4k_dot' \
   --exclude='tests/cuda_long_context_smoke' \
   --exclude='gguf-tools/deepseek4-quantize' \
+  --exclude='benchmark-results' \
   "$ROOT/" \
   "$ATHENA_USER@$ATHENA_HOST:$ATHENA_DEST"
 
 echo
 echo "Deploy complete: $ATHENA_USER@$ATHENA_HOST:$ATHENA_DEST"
 echo "Next on Athena:"
-echo "  cd $ATHENA_DEST && make -B cuda-regression CUDA_ARCH=sm_121"
+echo "  cd $ATHENA_DEST && make -B cuda-regression CUDA_ARCH=sm_121a"
 echo "  cd $ATHENA_DEST && make -B cuda-spark-graph-sm121"
 echo "  cd $ATHENA_DEST && ./run-dspark-server.sh 2>&1 | tee /tmp/ds4-dspark-server.log"

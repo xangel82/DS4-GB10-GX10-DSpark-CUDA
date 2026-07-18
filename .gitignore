@@ -16,5 +16,6 @@
 __pycache__/
 *.pyc
 /misc/
+/benchmark-results/
 .*.swp
 .DS_Store

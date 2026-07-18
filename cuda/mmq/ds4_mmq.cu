@@ -4,13 +4,9 @@
 // Implements the public ds4_mmq_* entry points and explicitly instantiates
 // the mul_mat_q_case<T> template for each quant type the caller needs.
 //
-// Status:
-//   Q8_0 dense ............ implemented, parity-tested against CPU reference
-//   Q2_K dense ............ pending (Phase 3)
-//   IQ2_XXS dense ......... pending (Phase 3)
-//   Q8_0 MoE _id .......... pending (Phase 4)
-//   Q2_K MoE _id .......... pending (Phase 4)
-//   IQ2_XXS MoE _id ....... pending (Phase 4)
+// The module contains dense and routed kernels for Q8_0, Q2_K, Q4_K, and
+// IQ2_XXS, plus the GB10 aligned-SoA D2R and fused MoE epilogues. Numerical
+// parity and long-context coverage live in tests/cuda_long_context_smoke.c.
 
 #include "ds4_mmq.h"
 
@@ -348,9 +344,8 @@ extern "C" int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts) {
 // from plain pointers + shape ints instead of ggml_tensor introspection.
 // ----------------------------------------------------------------------------
 
-// Per-device singleton context. Owns the pool for stream-K fixup scratch.
-// Phase 4 will make this per-stream as well; for now a single context per
-// device is sufficient for the dense path.
+// Per-device singleton context. Owns the pool for stream-K fixup scratch used
+// by the dense and routed entry points.
 namespace {
 
 __global__ static void ds4_mmq_sanitize_f32_kernel(float *p, uint64_t n) {
@@ -837,6 +832,8 @@ int ds4_mmq_moe_impl(
 
 struct ds4_mmq_fused_down {
     const void  * W;
+    const char  * W_soa;
+    int64_t       soa_blocks;
     const float * router_weights;
     float       * mid_f32;
     float       * out;
@@ -1042,6 +1039,7 @@ int ds4_mmq_moe_pair_impl(
         cudaMemsetAsync(out_b, 0, (size_t)M * (size_t)ne_get_rows * sizeof(float), stream);
     }
 
+    bool gate_up_done = false;
     if (type == GGML_TYPE_IQ2_XXS && xa_soa != nullptr && xb_soa != nullptr &&
         d2r_enabled() && d2r_iq2_enabled() && K % 256 == 0 &&
         ne_get_rows >= d2r_min_cols()) {
@@ -1065,12 +1063,13 @@ int ds4_mmq_moe_pair_impl(
                         expert_bounds.get(), out_a, out_b, M, K, ne_get_rows, n_experts,
                         d2r_work.get(), d2r_work_bytes, stream);
                 if (d2r_rc == 0) {
-                    return 0;
+                    gate_up_done = true;
                 }
             }
         }
     }
 
+    if (!gate_up_done) {
     mmq_args args = {
         /*x=*/(const char *)W_a,
         /*type_x=*/type,
@@ -1128,6 +1127,7 @@ int ds4_mmq_moe_pair_impl(
             fprintf(stderr, "%s: mul_mat_q_case (pair b) launch failed: %s\n", tag, cudaGetErrorString(err));
             return -5;
         }
+    }
     }
     }
 
@@ -1206,10 +1206,39 @@ int ds4_mmq_moe_pair_impl(
             /*stride_sample_dst=*/0,
             /*use_stream_k=*/use_stream_k,
             /*ncols_max=*/routed_ncols_max,
-            /*x_soa=*/nullptr,
-            /*soa_blocks=*/0,
+            /*x_soa=*/fused_down->W_soa,
+            /*soa_blocks=*/fused_down->soa_blocks,
         };
-        {
+        bool down_done = false;
+        if (fused_down->W_soa != nullptr && d2r_enabled() &&
+            ne_get_rows >= d2r_min_cols() &&
+            ds4_mmq_q2_K_moe_d2r_available(cc)) {
+            const size_t work_bytes =
+                ds4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
+            if (work_bytes != 0u) {
+                ggml_cuda_pool_alloc<char> work(ctx->pool(), work_bytes);
+                ds4_mmq_nvtx_scope stage(
+                        "ds4/prefill/moe/q2_down_d2r",
+                        ds4_mmq_nvtx_payload((uint32_t)ne_get_rows,
+                                             (uint32_t)fused_down->out_dim),
+                        nvtx_prefill);
+                down_done = ds4_mmq_q2_K_moe_d2r_launch(
+                        fused_down->W_soa,
+                        fused_down->soa_blocks,
+                        down_q8_1.get(),
+                        ids_dst.get(),
+                        expert_bounds.get(),
+                        fused_down->out,
+                        fused_down->out_dim,
+                        M,
+                        ne_get_rows,
+                        n_experts,
+                        work.get(),
+                        work_bytes,
+                        stream) == 0;
+            }
+        }
+        if (!down_done) {
             ds4_mmq_nvtx_scope stage(
                     "ds4/prefill/moe/q2_down",
                     ds4_mmq_nvtx_payload((uint32_t)ne_get_rows,
@@ -1329,6 +1358,8 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused(
         float clamp, cudaStream_t stream) {
     const ds4_mmq_fused_down fused_down = {
         W_down,
+        nullptr,
+        0,
         router_weights,
         mid_f32,
         down,
@@ -1340,6 +1371,41 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused(
         W_gate, W_up, X, ids, gate, up,
         expert_mid_dim, expert_in_dim, n_tokens, n_experts, n_expert_used,
         stream, /*xa_soa=*/NULL, /*xb_soa=*/NULL, /*soa_blocks=*/0,
+        /*sanitize_out=*/false, &fused_down);
+}
+
+extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
+        const void * W_gate, const void * W_up, const void * W_down,
+        const float * X, const int32_t * ids, const float * router_weights,
+        float * gate, float * up, float * mid_f32, float * down,
+        int expert_mid_dim, int expert_in_dim, int out_dim,
+        int n_tokens, int n_experts, int n_expert_used,
+        float clamp, cudaStream_t stream) {
+    if (expert_mid_dim <= 0 || expert_in_dim <= 0 || out_dim <= 0 ||
+        n_experts <= 0 || expert_in_dim % 256 != 0 ||
+        expert_mid_dim % 256 != 0 || out_dim % 2 != 0) {
+        return -1;
+    }
+    const int64_t iq2_blocks =
+        (int64_t)n_experts * expert_mid_dim * (expert_in_dim / 256);
+    const int64_t q2_pairs =
+        (int64_t)n_experts * (out_dim / 2) * (expert_mid_dim / 256);
+    const ds4_mmq_fused_down fused_down = {
+        W_down,
+        (const char *)W_down,
+        q2_pairs,
+        router_weights,
+        mid_f32,
+        down,
+        out_dim,
+        clamp,
+    };
+    return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
+        "ds4_mmq_iq2_xxs_q2_K_moe_fused_soa",
+        W_gate, W_up, X, ids, gate, up,
+        expert_mid_dim, expert_in_dim, n_tokens, n_experts, n_expert_used,
+        stream,
+        (const char *)W_gate, (const char *)W_up, iq2_blocks,
         /*sanitize_out=*/false, &fused_down);
 }
 
@@ -1595,6 +1661,7 @@ __global__ void iq2_xxs_aligned_moe_vec_kernel(
         int                M,
         int                nb,         // IQ2_XXS blocks per row = K/256
         int                nyb,        // Q8_1 blocks per activation row
+        int                n_experts,
         int                n_expert_used)
 {
     const int row  = blockIdx.x;
@@ -1604,7 +1671,7 @@ __global__ void iq2_xxs_aligned_moe_vec_kernel(
     // mul_mat_vec_q_moe): clamp the pointer math to expert 0, skip the dot
     // loop, write a clean 0.
     const int32_t id_raw = ids[slot];
-    const bool invalid_id = id_raw < 0;
+    const bool invalid_id = id_raw < 0 || id_raw >= n_experts;
     const long long rbase = ((long long)(invalid_id ? 0 : id_raw) * M + row) * nb;
     x8 += (long long)(slot / n_expert_used) * nyb;
 
@@ -1659,6 +1726,7 @@ __global__ void iq2_xxs_aligned_moe_pair_vec_kernel(
         int                M,
         int                nb,
         int                nyb,
+        int                n_experts,
         int                n_expert_used)
 {
     const int row  = blockIdx.x;
@@ -1668,7 +1736,7 @@ __global__ void iq2_xxs_aligned_moe_pair_vec_kernel(
     const __half *dq = blockIdx.z ? dq_up : dq_gate;
     float        *out = blockIdx.z ? out_up : out_gate;
     const int32_t id_raw = ids[slot];
-    const bool invalid_id = id_raw < 0;
+    const bool invalid_id = id_raw < 0 || id_raw >= n_experts;
     const long long rbase = ((long long)(invalid_id ? 0 : id_raw) * M + row) * nb;
     x8 += (long long)(slot / n_expert_used) * nyb;
 
@@ -1727,6 +1795,7 @@ __global__ void iq2_xxs_aligned_moe_gate_up_mid_kernel(
         int                M,
         int                nb,
         int                nyb,
+        int                n_experts,
         int                n_expert_used,
         float              clamp)
 {
@@ -1734,7 +1803,7 @@ __global__ void iq2_xxs_aligned_moe_gate_up_mid_kernel(
     const int slot = blockIdx.y;       // flat assignment = token*n_expert_used+slot
     const int lane = threadIdx.x;
     const int32_t id_raw = ids[slot];
-    const bool invalid_id = id_raw < 0;
+    const bool invalid_id = id_raw < 0 || id_raw >= n_experts;
     const long long rbase = ((long long)(invalid_id ? 0 : id_raw) * M + row) * nb;
     x8 += (long long)(slot / n_expert_used) * nyb;
 
@@ -3008,7 +3077,7 @@ __global__ static void q2_k_aligned_moe_vec_kernel(
         float * __restrict__ dst,
         const uint32_t ncols_x, const uint32_t nrows_x,
         const uint32_t stride_col_y, const uint32_t stride_col_dst,
-        const uint32_t ncols_dst) {
+        const uint32_t ncols_dst, const uint32_t n_experts) {
     constexpr int qi  = 16;   // QI2_K
     constexpr int vdr = 1;    // VDR_Q2_K_Q8_1_MMVQ
     constexpr int warp_size = 32;
@@ -3023,7 +3092,7 @@ __global__ static void q2_k_aligned_moe_vec_kernel(
     }
 
     const int32_t  id_raw     = ids[token_idx];
-    const bool     invalid_id = id_raw < 0;
+    const bool     invalid_id = id_raw < 0 || (uint32_t)id_raw >= n_experts;
     const uint32_t channel_x  = invalid_id ? 0u : (uint32_t)id_raw;
 
     const block_q8_1 * y = vy + token_idx*stride_col_y;
@@ -3068,6 +3137,91 @@ __global__ static void q2_k_aligned_moe_vec_kernel(
 
     if (threadIdx.x < 2 && uint32_t(row0 + threadIdx.x) < nrows_x) {
         dst[token_idx*stride_col_dst + row0 + threadIdx.x] = tmp[threadIdx.x];
+    }
+}
+
+__launch_bounds__(6*32, 1)
+__global__ static void q2_k_aligned_moe_down_sum6_kernel(
+        const uint2 * __restrict__ dm2_soa,
+        const int4  * __restrict__ sc4_soa,
+        const uint2 * __restrict__ qs2_soa,
+        const block_q8_1 * __restrict__ vy,
+        const int32_t * __restrict__ ids,
+        float * __restrict__ dst,
+        uint32_t ncols_x,
+        uint32_t nrows_x,
+        uint32_t stride_col_y,
+        uint32_t n_tokens,
+        uint32_t n_experts) {
+    constexpr int top_k = 6;
+    constexpr int qi = 16;
+    constexpr int vdr = 1;
+    constexpr int warp_size = 32;
+    const uint32_t slot = threadIdx.y;
+    const uint32_t token = blockIdx.y;
+    const int row0 = 2 * (int)blockIdx.x;
+    if (slot >= top_k || token >= n_tokens) return;
+
+    const uint32_t assignment = token * top_k + slot;
+    const int32_t id_raw = ids[assignment];
+    const bool invalid_id = id_raw < 0 || (uint32_t)id_raw >= n_experts;
+    const uint32_t expert = invalid_id ? 0u : (uint32_t)id_raw;
+    const int blocks_per_row_x = (int)(ncols_x / QK_K);
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+    const block_q8_1 *y = vy + (uint64_t)assignment * stride_col_y;
+    const size_t pair_base =
+        ((size_t)expert * (nrows_x / 2u) + (size_t)blockIdx.x) *
+        (size_t)blocks_per_row_x;
+    float tmp[2] = {0.0f, 0.0f};
+
+    for (int kbx = threadIdx.x / (qi / vdr);
+         !invalid_id && kbx < blocks_per_row_x;
+         kbx += blocks_per_iter) {
+        const int kby = kbx * (QK_K / QK8_1);
+        const int iqs = vdr * (threadIdx.x % (qi / vdr));
+        const int bq8_offset = QR2_K * (iqs / QI8_1);
+        const int scale_offset =
+            iqs - iqs % QI8_1 + (iqs % QI8_1) / (QI8_1 / 2);
+        const int whalf = iqs / QI8_1;
+        const int lo = scale_offset - 8 * whalf;
+        const block_q8_1 *bq8_1 = &y[kby];
+        int u[QR2_K];
+        float d8[QR2_K];
+#pragma unroll
+        for (int i = 0; i < QR2_K; ++i) {
+            u[i] = get_int_b4(bq8_1[bq8_offset + i].qs, iqs % QI8_1);
+            d8[i] = __low2float(bq8_1[bq8_offset + i].ds);
+        }
+        const size_t pblk = pair_base + (size_t)kbx;
+        const uint2 v2 = qs2_soa[pblk * 16u + (unsigned)iqs];
+        const uint2 dmw = dm2_soa[pblk];
+        const int4 scw = sc4_soa[pblk * 2u + (unsigned)whalf];
+        const half2 dm0 = *(const half2 *)&dmw.x;
+        const half2 dm1 = *(const half2 *)&dmw.y;
+        tmp[0] += q2_k_vec_dot_windowed(
+            (int)v2.x, u, (uint32_t)scw.x, (uint32_t)scw.y, lo, dm0, d8);
+        tmp[1] += q2_k_vec_dot_windowed(
+            (int)v2.y, u, (uint32_t)scw.z, (uint32_t)scw.w, lo, dm1, d8);
+    }
+#pragma unroll
+    for (int i = 0; i < 2; ++i) tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+
+    __shared__ float partial[top_k][2];
+    if (threadIdx.x < 2u) {
+        const uint32_t row = (uint32_t)row0 + threadIdx.x;
+        float value = row < nrows_x ? tmp[threadIdx.x] : 0.0f;
+        if (!isfinite(value)) value = 0.0f;
+        partial[slot][threadIdx.x] = value;
+    }
+    __syncthreads();
+    if (slot == 0u && threadIdx.x < 2u) {
+        const uint32_t row = (uint32_t)row0 + threadIdx.x;
+        if (row < nrows_x) {
+            float sum = 0.0f;
+#pragma unroll
+            for (uint32_t s = 0; s < top_k; s++) sum += partial[s][threadIdx.x];
+            dst[(uint64_t)token * nrows_x + row] = sum;
+        }
     }
 }
 
@@ -3189,7 +3343,7 @@ extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
             out_f32 + (int64_t)c0 * s2_dst,
             (uint32_t)K, (uint32_t)M,
             (uint32_t)s12_y, (uint32_t)s2_dst,
-            (uint32_t)ncols);
+            (uint32_t)ncols, (uint32_t)n_experts);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
             fprintf(stderr, "%s: kernel launch failed: %s (cols %d..%d)\n",
@@ -3199,6 +3353,74 @@ extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
     }
 
     ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)n_tokens, stream);
+    return 0;
+}
+
+extern "C" int ds4_mmq_q2_K_aligned_moe_down_sum6_vec(
+        const void *W_aligned, const float *X_f32, const int32_t *ids,
+        float *out_f32, int M, int K, int n_tokens, int n_experts,
+        int n_expert_used, cudaStream_t stream) {
+    const char *tag = "ds4_mmq_q2_K_aligned_moe_down_sum6_vec";
+    if (!W_aligned || !X_f32 || !ids || !out_f32 ||
+        M <= 0 || (M & 1) != 0 || K <= 0 || K % 256 != 0 ||
+        n_tokens < 1 || n_tokens > 16 || n_experts <= 0 ||
+        n_expert_used != 6) {
+        return -1;
+    }
+    const int dev = ggml_cuda_get_device();
+    ggml_backend_cuda_context *ctx = get_ctx_for_device(dev);
+    if (!ctx) {
+        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        return -1;
+    }
+    ds4_pool_set_stream(stream);
+    const int n_assignments = n_tokens * n_expert_used;
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const size_t nbytes_q8_1 = (size_t)n_assignments * ne10_padded *
+                               sizeof(block_q8_1) / QK8_1;
+    ggml_cuda_pool_alloc<char> q8_pool;
+    char *q8 = nullptr;
+    if (g_q81_scratch_enabled && g_q81_scratch_ptr &&
+        g_q81_scratch_bytes >= nbytes_q8_1) {
+        q8 = (char *)g_q81_scratch_ptr;
+    } else {
+        q8_pool.alloc(ctx->pool(), nbytes_q8_1);
+        q8 = q8_pool.get();
+    }
+    quantize_row_q8_1_cuda(
+        X_f32, nullptr, q8, GGML_TYPE_Q2_K, K,
+        (int64_t)K, (int64_t)K, (int64_t)K * n_assignments,
+        ne10_padded, 1, n_assignments, 1, stream);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: activation quantize failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -2;
+    }
+
+    const uint64_t npair =
+        (uint64_t)n_experts * (uint64_t)(M / 2) * (uint64_t)(K / 256);
+    const uint64_t dm_bytes = (npair * 8u + 63u) & ~63ull;
+    const uint64_t sc_bytes = (npair * 32u + 63u) & ~63ull;
+    q2_k_aligned_moe_down_sum6_kernel<<<
+            dim3((unsigned)(M / 2), (unsigned)n_tokens), dim3(32, 6), 0, stream>>>(
+            (const uint2 *)W_aligned,
+            (const int4 *)((const char *)W_aligned + dm_bytes),
+            (const uint2 *)((const char *)W_aligned + dm_bytes + sc_bytes),
+            (const block_q8_1 *)q8,
+            ids,
+            out_f32,
+            (uint32_t)K,
+            (uint32_t)M,
+            (uint32_t)(ne10_padded / QK8_1),
+            (uint32_t)n_tokens,
+            (uint32_t)n_experts);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: kernel launch failed: %s\n",
+                tag, cudaGetErrorString(err));
+        return -3;
+    }
     return 0;
 }
 
@@ -3342,7 +3564,8 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_pair_vec(
         (const __half *)W_gate_aligned,
         (const uint2 *)((const char *)W_up_aligned + dq_bytes),
         (const __half *)W_up_aligned,
-        (const block_q8_1 *)x8, ids, M, K / 256, K / 32, n_expert_used);
+        (const block_q8_1 *)x8, ids, M, K / 256, K / 32,
+        n_experts, n_expert_used);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
@@ -3379,7 +3602,8 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
         (const __half *)W_gate_aligned,
         (const uint2 *)((const char *)W_up_aligned + dq_bytes),
         (const __half *)W_up_aligned,
-        (const block_q8_1 *)x8, ids, weights, M, K / 256, K / 32, n_expert_used, clamp);
+        (const block_q8_1 *)x8, ids, weights, M, K / 256, K / 32,
+        n_experts, n_expert_used, clamp);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
@@ -3446,7 +3670,7 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_vec(
     dim3 grid((unsigned)M, (unsigned)(n_tokens * n_expert_used), 1);
     iq2_xxs_aligned_moe_vec_kernel<<<grid, 32, 0, stream>>>(
         out_f32, qs, dq, (const block_q8_1 *)src1_q8_1_ptr, ids, M, K / 256,
-        K / 32, n_expert_used);
+        K / 32, n_experts, n_expert_used);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));

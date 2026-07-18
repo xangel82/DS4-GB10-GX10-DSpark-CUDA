@@ -4636,8 +4636,12 @@ static bool dist_kv_layer_tensor_bytes(
             !dist_u64_add(&bytes, attn_state))
             return false;
         if (ratio == 4u) {
-            if (!dist_u64_mul(n_index_comp, layout->indexer_head_dim, &tmp) ||
-                !dist_u64_mul(tmp, sizeof(float), &tmp) ||
+            const bool indexer_packed =
+                (layout->prefill_cap & DS4_SESSION_INDEXER_PACKED_FLAG) != 0u;
+            const uint64_t indexer_row_bytes = indexer_packed
+                ? DS4_SESSION_INDEXER_PACKED_ROW_BYTES
+                : (uint64_t)layout->indexer_head_dim * sizeof(float);
+            if (!dist_u64_mul(n_index_comp, indexer_row_bytes, &tmp) ||
                 !dist_u64_add(&bytes, tmp))
                 return false;
             const uint64_t index_state =
@@ -4698,8 +4702,15 @@ static int dist_kv_parse_layer_payload(
             return 1;
     }
     if (h[0] != DS4_SESSION_LAYER_PAYLOAD_MAGIC ||
-        h[1] != DS4_SESSION_LAYER_PAYLOAD_VERSION) {
+        (h[1] != DS4_SESSION_LAYER_PAYLOAD_VERSION &&
+         h[1] != DS4_SESSION_LAYER_PAYLOAD_VERSION_F32_INDEXER)) {
         if (errlen) snprintf(err, errlen, "unsupported distributed KV layer payload");
+        return 1;
+    }
+    if (h[1] == DS4_SESSION_LAYER_PAYLOAD_VERSION_F32_INDEXER &&
+        (h[3] & DS4_SESSION_INDEXER_PACKED_FLAG) != 0u) {
+        if (errlen) snprintf(err, errlen,
+                            "legacy distributed KV layer payload has invalid packed metadata");
         return 1;
     }
     ds4_dist_kv_layout got = {
@@ -5230,8 +5241,15 @@ int ds4_dist_session_load_payload(
             return 1;
     }
     if (h[0] != DS4_SESSION_PAYLOAD_MAGIC ||
-        h[1] != DS4_SESSION_PAYLOAD_VERSION) {
+        (h[1] != DS4_SESSION_PAYLOAD_VERSION &&
+         h[1] != DS4_SESSION_PAYLOAD_VERSION_F32_INDEXER)) {
         if (errlen) snprintf(err, errlen, "unsupported DS4 KV payload version");
+        return 1;
+    }
+    if (h[1] == DS4_SESSION_PAYLOAD_VERSION_F32_INDEXER &&
+        (h[3] & DS4_SESSION_INDEXER_PACKED_FLAG) != 0u) {
+        if (errlen) snprintf(err, errlen,
+                            "legacy DS4 KV payload has invalid packed metadata");
         return 1;
     }
     ds4_dist_kv_layout layout = {

@@ -24,6 +24,7 @@
 
 typedef struct {
     const char *model_path;
+    const char *dspark_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -36,6 +37,7 @@ typedef struct {
     int ctx_alloc;
     int step_incr;
     int gen_tokens;
+    int dspark_draft_tokens;
     int power_percent;
     uint32_t prefill_chunk;
     uint32_t ssd_streaming_cache_experts;
@@ -43,13 +45,21 @@ typedef struct {
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
     double step_mul;
+    int *frontiers;
+    size_t n_frontiers;
     const char *dump_frontier_logits_dir;
     ds4_dist_options dist;
     bool warm_weights;
     bool quality;
+    bool cold_sweep;
     bool ssd_streaming;
     bool ssd_streaming_cold;
 } bench_config;
+
+typedef struct {
+    uint64_t rss_bytes;
+    uint64_t hwm_bytes;
+} bench_process_memory;
 
 static double bench_now_sec(void) {
     struct timespec ts;
@@ -89,6 +99,75 @@ static double parse_double_arg(const char *s, const char *opt) {
         exit(2);
     }
     return v;
+}
+
+static void parse_frontiers(bench_config *c, const char *s, const char *opt) {
+    if (!c || !s || !s[0]) {
+        fprintf(stderr, "ds4-bench: %s requires a non-empty comma-separated list\n", opt);
+        exit(2);
+    }
+    size_t count = 1;
+    for (const char *p = s; *p; p++) if (*p == ',') count++;
+    int *values = calloc(count, sizeof(values[0]));
+    char *copy = malloc(strlen(s) + 1u);
+    if (!values || !copy) {
+        fprintf(stderr, "ds4-bench: out of memory parsing %s\n", opt);
+        free(values);
+        free(copy);
+        exit(1);
+    }
+    strcpy(copy, s);
+    size_t n = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(copy, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        const int v = parse_int(tok, opt);
+        if (n != 0 && v <= values[n - 1]) {
+            fprintf(stderr, "ds4-bench: %s values must be strictly increasing\n", opt);
+            free(values);
+            free(copy);
+            exit(2);
+        }
+        values[n++] = v;
+    }
+    free(copy);
+    if (n != count) {
+        fprintf(stderr, "ds4-bench: malformed value for %s: %s\n", opt, s);
+        free(values);
+        exit(2);
+    }
+    free(c->frontiers);
+    c->frontiers = values;
+    c->n_frontiers = n;
+    c->ctx_start = values[0];
+    c->ctx_max = values[n - 1];
+}
+
+static bench_process_memory bench_process_memory_read(void) {
+    bench_process_memory out = {0};
+#if defined(__linux__)
+    FILE *fp = fopen("/proc/self/status", "rb");
+    if (!fp) return out;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned long long kib = 0;
+        if (sscanf(line, "VmRSS: %llu kB", &kib) == 1) {
+            out.rss_bytes = (uint64_t)kib * 1024u;
+        } else if (sscanf(line, "VmHWM: %llu kB", &kib) == 1) {
+            out.hwm_bytes = (uint64_t)kib * 1024u;
+        }
+    }
+    fclose(fp);
+#endif
+    return out;
+}
+
+static uint64_t bench_token_hash_update(uint64_t hash, int token) {
+    const uint32_t value = (uint32_t)token;
+    for (uint32_t shift = 0; shift < 32u; shift += 8u) {
+        hash ^= (value >> shift) & 0xffu;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
 }
 
 static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
@@ -204,6 +283,14 @@ static bench_config parse_options(int argc, char **argv) {
 
         if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark")) {
+            c.dspark_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dspark-draft")) {
+            c.dspark_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (c.dspark_draft_tokens > 5) {
+                fprintf(stderr, "ds4-bench: --dspark-draft must be in 1..5\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -214,6 +301,10 @@ static bench_config parse_options(int argc, char **argv) {
             c.ctx_start = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--ctx-max")) {
             c.ctx_max = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--frontiers")) {
+            parse_frontiers(&c, need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--cold-sweep")) {
+            c.cold_sweep = true;
         } else if (!strcmp(arg, "--ctx-alloc")) {
             c.ctx_alloc = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--step-incr")) {
@@ -323,6 +414,10 @@ static bench_config parse_options(int argc, char **argv) {
     }
     if (c.dist.role == DS4_DISTRIBUTED_WORKER) {
         fprintf(stderr, "ds4-bench: --role worker is a serving mode; start workers with ./ds4\n");
+        exit(2);
+    }
+    if (c.dspark_path && c.backend != DS4_BACKEND_CUDA) {
+        fprintf(stderr, "ds4-bench: --dspark currently requires the CUDA backend\n");
         exit(2);
     }
     return c;
@@ -510,9 +605,11 @@ int main(int argc, char **argv) {
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .dspark_path = cfg.dspark_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .prefill_chunk = cfg.prefill_chunk,
+        .dspark_draft_tokens = cfg.dspark_draft_tokens,
         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,
         .ssd_streaming_preload_experts = cfg.ssd_streaming_preload_experts,
@@ -531,7 +628,13 @@ int main(int argc, char **argv) {
         return 2;
     }
     ds4_engine *engine = NULL;
-    if (ds4_engine_open(&engine, &opt) != 0) return 1;
+    const double startup_t0 = bench_now_sec();
+    if (ds4_engine_open(&engine, &opt) != 0) {
+        free(cfg.frontiers);
+        return 1;
+    }
+    const double startup_sec = bench_now_sec() - startup_t0;
+    const bench_process_memory startup_memory = bench_process_memory_read();
     log_context_memory(cfg.backend, cfg.ctx_alloc, cfg.prefill_chunk);
 
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
@@ -569,6 +672,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     maybe_warn_distributed_step_shape(&cfg, session);
+    const bench_process_memory ready_memory = bench_process_memory_read();
 
     FILE *out = stdout;
     if (cfg.csv_path) {
@@ -581,7 +685,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes\n");
+    fprintf(out, "mode,ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes,decode_cycles,tokens_per_cycle,greedy_token_hash,startup_sec,startup_rss_bytes,startup_hwm_bytes,ready_rss_bytes,ready_hwm_bytes,prefill_rss_bytes,prefill_hwm_bytes,decode_rss_bytes,decode_hwm_bytes\n");
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
@@ -591,7 +695,17 @@ int main(int argc, char **argv) {
     int previous = 0;
     int rc = 0;
 
-    for (int frontier = cfg.ctx_start; ; frontier = next_frontier(&cfg, frontier)) {
+    size_t frontier_i = 0;
+    for (int frontier = cfg.n_frontiers ? cfg.frontiers[0] : cfg.ctx_start; ; ) {
+        if (cfg.cold_sweep && frontier_i != 0) {
+            ds4_session_free(session);
+            session = NULL;
+            if (ds4_session_create(&session, engine, cfg.ctx_alloc) != 0) {
+                fprintf(stderr, "ds4-bench: failed to create cold-sweep session at %d\n", frontier);
+                rc = 1;
+                break;
+            }
+        }
         ds4_tokens prefix = {
             .v = prompt.v,
             .len = frontier,
@@ -606,14 +720,15 @@ int main(int argc, char **argv) {
         }
         const double prefill_t1 = bench_now_sec();
         const double prefill_sec = prefill_t1 - prefill_t0;
-        const int prefill_tokens = frontier - previous;
+        const int prefill_tokens = cfg.cold_sweep ? frontier : frontier - previous;
+        const bench_process_memory prefill_memory = bench_process_memory_read();
 
         if (write_frontier_logits_json(&cfg, engine, session, frontier, previous) != 0) {
             rc = 1;
             break;
         }
 
-        if (cfg.gen_tokens > 0 && !distributed) {
+        if (cfg.gen_tokens > 0 && !distributed && !cfg.cold_sweep) {
             if (ds4_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: snapshot at %d failed: %s\n", frontier, err);
                 rc = 1;
@@ -622,7 +737,10 @@ int main(int argc, char **argv) {
         }
 
         const double gen_t0 = bench_now_sec();
-        for (int i = 0; i < cfg.gen_tokens; i++) {
+        int gen_done = 0;
+        int decode_cycles = 0;
+        uint64_t greedy_token_hash = UINT64_C(1469598103934665603);
+        while (gen_done < cfg.gen_tokens) {
             if (ds4_session_pos(session) + 1 >= ds4_session_ctx(session)) {
                 fprintf(stderr, "ds4-bench: generation would exceed allocated context at frontier %d\n", frontier);
                 rc = 1;
@@ -634,17 +752,49 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
-            if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
-                fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
-                rc = 1;
-                break;
+            if (ds4_engine_has_dspark(engine) &&
+                ds4_engine_dspark_draft_tokens(engine) > 0) {
+                int accepted[17];
+                int remaining = cfg.gen_tokens - gen_done;
+                int n = ds4_session_eval_speculative_argmax(session,
+                                                             token,
+                                                             remaining,
+                                                             -1,
+                                                             accepted,
+                                                             (int)(sizeof(accepted) / sizeof(accepted[0])),
+                                                             err,
+                                                             sizeof(err));
+                if (n <= 0) {
+                    fprintf(stderr, "ds4-bench: DSpark decode at frontier %d failed: %s\n",
+                            frontier, n < 0 ? err : "no tokens accepted");
+                    rc = 1;
+                    break;
+                }
+                if (n > remaining) n = remaining;
+                for (int i = 0; i < n; i++) {
+                    greedy_token_hash = bench_token_hash_update(
+                        greedy_token_hash, accepted[i]);
+                }
+                gen_done += n;
+            } else {
+                if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
+                    fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                greedy_token_hash = bench_token_hash_update(greedy_token_hash, token);
+                gen_done++;
             }
+            decode_cycles++;
         }
         const double gen_t1 = bench_now_sec();
+        const bench_process_memory decode_memory = bench_process_memory_read();
         if (rc != 0) break;
 
         if (cfg.gen_tokens == 0) {
             /* Pure prefill benchmark: leave the live session at the frontier. */
+        } else if (cfg.cold_sweep) {
+            /* The next frontier starts from a new session. */
         } else if (distributed) {
             if (ds4_session_sync(session, &prefix, err, sizeof(err)) != 0) {
                 fprintf(stderr, "ds4-bench: distributed replay restore at %d failed: %s\n", frontier, err);
@@ -661,17 +811,37 @@ int main(int argc, char **argv) {
 
         const double gen_sec = gen_t1 - gen_t0;
         fprintf(out,
-                "%d,%d,%.2f,%d,%.2f,%llu\n",
+                "%s,%d,%d,%.2f,%d,%.2f,%llu,%d,%.4f,%016llx,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                cfg.cold_sweep ? "cold" : "append",
                 frontier,
                 prefill_tokens,
                 prefill_sec > 0.0 ? (double)prefill_tokens / prefill_sec : 0.0,
-                cfg.gen_tokens,
-                gen_sec > 0.0 ? (double)cfg.gen_tokens / gen_sec : 0.0,
-                (unsigned long long)(distributed ? 0 : snap.len));
+                gen_done,
+                gen_sec > 0.0 ? (double)gen_done / gen_sec : 0.0,
+                (unsigned long long)(distributed || cfg.cold_sweep ? 0 : snap.len),
+                decode_cycles,
+                decode_cycles > 0 ? (double)gen_done / (double)decode_cycles : 0.0,
+                (unsigned long long)greedy_token_hash,
+                startup_sec,
+                (unsigned long long)startup_memory.rss_bytes,
+                (unsigned long long)startup_memory.hwm_bytes,
+                (unsigned long long)ready_memory.rss_bytes,
+                (unsigned long long)ready_memory.hwm_bytes,
+                (unsigned long long)prefill_memory.rss_bytes,
+                (unsigned long long)prefill_memory.hwm_bytes,
+                (unsigned long long)decode_memory.rss_bytes,
+                (unsigned long long)decode_memory.hwm_bytes);
         fflush(out);
 
-        previous = frontier;
-        if (frontier >= cfg.ctx_max) break;
+        previous = cfg.cold_sweep ? 0 : frontier;
+        if (cfg.n_frontiers) {
+            frontier_i++;
+            if (frontier_i >= cfg.n_frontiers) break;
+            frontier = cfg.frontiers[frontier_i];
+        } else {
+            if (frontier >= cfg.ctx_max) break;
+            frontier = next_frontier(&cfg, frontier);
+        }
     }
 
     if (out != stdout) fclose(out);
@@ -679,5 +849,6 @@ int main(int argc, char **argv) {
     ds4_session_free(session);
     ds4_tokens_free(&prompt);
     ds4_engine_close(engine);
+    free(cfg.frontiers);
     return rc;
 }

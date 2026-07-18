@@ -10,6 +10,7 @@
 #define DS4_REPACK_H
 
 #include <cstdint>
+#include <cuda_runtime_api.h>
 #include <string>
 #include <vector>
 
@@ -115,5 +116,14 @@ bool ds4_repack_build_iq2_aligned(const ds4_repack_build_args &a,
 bool ds4_repack_build_q2k_aligned(const ds4_repack_build_args &a,
                                   std::vector<ds4_repack_artifact> &out,
                                   uint64_t *repacked_bytes_out);
+
+/* Device-to-device entries used by the CUDA parity harness. Source and
+ * destination must not overlap. They emit the same layouts as the builders. */
+bool ds4_repack_iq2_aligned_device(void *dst, const void *raw,
+                                   uint64_t in_dim, uint64_t out_dim,
+                                   uint32_t group_count, cudaStream_t stream);
+bool ds4_repack_q2k_aligned_device(void *dst, const void *raw,
+                                   uint64_t in_dim, uint64_t out_dim,
+                                   uint32_t group_count, cudaStream_t stream);
 
 #endif /* DS4_REPACK_H */

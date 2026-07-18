@@ -25,12 +25,20 @@ CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
 ifneq ($(strip $(CUDA_ARCH)),)
+ifeq ($(CUDA_ARCH),sm_121a)
+NVCC_ARCH_FLAGS := -gencode=arch=compute_121a,code=sm_121a
+else
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
+endif
+endif
+ifneq ($(filter sm_121a,$(CUDA_ARCH)),)
+CUDA_INDEXER_FEATURE_FLAGS := -DDS4_CUDA_SM121A_MXF4_MMA
 endif
 NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math -std=c++17 $(NVCC_ARCH_FLAGS) -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread
 MMQ_INCLUDES := -Icuda/mmq
-MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o
-CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o $(MMQ_OBJS)
+MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/ds4_repack.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o
+CUDA_INDEXER_OBJS := cuda/indexer/ds4_indexer_sm121.o cuda/indexer/ds4_topk_radix.o cuda/indexer/ds4_topk_gvr.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o $(MMQ_OBJS) $(CUDA_INDEXER_OBJS)
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -ldl
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
@@ -86,7 +94,7 @@ help:
 	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10"
 	@echo "  make cuda-spark-graph    Build experimental token-level CUDA Graph path for GB10"
 	@echo "  make cuda-spark-mtp-tc   Build CUDA Graph + opt-in MTP Tensor Core support"
-	@echo "  make cuda-spark-graph-sm121  Build CUDA Graph path as a native GB10 sm_121 cubin"
+	@echo "  make cuda-spark-graph-sm121  Build CUDA Graph path as a native GB10 sm_121a cubin"
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
@@ -103,8 +111,8 @@ cuda-spark-graph:
 		NVCCFLAGS="$(NVCCFLAGS) --default-stream per-thread -DDS4_CUDA_TOKEN_GRAPH_BUILD"
 
 cuda-spark-graph-sm121:
-	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=sm_121 \
-		NVCCFLAGS="-O3 -g -lineinfo --use_fast_math -std=c++17 -arch=sm_121 -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread --default-stream per-thread -DDS4_CUDA_TOKEN_GRAPH_BUILD"
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=sm_121a \
+		NVCCFLAGS="-O3 -g -lineinfo --use_fast_math -std=c++17 -gencode=arch=compute_121a,code=sm_121a -Xcompiler $(NATIVE_CPU_FLAG) -Xcompiler -pthread --default-stream per-thread -DDS4_CUDA_TOKEN_GRAPH_BUILD"
 
 cuda-spark-mtp-tc: cuda-spark-graph-sm121
 
@@ -229,8 +237,17 @@ ds4_agent_cpu.o: ds4_agent.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h ds4_kv
 ds4_metal.o: ds4_metal.m ds4_gpu.h $(METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -c -o $@ ds4_metal.m
 
-ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h
+ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h cuda/indexer/ds4_indexer_sm121.h cuda/indexer/ds4_topk_radix.h cuda/indexer/ds4_topk_gvr.h
 	$(NVCC) $(NVCCFLAGS) -c -o $@ ds4_cuda.cu
+
+cuda/indexer/ds4_indexer_sm121.o: cuda/indexer/ds4_indexer_sm121.cu cuda/indexer/ds4_indexer_sm121.h
+	$(NVCC) $(NVCCFLAGS) $(CUDA_INDEXER_FEATURE_FLAGS) -c -o $@ $<
+
+cuda/indexer/ds4_topk_radix.o: cuda/indexer/ds4_topk_radix.cu cuda/indexer/ds4_topk_radix.h
+	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
+
+cuda/indexer/ds4_topk_gvr.o: cuda/indexer/ds4_topk_gvr.cu cuda/indexer/ds4_topk_gvr.h cuda/indexer/ds4_topk_radix.h
+	$(NVCC) $(NVCCFLAGS) -c -o $@ $<
 
 cuda/mmq/ds4_ggml_stubs.o: cuda/mmq/ds4_ggml_stubs.cu cuda/mmq/ds4_ggml_stubs.h cuda/mmq/common.cuh
 	$(NVCC) $(NVCCFLAGS) $(MMQ_INCLUDES) -c -o $@ $<
@@ -240,6 +257,9 @@ cuda/mmq/ds4_mmq.o: cuda/mmq/ds4_mmq.cu cuda/mmq/ds4_mmq.h cuda/mmq/ds4_mmq_d2r.
 
 cuda/mmq/ds4_mmq_d2r.o: cuda/mmq/ds4_mmq_d2r.cu cuda/mmq/ds4_mmq_d2r.cuh cuda/mmq/mmq.cuh cuda/mmq/common.cuh cuda/mmq/vecdotq.cuh cuda/mmq/mma.cuh
 	$(NVCC) $(NVCCFLAGS) $(MMQ_INCLUDES) -diag-suppress 177 -c -o $@ $<
+
+cuda/mmq/ds4_repack.o: cuda/mmq/ds4_repack.cu cuda/mmq/ds4_repack.h cuda/mmq/ds4_mmq.h
+	$(NVCC) $(NVCCFLAGS) $(MMQ_INCLUDES) -c -o $@ $<
 
 cuda/mmq/quantize.o: cuda/mmq/quantize.cu cuda/mmq/quantize.cuh cuda/mmq/mmq.cuh cuda/mmq/common.cuh
 	$(NVCC) $(NVCCFLAGS) $(MMQ_INCLUDES) -c -o $@ $<
@@ -253,7 +273,7 @@ cuda/mmq/mmvq.o: cuda/mmq/mmvq.cu cuda/mmq/mmvq.cuh cuda/mmq/common.cuh cuda/mmq
 ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm.cu
 
-tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
+tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS) $(CUDA_INDEXER_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
@@ -280,4 +300,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot *.o cuda/mmq/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot *.o cuda/indexer/*.o cuda/mmq/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

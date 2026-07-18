@@ -71,10 +71,67 @@ CUDA a questa dimensione e falliva con `invalid argument`. Il launcher
 configura ora la dimensione dinamica reale fin dal primo uso e la regressione
 esercita esplicitamente questo confine.
 
+### Pipeline SM121 nel worktree: implementata, gate Athena pendente
+
+Il worktree successivo al riferimento sopra integra tutte le fasi del piano
+indexer, MoE, attention e deep decode. I valori attesi del piano non sono
+riportati come risultati: questa versione deve ancora superare compilazione,
+regressione e benchmark end-to-end su Athena.
+
+- `tools/benchmark_gb10.py` esegue tre processi per sweep cold e append alle
+  frontiere 12K, 32K, 64K, 80K e 96K. Registra startup, prefill, decode DSpark,
+  RSS/HWM prima e dopo la creazione della sessione, picco osservato e hash FNV
+  dei token greedy in CSV e JSON. Frontiere mancanti o hash non deterministici
+  fanno fallire il comando;
+- la index cache ratio-4 usa righe MXFP4 da 68 byte: 64 byte E2M1 e quattro
+  scale UE8M0. Le frontiere del compressor restano F32 e le query packed sono
+  transienti. Il checkpoint corrente e' v4 packed; restore locale e distribuito
+  continuano a leggere il precedente v3 F32;
+- lo scorer SM121a usa MMA block-scaled nativo, mentre l'exact Top-512 passa al
+  Radix Select oltre 8192 righe. La score matrix resta intenzionalmente
+  materializzata: eliminarla ricreerebbe il costo del LiteTopK gia' scartato;
+- gate/up IQ2_XXS e down Q2_K del solo target sono ripaccati SoA direttamente
+  nelle stesse regioni device. Il catalogo richiede gate, up e down completi per
+  ogni layer; non esiste una seconda copia permanente e il sidecar DSpark non
+  viene trasformato;
+- fino a 16 token, quindi anche decode e verifier `K+1`, gate/up, SwiGLU,
+  routing weight, down e somma dei sei slot usano il tier vector diretto. Il
+  prefill piu' largo usa D2R expert-major e una riduzione finale deterministica
+  in ordine di slot; una scatter atomica cambierebbe l'ordine numerico;
+- la compressed attention KV persistente e' F16. Poiche' la riga viene prima
+  arrotondata nel formato FP8 del modello, il successivo storage F16 non perde
+  informazione. Token-tile la legge direttamente e applica conditional softmax;
+- lo stage resta staticamente a 32 righe e occupa 88.576 byte. Uno stage 64
+  non e' incompleto: i soli due ring KV richiederebbero 131.072 byte, oltre il
+  limite shared-memory da 90 KiB della GB10;
+- la conversione Q e' caricata una sola volta nei registri della CTA che
+  possiede quella coppia di head. Uno staging globale F16 non introdurrebbe
+  riuso tra CTA e richiederebbe circa 512 MiB a chunk 8192, incompatibile con
+  il margine RAM disponibile;
+- il deep decode a token singolo usa GVR exact oltre 12K righe quando possiede
+  un hint valido. Verifica e refinement conservano Top-512 esatto e ricadono su
+  Radix; hint e validita' seguono snapshot, partial accept e rollback DSpark.
+
+Il dispatch e' strutturale e automatico. Non sono stati aggiunti flag al
+launcher, non cambiano Top-K, maschere, sink, softmax online, pesi o sampler del
+target. I vecchi percorsi rimangono soltanto per forme non eleggibili e come
+riferimento numerico della regressione.
+
+Log di attivazione attesi, quando le relative forme vengono realmente eseguite:
+
+```text
+ds4: CUDA target MoE replaced in place: ... (zero permanent duplication)
+ds4: CUDA in-place aligned MoE execution active ...
+ds4: CUDA packed MXFP4 indexer scorer enabled ...
+ds4: CUDA exact radix Top-512 enabled ...
+ds4: CUDA token-tile HMMA indexed prefill enabled (... stage=32 ... comp-kv=direct-f16)
+ds4: CUDA Blackwell exact GVR Top-512 enabled ...
+```
+
 ## Requisiti
 
 - NVIDIA GB10 / DGX Spark con Linux ARM64;
-- CUDA Toolkit 13 con `/usr/local/cuda/bin/nvcc` e supporto `sm_121`;
+- CUDA Toolkit 13 con `/usr/local/cuda/bin/nvcc` e supporto `sm_121a`;
 - toolchain C/C++ (`make`, `cc`, `git`);
 - almeno 128 GB di memoria unificata per il profilo `balanced`;
 - spazio disco per target GGUF, sidecar DSpark e KV cache;
@@ -142,7 +199,7 @@ Percorsi differenti possono essere passati con `DS4_MODEL`,
 Fermare il server prima del test per evitare pressione di memoria, quindi:
 
 ```bash
-cd ~/DS4-GB10-GX10-DSpark-CUDA && make -B cuda-regression CUDA_ARCH=sm_121
+cd ~/DS4-GB10-GX10-DSpark-CUDA && make -B cuda-regression CUDA_ARCH=sm_121a
 ```
 
 Il comando compila anche gli oggetti `cuda/mmq`. L'esito valido termina con
@@ -155,8 +212,12 @@ fallimenti precedenti a quella riga bloccano il deploy.
 cd ~/DS4-GB10-GX10-DSpark-CUDA && make -B cuda-spark-graph-sm121
 ```
 
-La riga NVCC deve contenere `-arch=sm_121`,
-`--default-stream per-thread` e `-DDS4_CUDA_TOKEN_GRAPH_BUILD`.
+La riga NVCC deve contenere
+`-gencode=arch=compute_121a,code=sm_121a`,
+`-DDS4_CUDA_SM121A_MXF4_MMA`, `--default-stream per-thread` e
+`-DDS4_CUDA_TOKEN_GRAPH_BUILD`. Il `-gencode` esplicito e' necessario: su
+alcune toolchain lo shorthand `-arch=sm_121a` perde il suffisso `a` nel PTX e
+produce `.target sm_121`, che non abilita le istruzioni MMA block-scaled MXFP4.
 
 ### 5. Avvio
 
@@ -204,6 +265,26 @@ Non aggiungere `-n`: in rsync significa dry-run e non trasferisce alcun file.
 Un file sorgente nuovo deve essere tracciato da Git oppure incluso
 esplicitamente, altrimenti `git ls-files` non lo invia.
 
+Durante la validazione della pipeline SM121 usare `deploy-athena.sh`: finche' i
+nuovi moduli `cuda/indexer/` e `tools/` non vengono tracciati, `git ls-files`
+li omette. Lo script trasferisce l'intero albero sorgente, inclusi i
+file nuovi, ma esclude `.git`, binari, oggetti e risultati di benchmark.
+
+## Benchmark riproducibile GB10
+
+Dopo `make -B cuda-spark-graph-sm121`, usare un prompt che tokenizzi ad almeno
+98.304 token. Il comando seguente esegue cold e append, tre volte ciascuno, e
+scrive mediane e dati grezzi sotto `benchmark-results/gb10`:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && python3 tools/benchmark_gb10.py --model /home/athena/ds4/ds4flash.gguf --dspark /home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf --prompt /path/to/same-long-prompt.txt --repeats 3
+```
+
+Gli artefatti principali sono `summary.json`, `summary.csv`, `raw.csv` e i log
+di ogni processo. Un valore `MISMATCH:` in `greedy_token_hash` blocca il gate;
+per il confronto A/B vanno mantenuti identici prompt, binari di riferimento,
+frontiere, chunk, draft depth e condizioni termiche.
+
 ## Configurazione corrente
 
 `run-dspark-server.sh` è la fonte autorevole dei default. Il profilo
@@ -248,6 +329,15 @@ Con lo stesso prompt, stessa posizione assoluta e server appena avviato:
 6. aumento memoria dovuto al token-tile non oltre circa 168 MiB;
 7. secondo turno append/canonical senza full prefill quando il prefisso è
    riutilizzabile.
+
+Per la pipeline SM121 in attesa di validazione si aggiungono questi gate:
+
+8. stesso hash greedy fra le tre ripetizioni deterministiche;
+9. RAM RSS/HWM non superiore al baseline e nessun aumento permanente dei pesi;
+10. scorer indexer almeno 1,6x e indexer combinato almeno +10% end-to-end;
+11. MoE almeno +10% end-to-end, token-tile attention almeno 1,5x;
+12. decode DSpark almeno al 98% della mediana baseline; GVR resta solo con
+    vantaggio superiore al 3% sul deep decode.
 
 ## Cronologia tecnica
 
@@ -1074,7 +1164,7 @@ per i routed expert.
    rinviata al replay normale e i graph con puntatori obsoleti sono distrutti.
 8. **Una sola barriera nel verifier.** I 43 layer target e l'output head MTP
    restano nello stesso command batch, eliminando una sincronizzazione device.
-9. **Build nativa GB10.** `make cuda-spark-mtp-tc` usa `-arch=sm_121` oltre al
+9. **Build nativa GB10.** `make cuda-spark-mtp-tc` usa `-arch=sm_121a` oltre al
    default stream per thread; non produce più il cubin generico `sm_75`.
 10. **Thinking greedy esplicito.** `DS4_MTP_GREEDY_THINK=1` evita che thinking
    mode ripristini una temperatura non-zero, condizione che disabiliterebbe il
@@ -1427,7 +1517,7 @@ ds4: CUDA Entrpi batched MMQ MoE prefill enabled (single-map IQ2 gate/up + Q2 do
 Prima del deploy è obbligatorio eseguire:
 
 ```bash
-make -B cuda-regression CUDA_ARCH=sm_121
+make -B cuda-regression CUDA_ARCH=sm_121a
 ```
 
 La regressione genera pesi IQ2_XXS/Q2_K e attivazioni deterministici non
@@ -1867,7 +1957,7 @@ anche questo readback, ma richiede una validazione statistica separata.
 La potenza di picco della GB10 riguarda formati a bassa precisione e Tensor
 Core. Molti matmul di decode Q8/IQ2/Q2 usano ancora kernel custom DP4A o
 dequantizzazione specializzata. Un kernel W8A8/FP8 o un percorso CUTLASS
-specifico per `sm_121` potrebbe fornire un guadagno maggiore, ma richiede
+specifico per `sm_121a` potrebbe fornire un guadagno maggiore, ma richiede
 benchmark di qualità e banda e non è una patch minimale.
 
 ### Profondità MTP superiore a due
@@ -1878,7 +1968,7 @@ lavoro utile per verifier ma anche il costo dei draft rifiutati.
 
 ## File modificati
 
-- `Makefile`: target CUDA Graph, build nativa `sm_121` e oggetti MMQ Entrpi.
+- `Makefile`: target CUDA Graph, build nativa `sm_121a` e oggetti MMQ Entrpi.
 - `ds4.c`: DSpark, confidence scheduler, commit diretto, ring rollback e payload KV.
 - `ds4_cuda.cu`: residenza multi-GGUF, kernel DSpark, graph K-aware, routed-MoE
   MMQ e token-tile HMMA confinati al prefill target.

@@ -309,6 +309,29 @@ int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
     float           clamp,
     cudaStream_t    stream);
 
+// Aligned-artifact production fast path. Gate/up stay in registers, weighted
+// SwiGLU is quantized directly into q8_scratch, and only the pair-major down
+// output is materialized. q8_scratch may alias the caller's unused gate
+// scratch, but must remain live until the function returns.
+int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
+    const void    * W_gate_soa,
+    const void    * W_up_soa,
+    const void    * W_down_soa,
+    const float   * X_f32,
+    const int32_t * ids,
+    const float   * router_weights,
+    void          * q8_scratch,
+    size_t          q8_scratch_bytes,
+    float         * down_f32,
+    int             expert_mid_dim,
+    int             expert_in_dim,
+    int             out_dim,
+    int             n_tokens,
+    int             n_experts,
+    int             n_expert_used,
+    float           clamp,
+    cudaStream_t    stream);
+
 // ds4 (P4 Inc3): same contract as ds4_mmq_iq2_xxs_moe_pair but over the
 // aligned-SoA artifacts (weight server --repack-iq2-aligned); see
 // ds4_mmq_q2_K_moe_soa.

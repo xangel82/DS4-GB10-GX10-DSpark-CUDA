@@ -128,6 +128,58 @@ ds4: CUDA token-tile HMMA indexed prefill enabled (... stage=32 ... comp-kv=dire
 ds4: CUDA Blackwell exact GVR Top-512 enabled ...
 ```
 
+### Fusione completa MoE D2R validata su Athena
+
+Il percorso target SoA con piu' di 16 token dispone ora di una pipeline
+`m128n32` che elimina le materializzazioni globali fra gate/up e down:
+
+1. una CTA carica una sola volta il tile Q8_1 dell'attivazione;
+2. due ring IQ2 indipendenti accumulano gate e up in registri, nello stesso
+   ordine K del D2R precedente;
+3. sanitizzazione, clamp, SwiGLU e routing weight sono applicati prima che i
+   risultati lascino la CTA;
+4. la shared memory dei ring viene riutilizzata come tile F32 e il risultato
+   viene quantizzato direttamente nel layout Q8_1 D2S6 expert-major richiesto
+   dal Q2_K down;
+5. il down D2R e la somma deterministica dei sei slot restano invariati.
+
+Il tile da 32 colonne mantiene due CTA residenti: shared di calcolo, staging e
+route weights occupano 45.408 byte per CTA, quindi 90.816 byte per due CTA,
+sotto il limite di 90 KiB della GB10. Il Q8_1 intermedio riusa lo scratch gate
+gia' allocato; non viene introdotta memoria permanente o transiente aggiuntiva.
+Il decode e il verifier DSpark, limitati al tier fino a 16 token, non entrano in
+questo kernel. I dump diagnostici conservano automaticamente il percorso
+materializzato precedente.
+
+La regressione Athena `sm_121a` ha confermato:
+
+```text
+cuda-regression: complete fused D2R MoE parity final=0.00000000 max=0 bad=0
+cuda long-context regression: OK
+```
+
+Durante un prefill reale deve inoltre comparire una sola volta:
+
+```text
+ds4: CUDA complete fused MoE D2R prefill enabled (shared Q8 input, register gate/up, direct SwiGLU Q8 down)
+```
+
+Su tre chunk con gli stessi intervalli di contesto del riferimento, il
+throughput e' passato da 780,88/777,00/761,57 t/s a
+798,07/800,24/785,47 t/s: `+2,77%` pesato. Un cold prefill da 92.995 token ha
+chiuso a 758,39 t/s medi, mantenendo 727,01 t/s sul chunk 73.728..81.920.
+Il decode successivo ha prodotto 811 token a 26,97 t/s; un secondo controllo
+a 85.831 token ha misurato 25,89 t/s. I context buffer sono rimasti invariati
+a 2.453,90 MiB.
+
+Il trace Nsight sul chunk 32.768..40.960 mostra 10 operazioni GPU per layer nel
+percorso MMQ contro le 12 precedenti. Il tempo MoE proiettato scende da 2,698
+a 2,618 secondi (`-3,0%`): il kernel combinato costa 38,88 ms/layer contro
+40,81 ms/layer complessivi di gate/up, SwiGLU pesata e quantizzazione separate.
+Il risultato e' quindi promosso come miglioramento incrementale a qualita',
+memoria e decode invariati; non rappresenta da solo un incremento macro del
+prefill.
+
 ## Requisiti
 
 - NVIDIA GB10 / DGX Spark con Linux ARM64;

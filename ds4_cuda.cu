@@ -206,6 +206,7 @@ static const void *g_moe_aligned_host_base;
 static uint64_t g_moe_aligned_model_size;
 static int g_moe_aligned_ready;
 static int g_moe_aligned_notice;
+static int g_moe_complete_fused_notice;
 static constexpr uint32_t DS4_MMQ_PREFILL_MIN_TOKENS = 1024u;
 static void *g_cublas_workspace;
 static uint64_t g_cublas_workspace_bytes;
@@ -528,6 +529,7 @@ static void cuda_moe_aligned_clear(void) {
     g_moe_aligned_model_size = 0;
     g_moe_aligned_ready = 0;
     g_moe_aligned_notice = 0;
+    g_moe_complete_fused_notice = 0;
 }
 
 static const cuda_moe_aligned_range *cuda_moe_aligned_find(
@@ -19021,14 +19023,35 @@ static int routed_moe_aligned_launch(
         if (cudaGetLastError() != cudaSuccess) return -6;
         output_summed = true;
     } else {
-        rc = ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
-                gate_art->device_ptr, up_art->device_ptr,
-                down_art->device_ptr, x, selected, weights,
-                (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
-                (float *)down->ptr,
-                (int)expert_mid_dim, (int)expert_in_dim, (int)out_dim,
-                (int)n_tokens, (int)n_total_expert, (int)n_expert,
-                clamp, stream);
+        const bool materialize_intermediates =
+            getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL;
+        if (!materialize_intermediates) {
+            rc = ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
+                    gate_art->device_ptr, up_art->device_ptr,
+                    down_art->device_ptr, x, selected, weights,
+                    gate->ptr, (size_t)gate->bytes, (float *)down->ptr,
+                    (int)expert_mid_dim, (int)expert_in_dim, (int)out_dim,
+                    (int)n_tokens, (int)n_total_expert, (int)n_expert,
+                    clamp, stream);
+            if (rc == 0 && !g_moe_complete_fused_notice) {
+                g_moe_complete_fused_notice = 1;
+                fprintf(stderr,
+                        "ds4: CUDA complete fused MoE D2R prefill enabled "
+                        "(shared Q8 input, register gate/up, direct SwiGLU Q8 down)\n");
+            }
+        } else {
+            rc = -1;
+        }
+        if (rc != 0) {
+            rc = ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
+                    gate_art->device_ptr, up_art->device_ptr,
+                    down_art->device_ptr, x, selected, weights,
+                    (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
+                    (float *)down->ptr,
+                    (int)expert_mid_dim, (int)expert_in_dim, (int)out_dim,
+                    (int)n_tokens, (int)n_total_expert, (int)n_expert,
+                    clamp, stream);
+        }
         if (rc != 0) return -7;
     }
 
@@ -19045,7 +19068,7 @@ static int routed_moe_aligned_launch(
         g_moe_aligned_notice = 1;
         fprintf(stderr,
                 "ds4: CUDA in-place aligned MoE execution active "
-                "(Q8_K small-batch + D2R/MMQ prefill tiers)\n");
+                "(Q8_K small-batch + fused gate/up/SwiGLU/Q8 D2R prefill)\n");
     }
     return 1;
 }
@@ -19958,6 +19981,7 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
     std::vector<float> up_soa_host(pair_values);
     std::vector<float> mid_soa_host(pair_values);
     std::vector<float> out_soa_host(out_values);
+    std::vector<float> out_fused_direct_host(out_values);
     std::vector<float> out_direct_host((uint64_t)16u * out_dim);
     std::vector<float> out_soa_prefix_host((uint64_t)16u * out_dim);
     std::vector<float> out_q8k_host((uint64_t)16u * out_dim);
@@ -20152,6 +20176,30 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
     if (ok) ok = ds4_gpu_tensor_read(out_mmq, 0, out_soa_host.data(), out_mmq->bytes);
 
     if (ok) {
+        ok = ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
+                gate_soa->ptr, up_soa->ptr, down_soa->ptr,
+                (const float *)x->ptr, (const int32_t *)selected->ptr,
+                (const float *)weights->ptr,
+                gate_mmq->ptr, (size_t)gate_mmq->bytes,
+                (float *)down_mmq->ptr,
+                mid_dim, in_dim, out_dim,
+                n_tokens, n_total_expert, n_expert, test_clamp,
+                stream) == 0;
+    }
+    if (ok) {
+        moe_mmq_sum_guard_kernel<<<
+                (uint32_t)((out_values + 255u) / 256u), 256, 0, stream>>>(
+                (float *)out_mmq->ptr, (const float *)down_mmq->ptr,
+                out_dim, n_expert, n_tokens);
+        ok = cudaGetLastError() == cudaSuccess &&
+             cudaStreamSynchronize(stream) == cudaSuccess;
+    }
+    if (ok) {
+        ok = ds4_gpu_tensor_read(
+                out_mmq, 0, out_fused_direct_host.data(), out_mmq->bytes);
+    }
+
+    if (ok) {
         ok = ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
                 gate_soa->ptr, up_soa->ptr,
                 (const float *)x->ptr, (const int32_t *)selected->ptr,
@@ -20305,6 +20353,8 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
                 mid_mmq_host, mid_soa_host, INFINITY, INFINITY);
         const parity_stats soa_out_stats = analyze_parity(
                 out_mmq_host, out_soa_host, INFINITY, INFINITY);
+        const parity_stats fused_direct_stats = analyze_parity(
+                out_soa_host, out_fused_direct_host, 2.0e-3, 2.0e-4);
         const parity_stats direct_out_stats = analyze_parity(
                 out_soa_prefix_host, out_direct_host, INFINITY, INFINITY);
         const parity_stats q8k_out_stats = analyze_parity(
@@ -20328,6 +20378,12 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
                 soa_mid_stats.relative_rmse,
                 soa_out_stats.relative_rmse);
         fprintf(stderr,
+                "cuda-regression: complete fused D2R MoE parity "
+                "final=%.8f max=%.8g bad=%llu\n",
+                fused_direct_stats.relative_rmse,
+                fused_direct_stats.max_abs,
+                (unsigned long long)fused_direct_stats.bad);
+        fprintf(stderr,
                 "cuda-regression: aligned-SoA direct down+sum6 parity "
                 "final=%.5f rel-rmse\n",
                 direct_out_stats.relative_rmse);
@@ -20343,6 +20399,8 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
              soa_gate_stats.bad == 0 && soa_up_stats.bad == 0 &&
              soa_mid_stats.relative_rmse < 0.05 &&
              soa_out_stats.relative_rmse < 0.05 &&
+             fused_direct_stats.relative_rmse < 1.0e-3 &&
+             fused_direct_stats.bad == 0 &&
              direct_out_stats.relative_rmse < 0.05 &&
              q8k_out_stats.bad == 0;
     }

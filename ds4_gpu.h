@@ -83,6 +83,8 @@ int ds4_gpu_dspark_draft_graph_begin(uint32_t n_tokens,
 void ds4_gpu_token_graph_reset(void);
 void ds4_gpu_token_graph_note_readback(double readback_ms, double eval_ms);
 void ds4_gpu_token_graph_note_sampling(double sampling_ms);
+void ds4_gpu_nsys_decode_cycle_begin(uint32_t pos);
+void ds4_gpu_nsys_decode_cycle_end(uint32_t emitted_tokens);
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label);

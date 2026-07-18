@@ -18325,8 +18325,10 @@ static bool cuda_prefill_nvtx_enabled(void) {
     if (enabled < 0) {
         const char *nvtx = getenv("DS4_CUDA_NVTX");
         const char *capture = getenv("DS4_CUDA_NSYS_PREFILL_START_POS");
+        const char *decode_capture = getenv("DS4_CUDA_NSYS_CAPTURE_START_POS");
         enabled = (nvtx != NULL && strcmp(nvtx, "1") == 0) ||
-                  (capture != NULL && capture[0] != '\0');
+                  (capture != NULL && capture[0] != '\0') ||
+                  (decode_capture != NULL && decode_capture[0] != '\0');
     }
     return enabled != 0;
 }
@@ -30872,22 +30874,32 @@ static int ds4_session_eval_dspark_cycle(
 
     int drafts[DS4_DSPARK_BLOCK_SIZE];
     float confidence[DS4_DSPARK_BLOCK_SIZE] = {0};
-    if (!metal_graph_eval_dspark_draft(&s->graph,
-                                       &e->model,
-                                       &e->weights,
-                                       &e->dspark_model,
-                                       &e->dspark_weights,
-                                       first_token,
-                                       (uint32_t)s->checkpoint.len,
-                                       (uint32_t)draft_cap,
-                                       (uint32_t)proposal_cap,
-                                       use_rejection_sampling,
-                                       temperature,
-                                       min_p,
-                                       draft_uniforms,
-                                       drafts,
-                                       confidence,
-                                       draft_probs)) {
+    const bool decode_nvtx = cuda_prefill_nvtx_enabled();
+    if (decode_nvtx) {
+        ds4_gpu_nvtx_range_push(
+                "ds4/decode/dspark/draft",
+                cuda_prefill_nvtx_payload((uint32_t)draft_cap,
+                                          (uint32_t)proposal_cap));
+    }
+    const bool draft_ok = metal_graph_eval_dspark_draft(
+            &s->graph,
+            &e->model,
+            &e->weights,
+            &e->dspark_model,
+            &e->dspark_weights,
+            first_token,
+            (uint32_t)s->checkpoint.len,
+            (uint32_t)draft_cap,
+            (uint32_t)proposal_cap,
+            use_rejection_sampling,
+            temperature,
+            min_p,
+            draft_uniforms,
+            drafts,
+            confidence,
+            draft_probs);
+    if (decode_nvtx) ds4_gpu_nvtx_range_pop();
+    if (!draft_ok) {
         if (log) fprintf(stderr, "ds4: DSpark draft failed; using target token\n");
         return dspark_eval_current_only(s, first_token, accepted,
                                         0u, 0.0, t0, "draft-failed",
@@ -31077,6 +31089,12 @@ static int ds4_session_eval_dspark_cycle(
             token_vec_push(&s->checkpoint, drafts[i]);
         }
         verifier_started = true;
+        if (decode_nvtx) {
+            ds4_gpu_nvtx_range_push(
+                    "ds4/decode/dspark/verifier",
+                    cuda_prefill_nvtx_payload((uint32_t)draft_n,
+                                              verify_rows));
+        }
         ok = metal_graph_verify_suffix_tops(&s->graph,
                                             &e->model,
                                             &e->weights,
@@ -31086,6 +31104,7 @@ static int ds4_session_eval_dspark_cycle(
                                             (uint32_t)draft_n,
                                             use_rejection_sampling ? NULL : row_tops,
                                             verify_logits);
+        if (decode_nvtx) ds4_gpu_nvtx_range_pop();
     }
 
     int committed = 0;
@@ -31093,6 +31112,12 @@ static int ds4_session_eval_dspark_cycle(
     if (ok && use_rejection_sampling) {
         int verify_tokens[DS4_DSPARK_BLOCK_SIZE] = {0};
         int verify_accept[DS4_DSPARK_BLOCK_SIZE] = {0};
+        if (decode_nvtx) {
+            ds4_gpu_nvtx_range_push(
+                    "ds4/decode/dspark/rejection",
+                    cuda_prefill_nvtx_payload((uint32_t)draft_n,
+                                              verify_rows));
+        }
         ok = ds4_gpu_tensor_write(s->graph.dspark_accept_uniforms,
                                   0,
                                   accept_uniforms,
@@ -31121,6 +31146,7 @@ static int ds4_session_eval_dspark_cycle(
                                   0,
                                   verify_accept,
                                   (uint64_t)draft_n * sizeof(verify_accept[0])) != 0;
+        if (decode_nvtx) ds4_gpu_nvtx_range_pop();
         for (int i = 0; ok && i < draft_n; i++) {
             if (!verify_accept[i]) {
                 mismatch = verify_tokens[i];
@@ -31314,19 +31340,27 @@ int ds4_session_eval_speculative_sample(ds4_session *s, int first_token,
 #endif
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (e->dspark_ready) {
-        return ds4_session_eval_dspark_cycle(s,
-                                             first_token,
-                                             max_tokens,
-                                             eos_token,
-                                             accepted,
-                                             accepted_cap,
-                                             temperature,
-                                             top_k,
-                                             top_p,
-                                             min_p,
-                                             rng,
-                                             err,
-                                             errlen);
+        const bool decode_trace = cuda_prefill_nvtx_enabled();
+        if (decode_trace) {
+            ds4_gpu_nsys_decode_cycle_begin((uint32_t)s->checkpoint.len);
+        }
+        const int rc = ds4_session_eval_dspark_cycle(s,
+                                                     first_token,
+                                                     max_tokens,
+                                                     eos_token,
+                                                     accepted,
+                                                     accepted_cap,
+                                                     temperature,
+                                                     top_k,
+                                                     top_p,
+                                                     min_p,
+                                                     rng,
+                                                     err,
+                                                     errlen);
+        if (decode_trace) {
+            ds4_gpu_nsys_decode_cycle_end(rc > 0 ? (uint32_t)rc : 0u);
+        }
+        return rc;
     }
 #endif
     if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
@@ -31375,19 +31409,27 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (e->dspark_ready) {
-        return ds4_session_eval_dspark_cycle(s,
-                                             first_token,
-                                             max_tokens,
-                                             eos_token,
-                                             accepted,
-                                             accepted_cap,
-                                             0.0f,
-                                             0,
-                                             1.0f,
-                                             0.0f,
-                                             NULL,
-                                             err,
-                                             errlen);
+        const bool decode_trace = cuda_prefill_nvtx_enabled();
+        if (decode_trace) {
+            ds4_gpu_nsys_decode_cycle_begin((uint32_t)s->checkpoint.len);
+        }
+        const int rc = ds4_session_eval_dspark_cycle(s,
+                                                     first_token,
+                                                     max_tokens,
+                                                     eos_token,
+                                                     accepted,
+                                                     accepted_cap,
+                                                     0.0f,
+                                                     0,
+                                                     1.0f,
+                                                     0.0f,
+                                                     NULL,
+                                                     err,
+                                                     errlen);
+        if (decode_trace) {
+            ds4_gpu_nsys_decode_cycle_end(rc > 0 ? (uint32_t)rc : 0u);
+        }
+        return rc;
     }
 #endif
 

@@ -47,8 +47,10 @@ static int cuda_nvtx_requested(void) {
     if (enabled < 0) {
         const char *nvtx = getenv("DS4_CUDA_NVTX");
         const char *capture = getenv("DS4_CUDA_NSYS_PREFILL_START_POS");
+        const char *decode_capture = getenv("DS4_CUDA_NSYS_CAPTURE_START_POS");
         enabled = (nvtx != NULL && strcmp(nvtx, "1") == 0) ||
-                  (capture != NULL && capture[0] != '\0');
+                  (capture != NULL && capture[0] != '\0') ||
+                  (decode_capture != NULL && decode_capture[0] != '\0');
     }
     return enabled;
 }
@@ -329,6 +331,7 @@ struct cuda_nsys_capture_state {
 };
 
 static cuda_nsys_capture_state g_nsys_capture;
+static int g_nsys_decode_cycle_active;
 
 struct cuda_nsys_prefill_capture_state {
     int initialized;
@@ -3281,13 +3284,23 @@ static void cuda_nsys_capture_stop(const char *reason) {
 #endif
 }
 
-static void cuda_nsys_capture_note_readback(void) {
+static void cuda_nsys_capture_note_tokens(uint32_t tokens) {
 #ifdef DS4_CUDA_TOKEN_GRAPH_BUILD
-    if (!g_nsys_capture.started || g_nsys_capture.stopped) return;
-    g_nsys_capture.captured_tokens++;
+    if (!g_nsys_capture.started || g_nsys_capture.stopped || tokens == 0u) return;
+    const uint64_t total = (uint64_t)g_nsys_capture.captured_tokens + tokens;
+    g_nsys_capture.captured_tokens = total > UINT32_MAX
+        ? UINT32_MAX : (uint32_t)total;
     if (g_nsys_capture.captured_tokens < g_nsys_capture.token_limit) return;
     cuda_nsys_capture_stop("window-complete");
+#else
+    (void)tokens;
 #endif
+}
+
+static void cuda_nsys_capture_note_readback(void) {
+    if (!g_nsys_decode_cycle_active) {
+        cuda_nsys_capture_note_tokens(1u);
+    }
 }
 
 static void cuda_nsys_prefill_capture_init(void) {
@@ -3381,6 +3394,18 @@ extern "C" void ds4_gpu_nvtx_range_push(const char *name, uint64_t payload) {
 
 extern "C" void ds4_gpu_nvtx_range_pop(void) {
     cuda_nvtx_pop();
+}
+
+extern "C" void ds4_gpu_nsys_decode_cycle_begin(uint32_t pos) {
+    cuda_nsys_capture_maybe_start(pos);
+    g_nsys_decode_cycle_active = 1;
+    cuda_nvtx_push("ds4/decode/dspark/cycle", cuda_nvtx_payload(pos, 0u));
+}
+
+extern "C" void ds4_gpu_nsys_decode_cycle_end(uint32_t emitted_tokens) {
+    cuda_nvtx_pop();
+    g_nsys_decode_cycle_active = 0;
+    cuda_nsys_capture_note_tokens(emitted_tokens);
 }
 
 extern "C" void ds4_gpu_prefill_trace_begin(uint32_t pos0, uint32_t n_tokens) {

@@ -18056,6 +18056,23 @@ static bool metal_graph_profile_layer_env_match(const char *env_name, uint32_t i
            (uint32_t)layer == il;
 }
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+static bool cuda_prefill_nvtx_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *nvtx = getenv("DS4_CUDA_NVTX");
+        const char *capture = getenv("DS4_CUDA_NSYS_PREFILL_START_POS");
+        enabled = (nvtx != NULL && strcmp(nvtx, "1") == 0) ||
+                  (capture != NULL && capture[0] != '\0');
+    }
+    return enabled != 0;
+}
+
+static uint64_t cuda_prefill_nvtx_payload(uint32_t first, uint32_t second) {
+    return ((uint64_t)first << 32) | second;
+}
+#endif
+
 static bool metal_graph_layer_stage_profile_enabled(uint32_t il) {
     return getenv("DS4_METAL_LAYER_STAGE_PROFILE") != NULL &&
            metal_graph_profile_layer_env_match("DS4_METAL_LAYER_STAGE_PROFILE_LAYER", il);
@@ -18131,6 +18148,18 @@ static bool metal_graph_encode_layer_attention_batch(
         ? 0u : ds4_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
     const bool zero_prefix = pos0 == 0;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    const bool nvtx_profile = cuda_prefill_nvtx_enabled();
+    if (nvtx_profile) {
+        const char *range_name = ratio == 4u
+            ? "ds4/prefill/attention/ratio4"
+            : ratio == 128u
+                ? "ds4/prefill/attention/ratio128"
+                : "ds4/prefill/attention/raw";
+        ds4_gpu_nvtx_range_push(range_name,
+                                cuda_prefill_nvtx_payload(il, n_tokens));
+    }
+#endif
     const bool index_stage_profile = getenv("DS4_METAL_INDEXER_STAGE_PROFILE") != NULL;
     const bool layer_stage_profile = metal_graph_layer_stage_profile_enabled(il);
     const bool q_stage_profile = getenv("DS4_METAL_Q_STAGE_PROFILE") != NULL;
@@ -19615,6 +19644,9 @@ static bool metal_graph_encode_layer_attention_batch(
     free(comp_counts);
 #undef DS4_METAL_PROFILE_ATTN_STAGE
 #undef DS4_METAL_PROFILE_Q_STAGE
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    if (nvtx_profile) ds4_gpu_nvtx_range_pop();
+#endif
     return ok;
 }
 
@@ -19640,6 +19672,13 @@ static bool metal_graph_encode_layer_ffn_batch(
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    const bool nvtx_profile = cuda_prefill_nvtx_enabled();
+    if (nvtx_profile) {
+        ds4_gpu_nvtx_range_push("ds4/prefill/ffn",
+                                cuda_prefill_nvtx_payload(il, n_tokens));
+    }
+#endif
     const bool layer_stage_profile = metal_graph_layer_stage_profile_enabled(il);
     double layer_stage_t0 = layer_stage_profile ? now_sec() : 0.0;
 #define DS4_METAL_PROFILE_FFN_STAGE(name) do { \
@@ -20088,6 +20127,9 @@ static bool metal_graph_encode_layer_ffn_batch(
     ds4_gpu_tensor_free(hc_split_view);
     ds4_gpu_tensor_free(hc_mix_view);
 #undef DS4_METAL_PROFILE_FFN_STAGE
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    if (nvtx_profile) ds4_gpu_nvtx_range_pop();
+#endif
     return ok;
 }
 
@@ -22277,17 +22319,26 @@ static bool metal_graph_prefill_raw_swa(
     (void)cancel;
     (void)cancel_ud;
     (void)cancelled;
-    return metal_graph_prefill_layer_major(g,
-                                           model,
-                                           weights,
-                                           prompt,
-                                           0,
-                                           (uint32_t)n_tokens,
-                                           logits,
-                                           show_progress,
-                                           NULL,
-                                           display_progress,
-                                           display_progress_ud);
+    const uint32_t chunk = (uint32_t)n_tokens;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    const bool nvtx_profile = cuda_prefill_nvtx_enabled();
+    if (nvtx_profile) ds4_gpu_prefill_trace_begin(0, chunk);
+#endif
+    const bool ok = metal_graph_prefill_layer_major(g,
+                                                    model,
+                                                    weights,
+                                                    prompt,
+                                                    0,
+                                                    chunk,
+                                                    logits,
+                                                    show_progress,
+                                                    NULL,
+                                                    display_progress,
+                                                    display_progress_ud);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+    if (nvtx_profile) ds4_gpu_prefill_trace_end(0, chunk, ok);
+#endif
+    return ok;
 }
 
 /* Prefill a contiguous token range in fixed-size chunks.
@@ -22374,6 +22425,10 @@ static bool metal_graph_prefill_chunked_range(
         const uint32_t chunk = remaining < local_cap ? remaining : local_cap;
         const uint32_t chunk_end = pos0 + chunk;
         float *chunk_logits = ((!final_logits_only && progress) || chunk_end == end) ? logits : NULL;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+        const bool nvtx_profile = cuda_prefill_nvtx_enabled();
+        if (nvtx_profile) ds4_gpu_prefill_trace_begin(pos0, chunk);
+#endif
         bool ok = metal_graph_prefill_layer_major(g,
                                                   model,
                                                   weights,
@@ -22385,6 +22440,9 @@ static bool metal_graph_prefill_chunked_range(
                                                   imatrix,
                                                   display_progress,
                                                   display_progress_ud);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+        if (nvtx_profile) ds4_gpu_prefill_trace_end(pos0, chunk, ok);
+#endif
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after chunked prefill failure also failed\n");

@@ -10,6 +10,16 @@
 #include <cublas_v2.h>
 #include <cub/block/block_radix_sort.cuh>
 
+#if defined(__has_include)
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define DS4_CUDA_HAS_NVTX 1
+#endif
+#endif
+#ifndef DS4_CUDA_HAS_NVTX
+#define DS4_CUDA_HAS_NVTX 0
+#endif
+
 #include <stdint.h>
 #include <stddef.h>
 #include <errno.h>
@@ -27,6 +37,62 @@
 
 #include "ds4_gpu.h"
 #include "cuda/mmq/ds4_mmq.h"
+
+static int cuda_nvtx_requested(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *nvtx = getenv("DS4_CUDA_NVTX");
+        const char *capture = getenv("DS4_CUDA_NSYS_PREFILL_START_POS");
+        enabled = (nvtx != NULL && strcmp(nvtx, "1") == 0) ||
+                  (capture != NULL && capture[0] != '\0');
+    }
+    return enabled;
+}
+
+static uint64_t cuda_nvtx_payload(uint32_t first, uint32_t second) {
+    return ((uint64_t)first << 32) | second;
+}
+
+static void cuda_nvtx_push(const char *name, uint64_t payload) {
+#if DS4_CUDA_HAS_NVTX
+    if (!cuda_nvtx_requested()) return;
+    nvtxEventAttributes_t attr = {};
+    attr.version = NVTX_VERSION;
+    attr.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
+    attr.payloadType = NVTX_PAYLOAD_TYPE_UNSIGNED_INT64;
+    attr.payload.ullValue = payload;
+    attr.messageType = NVTX_MESSAGE_TYPE_ASCII;
+    attr.message.ascii = name;
+    (void)nvtxRangePushEx(&attr);
+#else
+    (void)name;
+    (void)payload;
+#endif
+}
+
+static void cuda_nvtx_pop(void) {
+#if DS4_CUDA_HAS_NVTX
+    if (cuda_nvtx_requested()) (void)nvtxRangePop();
+#endif
+}
+
+class cuda_nvtx_scope {
+public:
+    cuda_nvtx_scope(const char *name, uint64_t payload, bool enabled = true)
+        : active_(enabled && cuda_nvtx_requested()) {
+        if (active_) cuda_nvtx_push(name, payload);
+    }
+
+    ~cuda_nvtx_scope() {
+        if (active_) cuda_nvtx_pop();
+    }
+
+    cuda_nvtx_scope(const cuda_nvtx_scope &) = delete;
+    cuda_nvtx_scope &operator=(const cuda_nvtx_scope &) = delete;
+
+private:
+    bool active_;
+};
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -224,6 +290,7 @@ static const char *cuda_mtp_graph_family_name(uint32_t variant) {
     return draft_names[k < 5u ? k : 0u];
 }
 static void cuda_nsys_capture_stop(const char *reason);
+static void cuda_nsys_prefill_capture_stop(const char *reason);
 static int cuda_q8_u16_validate(void);
 static int cuda_moe_gb10_validate_signs(void);
 static int g_q8_u16_validation = -1;
@@ -242,6 +309,19 @@ struct cuda_nsys_capture_state {
 };
 
 static cuda_nsys_capture_state g_nsys_capture;
+
+struct cuda_nsys_prefill_capture_state {
+    int initialized;
+    int enabled;
+    int started;
+    int active;
+    int stopped;
+    uint32_t start_pos;
+    uint32_t chunk_pos;
+    uint32_t chunk_tokens;
+};
+
+static cuda_nsys_prefill_capture_state g_nsys_prefill_capture;
 
 struct cuda_token_graph_timing_current {
     int active;
@@ -3032,6 +3112,8 @@ static int cuda_token_graph_pipeline_allowed(void) {
     if (!cuda_token_graph_pipeline_requested()) return 0;
     if (cuda_token_graph_timing_enabled()) return 0;
     if (getenv("DS4_CUDA_NSYS_CAPTURE_START_POS") != NULL) return 0;
+    const char *prefill_capture = getenv("DS4_CUDA_NSYS_PREFILL_START_POS");
+    if (prefill_capture != NULL && prefill_capture[0] != '\0') return 0;
     return 1;
 }
 
@@ -3164,6 +3246,114 @@ static void cuda_nsys_capture_note_readback(void) {
     if (g_nsys_capture.captured_tokens < g_nsys_capture.token_limit) return;
     cuda_nsys_capture_stop("window-complete");
 #endif
+}
+
+static void cuda_nsys_prefill_capture_init(void) {
+    if (g_nsys_prefill_capture.initialized) return;
+    g_nsys_prefill_capture.initialized = 1;
+
+    const char *start_env = getenv("DS4_CUDA_NSYS_PREFILL_START_POS");
+    if (!start_env || !start_env[0]) return;
+    if (getenv("DS4_CUDA_NSYS_CAPTURE_START_POS") != NULL) {
+        fprintf(stderr,
+                "ds4: CUDA Nsight prefill capture disabled: decode and prefill "
+                "capture windows cannot be combined\n");
+        g_nsys_prefill_capture.stopped = 1;
+        return;
+    }
+
+    char *end = NULL;
+    const unsigned long long start = strtoull(start_env, &end, 10);
+    if (end == start_env || *end != '\0' || start > UINT32_MAX) {
+        fprintf(stderr,
+                "ds4: invalid Nsight prefill capture start=%s; disabled\n",
+                start_env);
+        g_nsys_prefill_capture.stopped = 1;
+        return;
+    }
+
+    g_nsys_prefill_capture.start_pos = (uint32_t)start;
+    g_nsys_prefill_capture.enabled = 1;
+#if !DS4_CUDA_HAS_NVTX
+    fprintf(stderr,
+            "ds4: CUDA Toolkit NVTX3 headers were unavailable at build time; "
+            "prefill capture will contain CUDA kernels without DS4 ranges\n");
+#endif
+}
+
+static void cuda_nsys_prefill_capture_maybe_start(
+        uint32_t pos0,
+        uint32_t n_tokens) {
+    cuda_nsys_prefill_capture_init();
+    if (!g_nsys_prefill_capture.enabled ||
+        g_nsys_prefill_capture.started ||
+        g_nsys_prefill_capture.stopped ||
+        pos0 < g_nsys_prefill_capture.start_pos) {
+        return;
+    }
+
+    const cudaError_t err = cudaProfilerStart();
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA Nsight prefill capture start failed pos=%u tokens=%u: %s; disabled\n",
+                pos0, n_tokens, cudaGetErrorString(err));
+        g_nsys_prefill_capture.stopped = 1;
+        (void)cudaGetLastError();
+        return;
+    }
+
+    g_nsys_prefill_capture.started = 1;
+    g_nsys_prefill_capture.active = 1;
+    g_nsys_prefill_capture.chunk_pos = pos0;
+    g_nsys_prefill_capture.chunk_tokens = n_tokens;
+    fprintf(stderr,
+            "ds4: CUDA Nsight prefill capture started pos=%u tokens=%u\n",
+            pos0, n_tokens);
+}
+
+static void cuda_nsys_prefill_capture_stop(const char *reason) {
+    if (!g_nsys_prefill_capture.active || g_nsys_prefill_capture.stopped) return;
+
+    const cudaError_t err = cudaProfilerStop();
+    g_nsys_prefill_capture.active = 0;
+    g_nsys_prefill_capture.stopped = 1;
+    if (err == cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA Nsight prefill capture stopped pos=%u tokens=%u reason=%s\n",
+                g_nsys_prefill_capture.chunk_pos,
+                g_nsys_prefill_capture.chunk_tokens,
+                reason ? reason : "requested");
+    } else {
+        fprintf(stderr,
+                "ds4: CUDA Nsight prefill capture stop failed pos=%u tokens=%u: %s\n",
+                g_nsys_prefill_capture.chunk_pos,
+                g_nsys_prefill_capture.chunk_tokens,
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+    }
+}
+
+extern "C" void ds4_gpu_nvtx_range_push(const char *name, uint64_t payload) {
+    cuda_nvtx_push(name, payload);
+}
+
+extern "C" void ds4_gpu_nvtx_range_pop(void) {
+    cuda_nvtx_pop();
+}
+
+extern "C" void ds4_gpu_prefill_trace_begin(uint32_t pos0, uint32_t n_tokens) {
+    cuda_nsys_prefill_capture_maybe_start(pos0, n_tokens);
+    cuda_nvtx_push("ds4/prefill/chunk", cuda_nvtx_payload(pos0, n_tokens));
+}
+
+extern "C" void ds4_gpu_prefill_trace_end(
+        uint32_t pos0,
+        uint32_t n_tokens,
+        bool success) {
+    (void)pos0;
+    (void)n_tokens;
+    cuda_nvtx_pop();
+    cuda_nsys_prefill_capture_stop(success ? "chunk-complete" : "chunk-failed");
 }
 
 static uint64_t cuda_token_graph_timing_interval(void) {
@@ -11500,6 +11690,9 @@ extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
         uint32_t                head_dim,
         uint32_t                ratio,
         float                   scale) {
+    cuda_nvtx_scope scope("ds4/prefill/indexer/score",
+                          cuda_nvtx_payload(n_comp, n_tokens),
+                          n_tokens >= 128u);
     return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, 0,
                                  n_head, head_dim, ratio, scale, 1);
 }
@@ -11532,6 +11725,9 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
         return 0;
     }
+    cuda_nvtx_scope scope("ds4/prefill/indexer/topk",
+                          cuda_nvtx_payload(n_comp, n_tokens),
+                          n_tokens >= 128u && top_k == 512u);
     if (top_k == 1u && getenv("DS4_CUDA_NO_BATCHED_ARGMAX") == NULL) {
         /* DSpark K3 verifies three draft positions at once.  Falling through
          * to indexer_topk_kernel used one CUDA thread per 129280-wide row and
@@ -13721,6 +13917,10 @@ static int cuda_attention_tokentile_indexed_launch(
         return 0;
     }
 
+    cuda_nvtx_scope token_tile_scope(
+            "ds4/prefill/attention/token_tile/indexed",
+            cuda_nvtx_payload(n_comp, n_tokens));
+
     const uint32_t n_tiles = (n_tokens + kTTTileTokens - 1u) / kTTTileTokens;
     const uint32_t rec_stride = kTTTileTokens * top_k;
     const uint32_t n_mirror_rows = n_tokens + kTTRawWindow - 1u;
@@ -13775,26 +13975,42 @@ static int cuda_attention_tokentile_indexed_launch(
         hmma_smem_configured = 1;
     }
 
-    attention_tokentile_union_build_kernel<<<n_tiles, kTTThreads, bitmap_smem>>>(
-            records, counts, topk, NULL, pos0, n_tokens, top_k, ratio,
-            n_comp, rec_stride);
-    if (!cuda_ok(cudaGetLastError(), "attention token-tile union launch")) return -1;
-    attention_tokentile_raw_mirror_kernel<<<n_mirror_rows, 256>>>(
-            raw_mirror, (const float *)raw_kv->ptr, NULL, pos0, n_tokens,
-            raw_cap, raw_start, first_raw_pos, raw_row_min, head_dim);
-    if (!cuda_ok(cudaGetLastError(), "attention token-tile raw mirror launch")) return -1;
-    attention_tokentile_comp_mirror_kernel<<<n_comp, 256>>>(
-            comp_mirror, (const float *)comp_kv->ptr, n_comp, head_dim);
-    if (!cuda_ok(cudaGetLastError(), "attention token-tile comp mirror launch")) return -1;
+    {
+        cuda_nvtx_scope stage("ds4/prefill/attention/token_tile/union",
+                              cuda_nvtx_payload(n_comp, n_tokens));
+        attention_tokentile_union_build_kernel<<<n_tiles, kTTThreads, bitmap_smem>>>(
+                records, counts, topk, NULL, pos0, n_tokens, top_k, ratio,
+                n_comp, rec_stride);
+        if (!cuda_ok(cudaGetLastError(), "attention token-tile union launch")) return -1;
+    }
+    {
+        cuda_nvtx_scope stage("ds4/prefill/attention/token_tile/raw_mirror",
+                              cuda_nvtx_payload(n_mirror_rows, n_tokens));
+        attention_tokentile_raw_mirror_kernel<<<n_mirror_rows, 256>>>(
+                raw_mirror, (const float *)raw_kv->ptr, NULL, pos0, n_tokens,
+                raw_cap, raw_start, first_raw_pos, raw_row_min, head_dim);
+        if (!cuda_ok(cudaGetLastError(), "attention token-tile raw mirror launch")) return -1;
+    }
+    {
+        cuda_nvtx_scope stage("ds4/prefill/attention/token_tile/comp_mirror",
+                              cuda_nvtx_payload(n_comp, n_tokens));
+        attention_tokentile_comp_mirror_kernel<<<n_comp, 256>>>(
+                comp_mirror, (const float *)comp_kv->ptr, n_comp, head_dim);
+        if (!cuda_ok(cudaGetLastError(), "attention token-tile comp mirror launch")) return -1;
+    }
 
     dim3 grid(n_tiles, n_head / kTTG, 1);
-    attention_tokentile_hmma_kernel<<<grid, kTTThreads,
-            tt_TokentileSmemBudget<kTTStageRows, kTTG>::total>>>(
-            (float *)heads->ptr, sinks, (const float *)q->ptr,
-            raw_mirror, comp_mirror, records, counts, rec_stride,
-            n_tokens, n_head, raw_row_min);
-    if (!cuda_ok(cudaGetLastError(), "attention token-tile indexed HMMA launch")) {
-        return -1;
+    {
+        cuda_nvtx_scope stage("ds4/prefill/attention/token_tile/hmma",
+                              cuda_nvtx_payload(n_tiles, n_tokens));
+        attention_tokentile_hmma_kernel<<<grid, kTTThreads,
+                tt_TokentileSmemBudget<kTTStageRows, kTTG>::total>>>(
+                (float *)heads->ptr, sinks, (const float *)q->ptr,
+                raw_mirror, comp_mirror, records, counts, rec_stride,
+                n_tokens, n_head, raw_row_min);
+        if (!cuda_ok(cudaGetLastError(), "attention token-tile indexed HMMA launch")) {
+            return -1;
+        }
     }
     static int notice_printed;
     if (!notice_printed) {
@@ -13830,6 +14046,10 @@ static int cuda_attention_tokentile_dense_launch(
         !cuda_attention_tokentile_arch_ok()) {
         return 0;
     }
+
+    cuda_nvtx_scope token_tile_scope(
+            "ds4/prefill/attention/token_tile/dense",
+            cuda_nvtx_payload(n_comp, n_tokens));
 
     const uint32_t n_tiles = (n_tokens + kTTTileTokens - 1u) / kTTTileTokens;
     const uint32_t rec_stride = 32768u;
@@ -13872,27 +14092,41 @@ static int cuda_attention_tokentile_dense_launch(
         hmma_smem_configured = 1;
     }
 
-    attention_tokentile_dense_build_kernel<<<n_tiles, kTTThreads>>>(
-            records, counts, NULL, pos0, n_tokens, ratio, n_comp, rec_stride);
-    if (!cuda_ok(cudaGetLastError(), "attention token-tile dense build launch")) return -1;
-    attention_tokentile_raw_mirror_kernel<<<n_mirror_rows, 256>>>(
-            raw_mirror, (const float *)raw_kv->ptr, NULL, pos0, n_tokens,
-            raw_cap, raw_start, first_raw_pos, raw_row_min, head_dim);
-    if (!cuda_ok(cudaGetLastError(), "attention token-tile raw mirror launch")) return -1;
+    {
+        cuda_nvtx_scope stage("ds4/prefill/attention/token_tile/visible_rows",
+                              cuda_nvtx_payload(n_comp, n_tokens));
+        attention_tokentile_dense_build_kernel<<<n_tiles, kTTThreads>>>(
+                records, counts, NULL, pos0, n_tokens, ratio, n_comp, rec_stride);
+        if (!cuda_ok(cudaGetLastError(), "attention token-tile dense build launch")) return -1;
+    }
+    {
+        cuda_nvtx_scope stage("ds4/prefill/attention/token_tile/raw_mirror",
+                              cuda_nvtx_payload(n_mirror_rows, n_tokens));
+        attention_tokentile_raw_mirror_kernel<<<n_mirror_rows, 256>>>(
+                raw_mirror, (const float *)raw_kv->ptr, NULL, pos0, n_tokens,
+                raw_cap, raw_start, first_raw_pos, raw_row_min, head_dim);
+        if (!cuda_ok(cudaGetLastError(), "attention token-tile raw mirror launch")) return -1;
+    }
     if (n_comp != 0u) {
+        cuda_nvtx_scope stage("ds4/prefill/attention/token_tile/comp_mirror",
+                              cuda_nvtx_payload(n_comp, n_tokens));
         attention_tokentile_comp_mirror_kernel<<<n_comp, 256>>>(
                 comp_mirror, (const float *)comp_kv->ptr, n_comp, head_dim);
         if (!cuda_ok(cudaGetLastError(), "attention token-tile comp mirror launch")) return -1;
     }
 
     dim3 grid(n_tiles, n_head / kTTG, 1);
-    attention_tokentile_hmma_kernel<<<grid, kTTThreads,
-            tt_TokentileSmemBudget<kTTStageRows, kTTG>::total>>>(
-            (float *)heads->ptr, sinks, (const float *)q->ptr,
-            raw_mirror, comp_mirror, records, counts, rec_stride,
-            n_tokens, n_head, raw_row_min);
-    if (!cuda_ok(cudaGetLastError(), "attention token-tile mixed HMMA launch")) {
-        return -1;
+    {
+        cuda_nvtx_scope stage("ds4/prefill/attention/token_tile/hmma",
+                              cuda_nvtx_payload(n_tiles, n_tokens));
+        attention_tokentile_hmma_kernel<<<grid, kTTThreads,
+                tt_TokentileSmemBudget<kTTStageRows, kTTG>::total>>>(
+                (float *)heads->ptr, sinks, (const float *)q->ptr,
+                raw_mirror, comp_mirror, records, counts, rec_stride,
+                n_tokens, n_head, raw_row_min);
+        if (!cuda_ok(cudaGetLastError(), "attention token-tile mixed HMMA launch")) {
+            return -1;
+        }
     }
     static int notice_printed;
     if (!notice_printed) {
@@ -17732,6 +17966,10 @@ static int routed_moe_mmq_prefill_launch(
         return 0;
     }
 
+    cuda_nvtx_scope routed_scope(
+            "ds4/prefill/moe/routed",
+            cuda_nvtx_payload(n_tokens, n_expert));
+
     const uint64_t expected_gate_row =
         (uint64_t)(expert_in_dim / CUDA_QK_K) * sizeof(cuda_block_iq2_xxs);
     const uint64_t expected_down_row =
@@ -17765,11 +18003,15 @@ static int routed_moe_mmq_prefill_launch(
     if (mid_is_f16) *mid_is_f16 = false;
 
     const uint64_t out_values = (uint64_t)n_tokens * out_dim;
-    moe_mmq_sum_guard_kernel<<<
-            (uint32_t)((out_values + 255u) / 256u), 256, 0, stream>>>(
-            (float *)out->ptr, (const float *)down->ptr,
-            out_dim, n_expert, n_tokens);
-    if (cudaGetLastError() != cudaSuccess) return -2;
+    {
+        cuda_nvtx_scope stage("ds4/prefill/moe/sum",
+                              cuda_nvtx_payload(n_tokens, out_dim));
+        moe_mmq_sum_guard_kernel<<<
+                (uint32_t)((out_values + 255u) / 256u), 256, 0, stream>>>(
+                (float *)out->ptr, (const float *)down->ptr,
+                out_dim, n_expert, n_tokens);
+        if (cudaGetLastError() != cudaSuccess) return -2;
+    }
 
     if (!g_mmq_prefill_notice) {
         g_mmq_prefill_notice = 1;

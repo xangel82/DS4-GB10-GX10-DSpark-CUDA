@@ -177,6 +177,9 @@ echo "Context guard: physical=$CTX advertise=${ADVERTISE_CONTEXT_PCT}%"
 echo "DSpark scheduler: full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY"
 echo "DSpark sampling: lossless p/q rejection for top_k=0 top_p=1 min-p policy (rollback DS4_DSPARK_REJECTION_DISABLE=1)"
 echo "GB10 verifier: Q8 batch-reuse=${DS4_CUDA_Q8_BATCH_REUSE:-0}, Q4-sidecar direct-MoE=${DS4_CUDA_MOE_TINY_DIRECT_Q4_ONLY:-0}, tiny-TC=${DS4_CUDA_DSPARK_TENSOR_CORES:-0}, tiny-TC-Q8=${DS4_CUDA_DSPARK_TENSOR_CORES_Q8:-0}"
+if [[ "${DS4_CUDA_NVTX:-0}" == "1" || "${DS4_CUDA_NSYS_PREFILL_START_POS:-}" != "" ]]; then
+  echo "Profiling: NVTX=1 prefill-capture-start=${DS4_CUDA_NSYS_PREFILL_START_POS:-disabled}"
+fi
 echo "Server: http://0.0.0.0:$PORT"
 
 exec ./ds4-server \

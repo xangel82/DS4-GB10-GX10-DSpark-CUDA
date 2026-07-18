@@ -158,6 +158,8 @@ static int check_decode_attention_overflow_path(void) {
 
 int main(void) {
     if (!ds4_gpu_init()) return 1;
+    ds4_gpu_nvtx_range_push("ds4/regression/nvtx-link", 0);
+    ds4_gpu_nvtx_range_pop();
     int rc = check_large_topk();
     if (!ds4_gpu_mmq_prefill_self_test()) rc = 1;
     if (!ds4_gpu_attention_tokentile_self_test()) rc = 1;

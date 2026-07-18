@@ -97,6 +97,14 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
 
+/* CUDA/Nsight diagnostics. These calls enqueue no GPU work and are no-ops
+ * unless NVTX tracing is requested. The prefill helpers additionally delimit
+ * a one-shot CUDA Profiler API capture when configured by the environment. */
+void ds4_gpu_nvtx_range_push(const char *name, uint64_t payload);
+void ds4_gpu_nvtx_range_pop(void);
+void ds4_gpu_prefill_trace_begin(uint32_t pos0, uint32_t n_tokens);
+void ds4_gpu_prefill_trace_end(uint32_t pos0, uint32_t n_tokens, bool success);
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);

@@ -613,6 +613,56 @@ ds4: CUDA Nsight capture started pos=6000 tokens=20
 ds4: CUDA Nsight capture stopped after 20 tokens reason=window-complete
 ```
 
+### 8a. Trace NVTX one-shot del prefill
+
+Il backend CUDA include range NVTX gerarchici che non modificano il calcolo e
+non introducono sincronizzazioni. Sono inattivi nel server ordinario e vengono
+abilitati con `DS4_CUDA_NVTX=1`. Impostare
+`DS4_CUDA_NSYS_PREFILL_START_POS` abilita automaticamente NVTX e delimita con
+la CUDA Profiler API un solo chunk: viene scelto il primo chunk il cui `pos0`
+e' maggiore o uguale alla posizione richiesta. DS4 non riserva buffer host o
+device, non crea eventi CUDA e non copia tensori per questa telemetria; lo
+spazio del file `.nsys-rep` e' gestito esternamente da Nsight Systems.
+
+I range principali sono:
+
+```text
+ds4/prefill/chunk
+ds4/prefill/attention/{raw,ratio4,ratio128}
+ds4/prefill/indexer/{score,topk}
+ds4/prefill/attention/token_tile/{indexed,dense,union,visible_rows,raw_mirror,comp_mirror,hmma}
+ds4/prefill/ffn
+ds4/prefill/moe/{routed,mmq_fused,expert_map,input_quant_q8_1,iq2_gate_up_d2r,iq2_gate,iq2_up,swiglu_down_quant,q2_down,sum}
+```
+
+Per catturare, per esempio, il chunk che parte da 32768 token, avviare il
+server sotto Nsight Systems e poi inviare da un altro terminale un prompt che
+superi 40960 token:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && /usr/local/cuda/bin/nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi --capture-range-end=stop-shutdown --kill=none --force-overwrite=true -o /tmp/ds4-prefill-pos32768 /usr/bin/env DS4_CUDA_NSYS_PREFILL_START_POS=32768 ./run-dspark-server.sh 2>&1 | tee /tmp/ds4-prefill-pos32768.log
+```
+
+Log attesi:
+
+```text
+ds4: CUDA Nsight prefill capture started pos=32768 tokens=8192
+ds4: CUDA Nsight prefill capture stopped pos=32768 tokens=8192 reason=chunk-complete
+```
+
+I tre riepiloghi utili si ottengono in una sola riga:
+
+```bash
+/usr/local/cuda/bin/nsys stats --report nvtx_gpu_proj_sum,nvtx_kern_sum,cuda_gpu_kern_sum /tmp/ds4-prefill-pos32768.nsys-rep
+```
+
+`nvtx_gpu_proj_sum` attribuisce il tempo GPU ai macro-stage; `nvtx_kern_sum`
+mostra quali kernel compongono ciascun range; `cuda_gpu_kern_sum` resta il
+controllo indipendente per il totale dei kernel. Payload NVTX e nomi sono
+statici: non vengono formattate stringhe nel percorso caldo. I token/s del run
+profilato non sono un benchmark, mentre il run senza le variabili diagnostiche
+mantiene NVTX disattivato.
+
 ### 9. Nsight Compute e permessi dei contatori
 
 `ncu` usa i performance counter hardware, che sul driver NVIDIA 580 della

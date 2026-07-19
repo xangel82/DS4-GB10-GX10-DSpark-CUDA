@@ -32,6 +32,39 @@ Il riferimento validato prima dell'ultimo intervento attention è circa
 24,5K–57,3K sono stati misurati circa `425,9 t/s`; il decode DSpark a 83K ha
 prodotto 401 token a `23,00 t/s`.
 
+### Fast path MoE aligned del verifier DSpark validato
+
+Il verifier target con batch `N=2..6` usa ora un kernel aligned dedicato a
+GB10. Gate/up conserva la riduzione quarter-warp precedente, ma calcola i
+segni IQ2 validati nei registri, copia le attivazioni Q8_K in shared memory con
+accessi coalescenti e porta il row span da 128 a 256. Il down carica una sola
+volta le sei attivazioni Q8_K per CTA e le riusa su due wave da 32 righe; le
+scale Q2_K restano in registri durante il dot product.
+
+Il dispatch e' limitato strutturalmente a `N=2..6`. Il decode target `N=1`, il
+drafter Q4 DSpark e il prefill con piu' di 16 token conservano i rispettivi
+percorsi precedenti. Non sono state aggiunte allocazioni persistenti o flag.
+La regressione Athena `sm_121a` ha esercitato tutte le cinque forme e ha
+confermato un risultato bit-identico al kernel aligned precedente:
+
+```text
+cuda-regression: GB10 aligned MoE verifier N=2..6 parity max=0 bad=0
+cuda long-context regression: OK
+```
+
+Nel run end-to-end successivo il decode DSpark ha misurato `29,24 t/s` a
+27,7K token, `26,47 t/s` a 63,5K e `25,26 t/s` a 88,8K. Contenuto e acceptance
+non rendono questi valori un A/B isolato, ma sui contesti confrontabili il
+guadagno osservato rispetto ai riferimenti precedenti e' nell'ordine del
+5–9%. Il prefill non ha mostrato regressioni: i due chunk centrali del cold
+prefill 25K hanno prodotto `856,25` e `839,38 t/s`, circa `847,8 t/s` medi.
+
+Log di attivazione atteso alla prima verifica speculativa:
+
+```text
+ds4: CUDA GB10 aligned MoE verifier enabled (computed IQ2 signs, coalesced Q8 staging, sum6 row span=64)
+```
+
 ### Token-tile HMMA: gate prestazionale superato
 
 Il worktree corrente aggiunge token-tile HMMA per l'attenzione prefill:

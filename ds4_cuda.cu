@@ -168,8 +168,8 @@ static_assert(offsetof(cuda_block_q2_K, scales) == 0 &&
 #include "ds4_iq2_tables_cuda.inc"
 
 /* The canonical IQ2 grid lives in constant memory for scalar lookup paths.
- * The GB10 decode kernel stages a byte-identical global-memory copy into
- * shared memory with coalesced warp loads. */
+ * The GB10 decode and small-batch verifier kernels stage a byte-identical
+ * global-memory copy into shared memory with coalesced warp loads. */
 __device__ static uint64_t cuda_iq2xxs_grid_global[256];
 
 static const void *g_model_host_base;
@@ -208,6 +208,7 @@ static const void *g_moe_aligned_host_base;
 static uint64_t g_moe_aligned_model_size;
 static int g_moe_aligned_ready;
 static int g_moe_aligned_notice;
+static int g_moe_aligned_small_batch_notice;
 static int g_moe_complete_fused_notice;
 static constexpr uint32_t DS4_MMQ_PREFILL_MIN_TOKENS = 1024u;
 static void *g_cublas_workspace;
@@ -532,6 +533,7 @@ static void cuda_moe_aligned_clear(void) {
     g_moe_aligned_model_size = 0;
     g_moe_aligned_ready = 0;
     g_moe_aligned_notice = 0;
+    g_moe_aligned_small_batch_notice = 0;
     g_moe_complete_fused_notice = 0;
 }
 
@@ -2898,9 +2900,10 @@ extern "C" int ds4_gpu_init(void) {
     if (getenv("DS4_CUDA_Q8_U16_LOADS") != NULL) {
         (void)cuda_q8_u16_validate();
     }
-    if (getenv("DS4_CUDA_MOE_DECODE_GB10") != NULL) {
-        (void)cuda_moe_gb10_validate_signs();
-    }
+    /* The aligned verifier path is the default target MoE path for DSpark
+     * K+1 batches, so prepare its byte-identical IQ2 lookup table before any
+     * CUDA graph capture starts. */
+    (void)cuda_moe_gb10_validate_signs();
     return 1;
 }
 
@@ -6009,8 +6012,8 @@ static int cuda_moe_gb10_validate_signs(void) {
 
     g_moe_gb10_sign_validation = 1;
     fprintf(stderr,
-            "ds4: CUDA GB10 MoE decode enabled "
-            "(computed IQ2 signs, row span=256, 128/128 exact)\n");
+            "ds4: CUDA GB10 IQ2 computed-sign path ready "
+            "(global grid, 128/128 exact)\n");
     return 1;
 }
 
@@ -16049,7 +16052,8 @@ __device__ static float dev_dot_iq2_xxs_q8_K_block(const cuda_block_iq2_xxs *x, 
  * separates the half scale from the eight uint2 code words but keeps the raw
  * expert/row/block order, so this reproduces the established Q8_K decode dot
  * without rebuilding a 66-byte block or keeping a second weight layout. */
-__device__ static float dev_dot_iq2_xxs_aligned_q8_K_block_lut(
+template <bool COMPUTED_SIGNS>
+__device__ static float dev_dot_iq2_xxs_aligned_q8_K_block_lut_impl(
         const __half *dq,
         const uint2 *qs,
         uint64_t blk,
@@ -16066,16 +16070,16 @@ __device__ static float dev_dot_iq2_xxs_aligned_q8_K_block_lut(
         const uint32_t aux1 = code.y;
         const int32_t ls = (int32_t)(2u * (aux1 >> 28) + 1u);
         int32_t w[8];
-        dev_iq2_i8x8_lut_impl<false>(grid, signs,
+        dev_iq2_i8x8_lut_impl<COMPUTED_SIGNS>(grid, signs,
                                      (uint8_t)(aux0 & 0xffu),
                                      (aux1 >> 0) & 127u, &w[0], &w[1]);
-        dev_iq2_i8x8_lut_impl<false>(grid, signs,
+        dev_iq2_i8x8_lut_impl<COMPUTED_SIGNS>(grid, signs,
                                      (uint8_t)((aux0 >> 8) & 0xffu),
                                      (aux1 >> 7) & 127u, &w[2], &w[3]);
-        dev_iq2_i8x8_lut_impl<false>(grid, signs,
+        dev_iq2_i8x8_lut_impl<COMPUTED_SIGNS>(grid, signs,
                                      (uint8_t)((aux0 >> 16) & 0xffu),
                                      (aux1 >> 14) & 127u, &w[4], &w[5]);
-        dev_iq2_i8x8_lut_impl<false>(grid, signs,
+        dev_iq2_i8x8_lut_impl<COMPUTED_SIGNS>(grid, signs,
                                      (uint8_t)((aux0 >> 24) & 0xffu),
                                      (aux1 >> 21) & 127u, &w[6], &w[7]);
         int32_t sumi = 0;
@@ -16090,6 +16094,27 @@ __device__ static float dev_dot_iq2_xxs_aligned_q8_K_block_lut(
         bsum += sumi * ls;
     }
     return 0.125f * xd * y->d * (float)bsum;
+}
+
+__device__ static float dev_dot_iq2_xxs_aligned_q8_K_block_lut(
+        const __half *dq,
+        const uint2 *qs,
+        uint64_t blk,
+        const cuda_block_q8_K *y,
+        const uint64_t *grid,
+        const uint8_t *signs) {
+    return dev_dot_iq2_xxs_aligned_q8_K_block_lut_impl<false>(
+            dq, qs, blk, y, grid, signs);
+}
+
+__device__ static float dev_dot_iq2_xxs_aligned_q8_K_block_computed_signs(
+        const __half *dq,
+        const uint2 *qs,
+        uint64_t blk,
+        const cuda_block_q8_K *y,
+        const uint64_t *grid) {
+    return dev_dot_iq2_xxs_aligned_q8_K_block_lut_impl<true>(
+            dq, qs, blk, y, grid, NULL);
 }
 
 __device__ static void dev_dot_iq2_xxs_q8_K_block8_deq_lut(
@@ -16442,15 +16467,15 @@ __device__ __forceinline__ static uint32_t dev_q2_aligned_row_word(
     return parity ? v.y : v.x;
 }
 
-__device__ __forceinline__ static uint8_t dev_q2_aligned_scale(
-        const int4 *sc4,
-        uint64_t pblk,
-        uint32_t parity,
+__device__ __forceinline__ static uint8_t dev_q2_aligned_scale_cached(
+        uint32_t sc0,
+        uint32_t sc1,
+        uint32_t sc2,
+        uint32_t sc3,
         uint32_t index) {
-    const int4 v = sc4[pblk * 2u + (index >> 3u)];
-    const uint32_t lo = parity ? (uint32_t)v.z : (uint32_t)v.x;
-    const uint32_t hi = parity ? (uint32_t)v.w : (uint32_t)v.y;
-    const uint32_t word = (index & 7u) < 4u ? lo : hi;
+    const uint32_t word = index < 4u ? sc0 :
+                          index < 8u ? sc1 :
+                          index < 12u ? sc2 : sc3;
     return (uint8_t)(word >> ((index & 3u) * 8u));
 }
 
@@ -16481,10 +16506,20 @@ __device__ static float dev_dot_q2_K_aligned_q8_K_block(
         uint64_t pblk,
         uint32_t parity,
         const cuda_block_q8_K *y) {
+    /* Each logical Q2_K block owns exactly 16 scale bytes. Keep their four
+     * packed words in registers instead of reloading the two int4 records for
+     * every bsums and dot-product term. */
+    const int4 scales_lo = sc4[pblk * 2u];
+    const int4 scales_hi = sc4[pblk * 2u + 1u];
+    const uint32_t sc0 = parity ? (uint32_t)scales_lo.z : (uint32_t)scales_lo.x;
+    const uint32_t sc1 = parity ? (uint32_t)scales_lo.w : (uint32_t)scales_lo.y;
+    const uint32_t sc2 = parity ? (uint32_t)scales_hi.z : (uint32_t)scales_hi.x;
+    const uint32_t sc3 = parity ? (uint32_t)scales_hi.w : (uint32_t)scales_hi.y;
     int summs = 0;
     #pragma unroll
     for (uint32_t j = 0; j < 16u; j++) {
-        summs += y->bsums[j] * (dev_q2_aligned_scale(sc4, pblk, parity, j) >> 4u);
+        summs += y->bsums[j] *
+                 (dev_q2_aligned_scale_cached(sc0, sc1, sc2, sc3, j) >> 4u);
     }
 
     const uint2 dm_pair = dm2[pblk];
@@ -16499,10 +16534,12 @@ __device__ static float dev_dot_q2_K_aligned_q8_K_block(
         int shift = 0;
         #pragma unroll
         for (uint32_t j = 0; j < 4u; j++) {
-            int d = dev_q2_aligned_scale(sc4, pblk, parity, is++) & 0x0f;
+            int d = dev_q2_aligned_scale_cached(
+                    sc0, sc1, sc2, sc3, is++) & 0x0f;
             isum += d * dev_dot_q2_aligned_16(
                     qs2, pblk, parity, k * 8u, q8, shift);
-            d = dev_q2_aligned_scale(sc4, pblk, parity, is++) & 0x0f;
+            d = dev_q2_aligned_scale_cached(
+                    sc0, sc1, sc2, sc3, is++) & 0x0f;
             isum += d * dev_dot_q2_aligned_16(
                     qs2, pblk, parity, k * 8u + 4u, q8 + 16u, shift);
             shift += 2;
@@ -16737,6 +16774,79 @@ __global__ static void moe_gate_up_mid_aligned_q8K_qwarp32_kernel(
     }
 }
 
+/* GB10 small-batch variant of the aligned gate/up kernel. It preserves the
+ * quarter-warp dot/reduction order, while coalescing Q8_K staging, deriving
+ * the validated IQ2 signs in registers, and amortizing one CTA over 256 rows. */
+__global__ static void moe_gate_up_mid_aligned_q8K_gb10_kernel(
+        float *mid_out,
+        const __half *gate_dq,
+        const uint2 *gate_qs,
+        const __half *up_dq,
+        const uint2 *up_qs,
+        const cuda_block_q8_K *xq,
+        const int32_t *selected,
+        const float *weights,
+        uint32_t xq_blocks,
+        uint32_t expert_mid_dim,
+        uint32_t n_total_expert,
+        uint32_t n_expert,
+        float clamp) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t pair = blockIdx.y;
+    const uint32_t tok = pair / n_expert;
+    const int32_t expert_i = selected[pair];
+    const bool valid = expert_i >= 0 && (uint32_t)expert_i < n_total_expert;
+    const uint32_t expert = valid ? (uint32_t)expert_i : 0u;
+    const cuda_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+
+    __shared__ uint32_t sxq_words[
+        16u * sizeof(cuda_block_q8_K) / sizeof(uint32_t)];
+    __shared__ uint64_t s_iq2_grid[256];
+    if (xq_blocks <= 16u) {
+        const uint32_t nwords =
+            xq_blocks * sizeof(cuda_block_q8_K) / sizeof(uint32_t);
+        const uint32_t *src = reinterpret_cast<const uint32_t *>(xqb);
+        for (uint32_t i = threadIdx.x; i < nwords; i += blockDim.x) {
+            sxq_words[i] = src[i];
+        }
+    }
+    for (uint32_t i = threadIdx.x; i < 256u; i += blockDim.x) {
+        s_iq2_grid[i] = cuda_iq2xxs_grid_global[i];
+    }
+    __syncthreads();
+    if (xq_blocks <= 16u) {
+        xqb = reinterpret_cast<const cuda_block_q8_K *>(sxq_words);
+    }
+
+    #pragma unroll 1
+    for (uint32_t rr = 0; rr < 8u; rr++) {
+        const uint32_t row = blockIdx.x * 256u + row_lane + rr * 32u;
+        if (row >= expert_mid_dim) continue;
+        float gate = 0.0f;
+        float up = 0.0f;
+        for (uint32_t b = lane; valid && b < xq_blocks; b += 8u) {
+            const uint64_t blk =
+                ((uint64_t)expert * expert_mid_dim + row) * xq_blocks + b;
+            gate += dev_dot_iq2_xxs_aligned_q8_K_block_computed_signs(
+                    gate_dq, gate_qs, blk, xqb + b, s_iq2_grid);
+            up += dev_dot_iq2_xxs_aligned_q8_K_block_computed_signs(
+                    up_dq, up_qs, blk, xqb + b, s_iq2_grid);
+        }
+        gate = quarter_warp_sum_f32(gate, lane);
+        up = quarter_warp_sum_f32(up, lane);
+        if (lane == 0u) {
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+            mid_out[off] = (gate / (1.0f + expf(-gate))) * up * weights[pair];
+        }
+    }
+}
+
 __global__ static void moe_down_aligned_q8K_sum6_qwarp32_kernel(
         float *out,
         const uint2 *dm2,
@@ -16774,6 +16884,74 @@ __global__ static void moe_down_aligned_q8K_sum6_qwarp32_kernel(
         if (lane == 0u) total += acc;
     }
     if (lane == 0u) out[(uint64_t)tok * out_dim + row] = total;
+}
+
+/* Every output row in a token CTA consumes the same six Q8_K activation
+ * vectors. Stage them once instead of asking all 32 quarter-warps to reload
+ * them independently. Two 32-row waves reuse the same staging, while dynamic
+ * shared memory keeps the production footprint at 6 * 8 Q8_K blocks for
+ * Flash and retains a global-memory fallback. */
+__global__ static void moe_down_aligned_q8K_sum6_gb10_kernel(
+        float *out,
+        const uint2 *dm2,
+        const int4 *sc4,
+        const uint2 *qs2,
+        const cuda_block_q8_K *midq,
+        const int32_t *selected,
+        uint32_t midq_blocks,
+        uint32_t out_dim,
+        uint32_t n_tokens,
+        uint32_t n_total_expert) {
+    const uint32_t lane = threadIdx.x & 7u;
+    const uint32_t row_lane = threadIdx.x >> 3u;
+    const uint32_t tok = blockIdx.y;
+    if (tok >= n_tokens) return;
+
+    const cuda_block_q8_K *token_midq =
+        midq + (uint64_t)tok * 6u * midq_blocks;
+    extern __shared__ uint32_t smidq_words[];
+    if (midq_blocks <= 16u) {
+        const uint32_t nwords = 6u * midq_blocks *
+            sizeof(cuda_block_q8_K) / sizeof(uint32_t);
+        const uint32_t *src = reinterpret_cast<const uint32_t *>(token_midq);
+        for (uint32_t i = threadIdx.x; i < nwords; i += blockDim.x) {
+            smidq_words[i] = src[i];
+        }
+    }
+    __syncthreads();
+    if (midq_blocks <= 16u) {
+        token_midq = reinterpret_cast<const cuda_block_q8_K *>(smidq_words);
+    }
+
+    #pragma unroll 1
+    for (uint32_t rr = 0; rr < 2u; rr++) {
+        const uint32_t row = blockIdx.x * 64u + row_lane + rr * 32u;
+        if (row >= out_dim) continue;
+        const uint32_t row_pair = row >> 1u;
+        const uint32_t parity = row & 1u;
+        float total = 0.0f;
+        #pragma unroll
+        for (uint32_t slot = 0; slot < 6u; slot++) {
+            const uint32_t assignment = tok * 6u + slot;
+            const int32_t expert_i = selected[assignment];
+            const bool valid =
+                expert_i >= 0 && (uint32_t)expert_i < n_total_expert;
+            const uint32_t expert = valid ? (uint32_t)expert_i : 0u;
+            const cuda_block_q8_K *xq =
+                token_midq + (uint64_t)slot * midq_blocks;
+            float acc = 0.0f;
+            for (uint32_t b = lane; valid && b < midq_blocks; b += 8u) {
+                const uint64_t pblk =
+                    ((uint64_t)expert * (out_dim / 2u) + row_pair) *
+                    midq_blocks + b;
+                acc += dev_dot_q2_K_aligned_q8_K_block(
+                        dm2, sc4, qs2, pblk, parity, xq + b);
+            }
+            acc = quarter_warp_sum_f32(acc, lane);
+            if (lane == 0u) total += acc;
+        }
+        if (lane == 0u) out[(uint64_t)tok * out_dim + row] = total;
+    }
 }
 
 __global__ static DS4_CUDA_UNUSED void moe_gate_up_mid_kernel(
@@ -18993,6 +19171,9 @@ static int routed_moe_aligned_launch(
     int rc = 0;
     bool output_summed = false;
     if (n_tokens <= 16u) {
+        const bool use_gb10_small_batch =
+            n_tokens >= 2u && n_tokens <= 6u &&
+            g_moe_gb10_sign_validation == 1;
         const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
         const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
         const uint64_t xq_bytes =
@@ -19017,13 +19198,25 @@ static int routed_moe_aligned_launch(
         const __half *up_dq = (const __half *)up_art->device_ptr;
         const uint2 *up_qs = (const uint2 *)(
                 (const char *)up_art->device_ptr + iq2_dq_bytes);
-        moe_gate_up_mid_aligned_q8K_qwarp32_kernel<<<
-                dim3((expert_mid_dim + 127u) / 128u, n_tokens * n_expert),
-                256, 0, stream>>>(
-                (float *)mid->ptr,
-                gate_dq, gate_qs, up_dq, up_qs,
-                xq, selected, weights,
-                xq_blocks, expert_mid_dim, n_total_expert, n_expert, clamp);
+        if (use_gb10_small_batch) {
+            moe_gate_up_mid_aligned_q8K_gb10_kernel<<<
+                    dim3((expert_mid_dim + 255u) / 256u,
+                         n_tokens * n_expert),
+                    256, 0, stream>>>(
+                    (float *)mid->ptr,
+                    gate_dq, gate_qs, up_dq, up_qs,
+                    xq, selected, weights,
+                    xq_blocks, expert_mid_dim, n_total_expert, n_expert, clamp);
+        } else {
+            moe_gate_up_mid_aligned_q8K_qwarp32_kernel<<<
+                    dim3((expert_mid_dim + 127u) / 128u,
+                         n_tokens * n_expert),
+                    256, 0, stream>>>(
+                    (float *)mid->ptr,
+                    gate_dq, gate_qs, up_dq, up_qs,
+                    xq, selected, weights,
+                    xq_blocks, expert_mid_dim, n_total_expert, n_expert, clamp);
+        }
         if (cudaGetLastError() != cudaSuccess) return -4;
 
         q8_K_quantize_kernel<<<
@@ -19041,11 +19234,28 @@ static int routed_moe_aligned_launch(
                 (const char *)down_art->device_ptr + q2_dm_bytes);
         const uint2 *qs2 = (const uint2 *)(
                 (const char *)down_art->device_ptr + q2_dm_bytes + q2_sc_bytes);
-        moe_down_aligned_q8K_sum6_qwarp32_kernel<<<
-                dim3((out_dim + 31u) / 32u, n_tokens), 256, 0, stream>>>(
-                (float *)out->ptr, dm2, sc4, qs2, midq, selected,
-                midq_blocks, out_dim, n_tokens, n_total_expert);
+        if (use_gb10_small_batch) {
+            const size_t smem_bytes = midq_blocks <= 16u
+                ? (size_t)6u * midq_blocks * sizeof(cuda_block_q8_K)
+                : 0u;
+            moe_down_aligned_q8K_sum6_gb10_kernel<<<
+                    dim3((out_dim + 63u) / 64u, n_tokens),
+                    256, smem_bytes, stream>>>(
+                    (float *)out->ptr, dm2, sc4, qs2, midq, selected,
+                    midq_blocks, out_dim, n_tokens, n_total_expert);
+        } else {
+            moe_down_aligned_q8K_sum6_qwarp32_kernel<<<
+                    dim3((out_dim + 31u) / 32u, n_tokens), 256, 0, stream>>>(
+                    (float *)out->ptr, dm2, sc4, qs2, midq, selected,
+                    midq_blocks, out_dim, n_tokens, n_total_expert);
+        }
         if (cudaGetLastError() != cudaSuccess) return -6;
+        if (use_gb10_small_batch && !g_moe_aligned_small_batch_notice) {
+            g_moe_aligned_small_batch_notice = 1;
+            fprintf(stderr,
+                    "ds4: CUDA GB10 aligned MoE verifier enabled "
+                    "(computed IQ2 signs, coalesced Q8 staging, sum6 row span=64)\n");
+        }
         output_summed = true;
     } else {
         const bool materialize_intermediates =
@@ -20012,7 +20222,10 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
     std::vector<float> out_direct_host((uint64_t)16u * out_dim);
     std::vector<float> out_soa_prefix_host((uint64_t)16u * out_dim);
     std::vector<float> out_q8k_host((uint64_t)16u * out_dim);
+    std::vector<float> out_q8k_gb10_host((uint64_t)6u * out_dim);
     std::vector<float> out_ref_prefix_host((uint64_t)16u * out_dim);
+    uint64_t q8k_gb10_bad = 0;
+    double q8k_gb10_max_abs = 0.0;
 
     uint32_t rng = 0x6d2b79f5u;
     auto next_u32 = [&rng]() -> uint32_t {
@@ -20325,6 +20538,79 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
                (uint64_t)16u * out_dim * sizeof(float));
     }
 
+    /* Exercise every target-verifier width used by DSpark. The optimized
+     * kernels retain the old aligned kernel above as their numerical oracle;
+     * all five shapes must agree at the same strict production tolerance. */
+    if (ok) ok = cuda_moe_gb10_validate_signs();
+    for (uint32_t verifier_tokens = 2u;
+         ok && verifier_tokens <= 6u;
+         verifier_tokens++) {
+        moe_gate_up_mid_aligned_q8K_gb10_kernel<<<
+                dim3((mid_dim + 255u) / 256u,
+                     verifier_tokens * n_expert),
+                256, 0, stream>>>(
+                (float *)mid_mmq->ptr,
+                (const __half *)gate_soa->ptr,
+                (const uint2 *)((const char *)gate_soa->ptr + iq2_dq_bytes),
+                (const __half *)up_soa->ptr,
+                (const uint2 *)((const char *)up_soa->ptr + iq2_dq_bytes),
+                (const cuda_block_q8_K *)xq->ptr,
+                (const int32_t *)selected->ptr,
+                (const float *)weights->ptr,
+                in_dim / CUDA_QK_K, mid_dim, n_total_expert, n_expert,
+                test_clamp);
+        ok = cudaGetLastError() == cudaSuccess;
+        if (ok) {
+            q8_K_quantize_kernel<<<
+                    dim3(mid_dim / CUDA_QK_K,
+                         verifier_tokens * n_expert),
+                    256, 0, stream>>>(
+                    (cuda_block_q8_K *)midq->ptr,
+                    (const float *)mid_mmq->ptr,
+                    mid_dim, verifier_tokens * n_expert);
+            ok = cudaGetLastError() == cudaSuccess;
+        }
+        if (ok) {
+            const size_t smem_bytes = (size_t)6u *
+                (mid_dim / CUDA_QK_K) * sizeof(cuda_block_q8_K);
+            moe_down_aligned_q8K_sum6_gb10_kernel<<<
+                    dim3((out_dim + 63u) / 64u, verifier_tokens),
+                    256, smem_bytes, stream>>>(
+                    (float *)out_mmq->ptr,
+                    (const uint2 *)down_soa->ptr,
+                    (const int4 *)((const char *)down_soa->ptr + q2_dm_bytes),
+                    (const uint2 *)((const char *)down_soa->ptr +
+                                    q2_dm_bytes + q2_sc_bytes),
+                    (const cuda_block_q8_K *)midq->ptr,
+                    (const int32_t *)selected->ptr,
+                    mid_dim / CUDA_QK_K, out_dim,
+                    verifier_tokens, n_total_expert);
+            ok = cudaGetLastError() == cudaSuccess &&
+                 cudaStreamSynchronize(stream) == cudaSuccess;
+        }
+        const uint64_t verifier_values = (uint64_t)verifier_tokens * out_dim;
+        if (ok) {
+            ok = ds4_gpu_tensor_read(
+                    out_mmq, 0, out_q8k_gb10_host.data(),
+                    verifier_values * sizeof(float));
+        }
+        if (ok) {
+            for (uint64_t i = 0; i < verifier_values; i++) {
+                const double ref = (double)out_q8k_host[i];
+                const double candidate = (double)out_q8k_gb10_host[i];
+                const double ae = fabs(candidate - ref);
+                const double re = fabs(ref) > 1.0e-12
+                    ? ae / fabs(ref)
+                    : (ae > 0.0 ? INFINITY : 0.0);
+                q8k_gb10_max_abs = fmax(q8k_gb10_max_abs, ae);
+                if (!isfinite(candidate) ||
+                    (ae > 1.0e-6 && re > 1.0e-6)) {
+                    ++q8k_gb10_bad;
+                }
+            }
+        }
+    }
+
     if (ok) {
         /* The established kernel stores gate/up after applying clamp, while
          * MMQ leaves both projections raw and clamps in the weighted SwiGLU
@@ -20433,6 +20719,11 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
                 q8k_out_stats.relative_rmse,
                 q8k_out_stats.max_abs,
                 (unsigned long long)q8k_out_stats.bad);
+        fprintf(stderr,
+                "cuda-regression: GB10 aligned MoE verifier N=2..6 parity "
+                "max=%.8g bad=%llu\n",
+                q8k_gb10_max_abs,
+                (unsigned long long)q8k_gb10_bad);
         parity_reported = 1;
         ok = gate_stats.bad == 0 && up_stats.bad == 0 &&
              mid_stats.relative_rmse < 0.10 && out_stats.relative_rmse < 0.10 &&
@@ -20442,7 +20733,7 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
              fused_direct_stats.relative_rmse < 1.0e-3 &&
              fused_direct_stats.bad == 0 &&
              direct_out_stats.relative_rmse < 0.05 &&
-             q8k_out_stats.bad == 0;
+             q8k_out_stats.bad == 0 && q8k_gb10_bad == 0;
     }
 
     if (!ok && !parity_reported) {

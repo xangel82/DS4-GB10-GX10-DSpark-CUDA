@@ -18325,9 +18325,11 @@ static bool cuda_prefill_nvtx_enabled(void) {
     if (enabled < 0) {
         const char *nvtx = getenv("DS4_CUDA_NVTX");
         const char *capture = getenv("DS4_CUDA_NSYS_PREFILL_START_POS");
+        const char *captures = getenv("DS4_CUDA_NSYS_PREFILL_START_POSITIONS");
         const char *decode_capture = getenv("DS4_CUDA_NSYS_CAPTURE_START_POS");
         enabled = (nvtx != NULL && strcmp(nvtx, "1") == 0) ||
                   (capture != NULL && capture[0] != '\0') ||
+                  (captures != NULL && captures[0] != '\0') ||
                   (decode_capture != NULL && decode_capture[0] != '\0');
     }
     return enabled != 0;

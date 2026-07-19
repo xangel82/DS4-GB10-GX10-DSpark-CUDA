@@ -47,9 +47,11 @@ static int cuda_nvtx_requested(void) {
     if (enabled < 0) {
         const char *nvtx = getenv("DS4_CUDA_NVTX");
         const char *capture = getenv("DS4_CUDA_NSYS_PREFILL_START_POS");
+        const char *captures = getenv("DS4_CUDA_NSYS_PREFILL_START_POSITIONS");
         const char *decode_capture = getenv("DS4_CUDA_NSYS_CAPTURE_START_POS");
         enabled = (nvtx != NULL && strcmp(nvtx, "1") == 0) ||
                   (capture != NULL && capture[0] != '\0') ||
+                  (captures != NULL && captures[0] != '\0') ||
                   (decode_capture != NULL && decode_capture[0] != '\0');
     }
     return enabled;
@@ -340,7 +342,9 @@ struct cuda_nsys_prefill_capture_state {
     int started;
     int active;
     int stopped;
-    uint32_t start_pos;
+    uint32_t start_positions[16];
+    uint32_t start_count;
+    uint32_t start_index;
     uint32_t chunk_pos;
     uint32_t chunk_tokens;
 };
@@ -3162,6 +3166,8 @@ static int cuda_token_graph_pipeline_allowed(void) {
     if (getenv("DS4_CUDA_NSYS_CAPTURE_START_POS") != NULL) return 0;
     const char *prefill_capture = getenv("DS4_CUDA_NSYS_PREFILL_START_POS");
     if (prefill_capture != NULL && prefill_capture[0] != '\0') return 0;
+    prefill_capture = getenv("DS4_CUDA_NSYS_PREFILL_START_POSITIONS");
+    if (prefill_capture != NULL && prefill_capture[0] != '\0') return 0;
     return 1;
 }
 
@@ -3310,7 +3316,10 @@ static void cuda_nsys_prefill_capture_init(void) {
     if (g_nsys_prefill_capture.initialized) return;
     g_nsys_prefill_capture.initialized = 1;
 
-    const char *start_env = getenv("DS4_CUDA_NSYS_PREFILL_START_POS");
+    const char *start_env = getenv("DS4_CUDA_NSYS_PREFILL_START_POSITIONS");
+    if (!start_env || !start_env[0]) {
+        start_env = getenv("DS4_CUDA_NSYS_PREFILL_START_POS");
+    }
     if (!start_env || !start_env[0]) return;
     if (getenv("DS4_CUDA_NSYS_CAPTURE_START_POS") != NULL) {
         fprintf(stderr,
@@ -3320,17 +3329,46 @@ static void cuda_nsys_prefill_capture_init(void) {
         return;
     }
 
-    char *end = NULL;
-    const unsigned long long start = strtoull(start_env, &end, 10);
-    if (end == start_env || *end != '\0' || start > UINT32_MAX) {
+    const char *cursor = start_env;
+    uint32_t previous = 0;
+    while (*cursor) {
+        if (g_nsys_prefill_capture.start_count ==
+            sizeof(g_nsys_prefill_capture.start_positions) /
+                sizeof(g_nsys_prefill_capture.start_positions[0])) {
+            fprintf(stderr,
+                    "ds4: too many Nsight prefill capture positions in %s; disabled\n",
+                    start_env);
+            g_nsys_prefill_capture.stopped = 1;
+            return;
+        }
+        errno = 0;
+        char *end = NULL;
+        const unsigned long long start = strtoull(cursor, &end, 10);
+        if (errno == ERANGE || end == cursor || start > UINT32_MAX ||
+            (*end != '\0' && *end != ',') ||
+            (g_nsys_prefill_capture.start_count != 0u && start <= previous) ||
+            (*end == ',' && end[1] == '\0')) {
+            fprintf(stderr,
+                    "ds4: invalid Nsight prefill capture positions=%s; "
+                    "expected a strictly increasing comma-separated list\n",
+                    start_env);
+            g_nsys_prefill_capture.stopped = 1;
+            return;
+        }
+        g_nsys_prefill_capture.start_positions[
+            g_nsys_prefill_capture.start_count++] = (uint32_t)start;
+        previous = (uint32_t)start;
+        if (*end == '\0') break;
+        cursor = end + 1;
+    }
+    if (g_nsys_prefill_capture.start_count == 0u) {
         fprintf(stderr,
-                "ds4: invalid Nsight prefill capture start=%s; disabled\n",
+                "ds4: invalid Nsight prefill capture positions=%s; disabled\n",
                 start_env);
         g_nsys_prefill_capture.stopped = 1;
         return;
     }
 
-    g_nsys_prefill_capture.start_pos = (uint32_t)start;
     g_nsys_prefill_capture.enabled = 1;
 #if !DS4_CUDA_HAS_NVTX
     fprintf(stderr,
@@ -3346,7 +3384,10 @@ static void cuda_nsys_prefill_capture_maybe_start(
     if (!g_nsys_prefill_capture.enabled ||
         g_nsys_prefill_capture.started ||
         g_nsys_prefill_capture.stopped ||
-        pos0 < g_nsys_prefill_capture.start_pos) {
+        g_nsys_prefill_capture.start_index >=
+            g_nsys_prefill_capture.start_count ||
+        pos0 < g_nsys_prefill_capture.start_positions[
+            g_nsys_prefill_capture.start_index]) {
         return;
     }
 
@@ -3365,8 +3406,11 @@ static void cuda_nsys_prefill_capture_maybe_start(
     g_nsys_prefill_capture.chunk_pos = pos0;
     g_nsys_prefill_capture.chunk_tokens = n_tokens;
     fprintf(stderr,
-            "ds4: CUDA Nsight prefill capture started pos=%u tokens=%u\n",
-            pos0, n_tokens);
+            "ds4: CUDA Nsight prefill capture started window=%u/%u pos=%u tokens=%u\n",
+            g_nsys_prefill_capture.start_index + 1u,
+            g_nsys_prefill_capture.start_count,
+            pos0,
+            n_tokens);
 }
 
 static void cuda_nsys_prefill_capture_stop(const char *reason) {
@@ -3374,14 +3418,27 @@ static void cuda_nsys_prefill_capture_stop(const char *reason) {
 
     const cudaError_t err = cudaProfilerStop();
     g_nsys_prefill_capture.active = 0;
-    g_nsys_prefill_capture.stopped = 1;
     if (err == cudaSuccess) {
         fprintf(stderr,
-                "ds4: CUDA Nsight prefill capture stopped pos=%u tokens=%u reason=%s\n",
+                "ds4: CUDA Nsight prefill capture stopped window=%u/%u "
+                "pos=%u tokens=%u reason=%s\n",
+                g_nsys_prefill_capture.start_index + 1u,
+                g_nsys_prefill_capture.start_count,
                 g_nsys_prefill_capture.chunk_pos,
                 g_nsys_prefill_capture.chunk_tokens,
                 reason ? reason : "requested");
+        if (reason && strcmp(reason, "chunk-complete") == 0) {
+            g_nsys_prefill_capture.start_index++;
+            g_nsys_prefill_capture.started = 0;
+            if (g_nsys_prefill_capture.start_index >=
+                g_nsys_prefill_capture.start_count) {
+                g_nsys_prefill_capture.stopped = 1;
+            }
+        } else {
+            g_nsys_prefill_capture.stopped = 1;
+        }
     } else {
+        g_nsys_prefill_capture.stopped = 1;
         fprintf(stderr,
                 "ds4: CUDA Nsight prefill capture stop failed pos=%u tokens=%u: %s\n",
                 g_nsys_prefill_capture.chunk_pos,

@@ -179,8 +179,9 @@ echo "DSpark sampling: lossless p/q rejection for top_k=0 top_p=1 min-p policy (
 echo "GB10 verifier: Q8 batch-reuse=${DS4_CUDA_Q8_BATCH_REUSE:-0}, Q4-sidecar direct-MoE=${DS4_CUDA_MOE_TINY_DIRECT_Q4_ONLY:-0}, tiny-TC=${DS4_CUDA_DSPARK_TENSOR_CORES:-0}, tiny-TC-Q8=${DS4_CUDA_DSPARK_TENSOR_CORES_Q8:-0}"
 if [[ "${DS4_CUDA_NVTX:-0}" == "1" ||
       "${DS4_CUDA_NSYS_PREFILL_START_POS:-}" != "" ||
+      "${DS4_CUDA_NSYS_PREFILL_START_POSITIONS:-}" != "" ||
       "${DS4_CUDA_NSYS_CAPTURE_START_POS:-}" != "" ]]; then
-  echo "Profiling: NVTX=1 prefill-capture-start=${DS4_CUDA_NSYS_PREFILL_START_POS:-disabled} decode-capture-start=${DS4_CUDA_NSYS_CAPTURE_START_POS:-disabled} decode-capture-tokens=${DS4_CUDA_NSYS_CAPTURE_TOKENS:-disabled}"
+  echo "Profiling: NVTX=1 prefill-capture-start=${DS4_CUDA_NSYS_PREFILL_START_POS:-disabled} prefill-capture-list=${DS4_CUDA_NSYS_PREFILL_START_POSITIONS:-disabled} decode-capture-start=${DS4_CUDA_NSYS_CAPTURE_START_POS:-disabled} decode-capture-tokens=${DS4_CUDA_NSYS_CAPTURE_TOKENS:-disabled}"
 fi
 echo "Server: http://0.0.0.0:$PORT"
 

@@ -65,6 +65,36 @@ Log di attivazione atteso alla prima verifica speculativa:
 ds4: CUDA GB10 aligned MoE verifier enabled (computed IQ2 signs, coalesced Q8 staging, sum6 row span=64)
 ```
 
+### Tentativo DSpark HMMA attention scartato
+
+Dopo `5d54db3` e' stato provato un percorso dedicato alla forma DSpark
+`5 token x 64 head x 512`, con QK Tensor Core FP16, softmax FP32 e value FP32
+tile da otto query. Il percorso non ha prodotto un miglioramento end-to-end ed
+e' stato rimosso.
+
+Il profilo Nsight del baseline spiegava il risultato: 42 chiamate al kernel di
+attenzione costavano complessivamente `10,70 ms` in 14 cicli DSpark da
+`2623,89 ms`, cioe' appena lo `0,408%` del percorso completo. Anche eliminando
+interamente quel costo, il limite teorico sarebbe stato circa `+0,41%`. La
+pipeline HMMA aumentava inoltre i nodi del CUDA Graph K5 da 213 a 225 e la
+conversione Q/K FP16 poteva modificare l'acceptance del drafter. Il run freddo
+e' rimasto sostanzialmente invariato (`17,927` contro `17,958 t/s`), senza un
+beneficio che giustificasse complessita' e rischio. Il collo di bottiglia macro
+resta il target verifier, pari a circa l'`86,7%` del ciclo profilato.
+
+### Tentativo verifier F16/CUTLASS scartato
+
+Sul commit `5d54db3` e' stato provato un planner `(M,N,K,label)` per N reale,
+4 e 8, con `cublasLt`, tre kernel CUTLASS narrow-N, grouped gate/up e q/kv,
+output padded diretto, riuso delle attivazioni e un percorso interleaved per
+`attn_output_a`. La regressione era corretta e `dspark_output` isolato
+migliorava di circa il 21,8%, ma grouped GEMM era sempre piu' lento. Il decode
+stabile e' rimasto circa 19,4-20,0 t/s e il tuning piu' la costruzione dei
+Graph penalizzavano pesantemente la prima risposta. L'intervento e' stato
+quindi rimosso: il beneficio pesato non giustificava oltre 3.000 righe di
+planner e una dipendenza CUTLASS vendorizzata. Lo snapshot completo e' stato
+conservato fuori dal repository in `ds4-verifier-cutlass-backup-20260719`.
+
 ### Token-tile HMMA: gate prestazionale superato
 
 Il worktree corrente aggiunge token-tile HMMA per l'attenzione prefill:
@@ -838,12 +868,19 @@ e' maggiore o uguale alla posizione richiesta. DS4 non riserva buffer host o
 device, non crea eventi CUDA e non copia tensori per questa telemetria; lo
 spazio del file `.nsys-rep` e' gestito esternamente da Nsight Systems.
 
+Per confrontare piu' profondita' senza ricaricare il modello, la variabile
+`DS4_CUDA_NSYS_PREFILL_START_POSITIONS` accetta fino a 16 posizioni strettamente
+crescenti separate da virgole. Ogni posizione cattura un solo chunk. Nsight va
+lanciato con `--capture-range-end=repeat-shutdown:N`, dove `N` e' il numero di
+finestre, e genera un report separato per ciascuna. La forma singola precedente
+resta compatibile.
+
 I range principali sono:
 
 ```text
 ds4/prefill/chunk
 ds4/prefill/attention/{raw,ratio4,ratio128}
-ds4/prefill/indexer/{score,topk}
+ds4/prefill/indexer/{score,score-mxfp4,topk}
 ds4/prefill/attention/token_tile/{indexed,dense,union,visible_rows,raw_mirror,comp_mirror,hmma}
 ds4/prefill/ffn
 ds4/prefill/moe/{routed,mmq_fused,expert_map,input_quant_q8_1,iq2_gate_up_d2r,iq2_gate,iq2_up,swiglu_down_quant,q2_down,sum}
@@ -877,6 +914,22 @@ statici: non vengono formattate stringhe nel percorso caldo. I token/s del run
 profilato non sono un benchmark, mentre il run senza le variabili diagnostiche
 mantiene NVTX disattivato.
 
+Per il confronto riproducibile del decadimento a contesto lungo, lo script
+`profile-nsys-prefill.sh` usa `ds4-bench`, il testo fisso dei Promessi Sposi e
+la configurazione balanced del launcher. Con un solo caricamento acquisisce i
+chunk `0`, `8192`, `32768`, `65536` e `98304`: il secondo separa il costo
+one-shot del primo chunk dal primo percorso sparse. Per ciascun report estrae
+range NVTX, kernel, CUDA API e copie GPU:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && ./profile-nsys-prefill.sh 2>&1 | tee /tmp/ds4-prefill-depth.log
+```
+
+Prima del lancio non devono essere attivi `ds4-server` o `ds4-bench`. I report
+sono `/tmp/ds4-prefill-depth*.nsys-rep` e i riepiloghi corrispondenti terminano
+in `.stats.txt`. I cinque report vanno interpretati nell'ordine delle finestre
+stampato nel log; i token/s sotto profiler non costituiscono un benchmark.
+
 ### 9. Nsight Compute e permessi dei contatori
 
 `ncu` usa i performance counter hardware, che sul driver NVIDIA 580 della
@@ -892,6 +945,40 @@ separato, per esempio `DS4_LOCK_FILE=/tmp/ds4-ncu-root.lock`: il lock normale
 possono impedirne la riapertura al processo lanciato da `sudo`. Anche i
 token/s osservati sotto `ncu` contengono overhead del profiler e non sono un
 benchmark.
+
+Lo script `profile-ncu-prefill.sh` profila una sola istanza reale del kernel
+HMMA indexed a circa 98K. Usa un chunk di 1024 token: il lavoro interno di ogni
+token-tile e la profondita' della KV restano rappresentativi del contesto
+lungo. La modalita' predefinita `occupancy` raccoglie soltanto attributi di
+lancio, registri, shared memory e occupancy. Usa application replay anche per
+queste sezioni: NCU attiva comunque il proprio meccanismo di replay e, con
+kernel replay, puo' tentare lo snapshot delle allocazioni CUDA pur senza una
+raccolta estesa di performance counter:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && sudo -E ./profile-ncu-prefill.sh 2>&1 | tee /tmp/ds4-ncu-prefill-indexed.log
+```
+
+Il kernel replay non va usato con il modello residente: NCU tenta di
+salvare e ripristinare le allocazioni CUDA accessibili e, sulla memoria
+unificata quasi piena della Spark, puo' fallire a `0%` con codice applicazione
+`9`. Dopo il passaggio occupancy, le metriche runtime si raccolgono con
+application replay e buffer su file. Questa modalita' riavvia e ricarica il
+modello per ogni passata necessaria, quindi e' molto piu' lenta ma non richiede
+una seconda copia dello stato CUDA residente:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && sudo -E env DS4_NCU_PREFILL_MODE=runtime ./profile-ncu-prefill.sh 2>&1 | tee /tmp/ds4-ncu-prefill-runtime.log
+```
+
+Il percorso esatto del report `.ncu-rep` e della relativa esportazione `.txt`
+viene stampato all'avvio e alla fine. Per profilare separatamente il percorso
+dense, senza confonderne i contatori con quello indexed, si parte ancora dal
+passaggio occupancy:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && sudo -E env DS4_NCU_PREFILL_RANGE=dense ./profile-ncu-prefill.sh 2>&1 | tee /tmp/ds4-ncu-prefill-dense.log
+```
 
 ## Risultati osservati
 

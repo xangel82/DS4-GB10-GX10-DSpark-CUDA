@@ -134,6 +134,73 @@ CUDA a questa dimensione e falliva con `invalid argument`. Il launcher
 configura ora la dimensione dinamica reale fin dal primo uso e la regressione
 esercita esplicitamente questo confine.
 
+### Port FlashMLA head-major SM121a: validato su Athena
+
+Il worktree successivo sostituisce, per il solo sparse prefill indexed, la
+bitmap union multi-token con il mapping token-level usato da FlashMLA. Il
+riferimento studiato e' `deepseek-ai/FlashMLA` al commit
+`9241ae3ef9bac614dd25e45e507e089f888280e0` (MIT). Non vengono importati
+PyTorch, CUTLASS SM90/SM100, WGMMA, TMA gather o TMEM non disponibili sul
+GB10: il port conserva le primitive HMMA e `cp.async` gia' validate su
+`sm_121a`.
+
+La nuova fattorizzazione mantiene invariata la matrice CTA `M=32`, ma passa da
+`16 token x 2 head` a `1 token x 32 head`. Ogni CTA legge quindi direttamente
+i Top-512 del proprio token e riusa ciascuna riga KV su 32 head. Gli indici
+vengono caricati 32 alla volta nella ring shared, validati contro la frontiera
+causale e consumati senza creare una copia globale `int2` e senza scandire
+tutta la bitmap `n_comp`. Restano invariati:
+
+- Top-K 512 e relativo ordine;
+- raw window da 128 token, sink e maschera causale;
+- KV compressed F16 e raw mirror F16 transiente;
+- QK, online softmax e accumulazione output FP32;
+- decode, verifier DSpark e percorso dense ratio-128.
+
+Il numero complessivo di CTA HMMA resta uguale: due CTA per token coprono i 64
+head. La griglia usa head-group sull'asse `x`, cosi' le due CTA dello stesso
+token vengono offerte consecutivamente allo scheduler e possono riusare le KV
+selezionate in L2. Il lavoro sparse di ogni CTA e' limitato a `128 + 512` righe,
+indipendentemente dalla sovrapposizione dei Top-K fra token adiacenti. Anche lo
+scratch migliora: il percorso indexed non materializza piu' i record globali;
+il percorso dense dimensiona il record stride su `n_comp` reale invece del
+massimo fisso 32768. Non viene aggiunta memoria permanente.
+
+Il log atteso e':
+
+```text
+ds4: CUDA FlashMLA-style exact sparse prefill enabled (token=1, heads=32, stage=32, direct-topk=512, comp-kv=direct-f16)
+```
+
+Il gate `cuda-regression` su `sm_121a` ha superato i quattro confronti
+token-tile e la regressione long-context. Le relative RMSE sono rimaste
+nell'ordine di `6,5e-4`/`6,7e-4` sia con compressed KV F32 sia con il percorso
+direct-F16; `cuda long-context regression: OK` ha chiuso il test.
+
+Nel confronto sui chunk completi alle stesse frontiere, il throughput medio e'
+passato da 794,56 a 864,24 t/s, pari a **+8,8%**. I quattro intervalli
+confrontabili hanno misurato:
+
+```text
+32768..40960: 823,58 -> 879,17 t/s  (+6,7%)
+40960..49152: 807,45 -> 877,45 t/s  (+8,7%)
+49152..57344: 798,85 -> 871,53 t/s  (+9,1%)
+65536..73728: 748,37 -> 828,82 t/s (+10,7%)
+```
+
+Il mapping e' circoscritto al prefill indexed: decode, verifier DSpark e
+percorso dense non lo possono selezionare. Non aggiunge una copia permanente
+dei pesi o della KV; rimuove invece i record globali del percorso indexed.
+
+Il gate qualitativo API del 19 luglio 2026 ha usato 12 casi fissi
+`gsm8k_cot_zeroshot` e 12 casi IFEval, temperatura zero e 2.200 token massimi.
+Ha ottenuto **12/12** su GSM8K `flexible-extract`, **12/12** IFEval
+`prompt_level_strict_acc` e **100%** IFEval `inst_level_strict_acc` in 12m28s.
+Il valore GSM8K `strict-match=0` e' soltanto formato: DS4 emette
+`\\boxed{...}` invece della frase letterale attesa dal filtro stretto. Il
+primo tentativo con il default corto non e' valido: interrompeva il modello
+prima di `</think>` e faceva valutare come risposta il reasoning incompleto.
+
 ### Pipeline SM121 nel worktree: implementata, gate Athena pendente
 
 Il worktree successivo al riferimento sopra integra tutte le fasi del piano
@@ -438,6 +505,28 @@ Gli artefatti principali sono `summary.json`, `summary.csv`, `raw.csv` e i log
 di ogni processo. Un valore `MISMATCH:` in `greedy_token_hash` blocca il gate;
 per il confronto A/B vanno mantenuti identici prompt, binari di riferimento,
 frontiere, chunk, draft depth e condizioni termiche.
+
+Per un gate rapido, ma ancora rappresentativo, usare soltanto lo sweep append
+alle frontiere 32K, 64K e 96K, due ripetizioni e 128 token greedy per frontiera.
+Include prefill corto/medio/lungo, decode DSpark, determinismo e picco RSS e
+richiede indicativamente 8–12 minuti su GB10, oltre a un singolo avvio per il
+gate qualitativo `ds4-eval`:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && python3 tools/benchmark_gb10.py --model /home/athena/ds4/ds4flash.gguf --dspark /home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf --prompt speed-bench/promessi_sposi.txt --output-dir /tmp/ds4-gb10-quick-gate --frontiers 32768,65536,98304 --gen-tokens 128 --repeats 2 --append-only && column -s, -t /tmp/ds4-gb10-quick-gate/summary.csv
+```
+
+Il gate qualitativo breve usa `lm-evaluation-harness` 0.4.10 sul Mac, senza
+consumare la RAM unificata di Athena. Con il server gia' avviato, il comando
+fissa casi, seed, temperatura e budget di reasoning:
+
+```bash
+OPENAI_API_KEY=dummy "$HOME/.venvs/ds4-lm-eval/bin/lm-eval" run --model local-chat-completions --model_args "model=deepseek-v4-flash,base_url=http://192.168.254.62:30007/v1/chat/completions,num_concurrent=1,max_retries=1,tokenized_requests=False,max_length=111411,eos_string=<|endoftext|>" --tasks gsm8k_cot_zeroshot,ifeval --apply_chat_template --samples '{"gsm8k_cot_zeroshot":[0,1,2,3,4,5,6,7,8,9,10,11],"ifeval":[0,1,2,3,4,5,6,7,8,9,10,11]}' --batch_size 1 --seed 1234 --gen_kwargs "max_gen_toks=2200,temperature=0.0" --output_path /tmp/ds4-lm-eval-quick-2200 --log_samples
+```
+
+Per questo gate va confrontata la metrica GSM8K `flexible-extract`; il filtro
+`strict-match` richiede una forma testuale specifica e non misura la correttezza
+del risultato `\\boxed{...}` emesso da DS4.
 
 ## Configurazione corrente
 
@@ -881,7 +970,8 @@ I range principali sono:
 ds4/prefill/chunk
 ds4/prefill/attention/{raw,ratio4,ratio128}
 ds4/prefill/indexer/{score,score-mxfp4,topk}
-ds4/prefill/attention/token_tile/{indexed,dense,union,visible_rows,raw_mirror,comp_mirror,hmma}
+ds4/prefill/attention/token_tile/{indexed,dense,visible_rows,raw_mirror,comp_mirror,hmma}
+ds4/prefill/attention/flashmla/hmma
 ds4/prefill/ffn
 ds4/prefill/moe/{routed,mmq_fused,expert_map,input_quant_q8_1,iq2_gate_up_d2r,iq2_gate,iq2_up,swiglu_down_quant,q2_down,sum}
 ```

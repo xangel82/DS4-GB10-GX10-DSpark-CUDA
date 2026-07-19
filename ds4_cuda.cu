@@ -8565,13 +8565,20 @@ __global__ static void attention_static_mixed_heads8_online_kernel(
 
 /* -------------------------------------------------------------------------
  * Token-tile HMMA attention for wide single-session prefill batches.
- * Fixed STAGE_ROWS=32 and G=2; decode and verifier shapes are ineligible.
+ * STAGE_ROWS stays 32; dense uses T16/G2 and indexed sparse uses T1/G32.
+ * Decode and verifier shapes are ineligible.
  * Adapted from Entrpi/ds4 commits 47438d7 and 9de3044 (MIT).
+ * Sparse head-major mapping follows deepseek-ai/FlashMLA commit 9241ae3 (MIT).
  */
 
 static constexpr uint32_t kTTTileTokens = 16u;
 static constexpr uint32_t kTTG = 2u;
 static constexpr uint32_t kTTM = 32u;
+/* FlashMLA sparse prefill keeps one query token in a CTA and amortizes each
+ * selected KV row across many heads.  M remains 32, so this mapping reuses
+ * the established SM121 warp-MMA fragments and shared-memory layout. */
+static constexpr uint32_t kTTSparseTileTokens = 1u;
+static constexpr uint32_t kTTSparseG = 32u;
 static constexpr uint32_t kTTStageRows = 32u;
 static constexpr uint32_t kTTRawWindow = 128u;
 static constexpr uint32_t kTTHeadDim = 512u;
@@ -8588,6 +8595,8 @@ static constexpr uint32_t kTTRingChunksPerRow =
 static constexpr size_t kTTSmemHardCap = 90ull * 1024ull;
 
 static_assert(kTTM == kTTTileTokens * kTTG, "token-tile M must be 16 tokens x G2");
+static_assert(kTTM == kTTSparseTileTokens * kTTSparseG,
+              "sparse FlashMLA mapping must be one token x 32 heads");
 static_assert(kTTProbStride == kTTStageRows + 8u, "token-tile prob stride changed");
 static_assert(kTTScoreKSliceDim % 16u == 0, "token-tile score K split changed");
 static_assert(kTTRingChunksPerRow == 64u, "token-tile KV ring expects 64 chunks");
@@ -8830,87 +8839,6 @@ __device__ __forceinline__ uint32_t tt_stage_raw_rows(
     return raw_rows;
 }
 
-__global__ static void __launch_bounds__(512, 1) attention_tokentile_union_build_kernel(
-        int2 *records,
-        uint32_t *counts,
-        const int32_t *topk,
-        const int32_t *positions,
-        uint32_t pos0,
-        uint32_t n_tokens,
-        uint32_t top_k,
-        uint32_t ratio,
-        uint32_t n_comp,
-        uint32_t rec_stride) {
-    extern __shared__ uint32_t bitmap[];
-    __shared__ uint32_t scan[513];
-    __shared__ uint32_t running_s;
-
-    const uint32_t tid = threadIdx.x;
-    const uint32_t tile_base = blockIdx.x * kTTTileTokens;
-    if (tile_base >= n_tokens) {
-        if (tid == 0u) counts[blockIdx.x] = 0u;
-        return;
-    }
-    const uint32_t tile_count =
-        n_tokens - tile_base < kTTTileTokens ? n_tokens - tile_base : kTTTileTokens;
-    const uint32_t bitmap_words = (n_comp + 1u) >> 1u;
-
-    for (uint32_t w = tid; w < bitmap_words; w += blockDim.x) {
-        bitmap[w] = 0u;
-    }
-    if (tid == 0u) running_s = 0u;
-    __syncthreads();
-
-    const uint32_t total_slots = tile_count * top_k;
-    for (uint32_t idx = tid; idx < total_slots; idx += blockDim.x) {
-        const uint32_t tok = idx / top_k;
-        const uint32_t i = idx - tok * top_k;
-        const uint32_t t = tile_base + tok;
-        const uint32_t qpos = positions ? (uint32_t)positions[t] : pos0 + t;
-        uint32_t visible = ratio ? (positions ? qpos / ratio : (qpos + 1u) / ratio) : n_comp;
-        if (visible > n_comp) visible = n_comp;
-        const int32_t c = topk[(uint64_t)t * top_k + i];
-        if (c >= 0 && (uint32_t)c < visible) {
-            const uint32_t cu = (uint32_t)c;
-            const uint32_t bits = ((uint32_t)(1u << tok)) << ((cu & 1u) * 16u);
-            atomicOr(&bitmap[cu >> 1u], bits);
-        }
-    }
-    __syncthreads();
-
-    for (uint32_t base = 0u; base < n_comp; base += blockDim.x) {
-        const uint32_t id = base + tid;
-        uint32_t mask = 0u;
-        if (id < n_comp) {
-            const uint32_t word = bitmap[id >> 1u];
-            mask = (id & 1u) ? (word >> 16u) : (word & 0xffffu);
-        }
-        const uint32_t pred = mask != 0u ? 1u : 0u;
-        if (tid == 0u) scan[0] = 0u;
-        scan[tid + 1u] = pred;
-        __syncthreads();
-        for (uint32_t off = 1u; off < blockDim.x; off <<= 1u) {
-            uint32_t v = 0u;
-            if (tid >= off) v = scan[tid + 1u - off];
-            __syncthreads();
-            scan[tid + 1u] += v;
-            __syncthreads();
-        }
-        const uint32_t rank = scan[tid];
-        const uint32_t total = scan[blockDim.x];
-        const uint32_t running = running_s;
-        if (pred) {
-            records[(uint64_t)blockIdx.x * rec_stride + running + rank] =
-                make_int2((int)id, (int)mask);
-        }
-        __syncthreads();
-        if (tid == 0u) running_s = running + total;
-        __syncthreads();
-    }
-
-    if (tid == 0u) counts[blockIdx.x] = running_s;
-}
-
 __global__ static void __launch_bounds__(256, 1) attention_tokentile_raw_mirror_kernel(
         half *dst,
         const float *raw_kv,
@@ -9032,6 +8960,33 @@ __device__ __forceinline__ void tt_issue_record_stage_cp_async(
     }
 }
 
+/* FlashMLA-style direct sparse metadata stage.  Only one lane writes each
+ * record; the following CTA synchronization publishes it before the KV stage
+ * consumes the record.  Invalid indices remain in the stage with mask zero,
+ * preserving exact sparse semantics without a global compacted copy. */
+template <uint32_t TT_STAGE_ROWS>
+__device__ __forceinline__ void tt_issue_sparse_record_stage(
+        int2 * __restrict__ rec_plane,
+        uint32_t row0,
+        uint32_t nr,
+        uint32_t raw_union_count,
+        const int32_t * __restrict__ sparse_indices,
+        uint32_t sparse_visible) {
+    static_assert(TT_STAGE_ROWS == 32u, "sparse record stage is fixed at R32");
+    const uint32_t raw_rows = tt_stage_raw_rows(row0, nr, raw_union_count);
+    const uint32_t lane = tt_lane_id();
+    const uint32_t warp = tt_warp_id();
+    const uint32_t lane16 = lane & 15u;
+    const uint32_t rr = warp * 2u + (lane >> 4u);
+    const bool comp_slot = rr < nr && rr >= raw_rows;
+    if (comp_slot && lane16 == 0u) {
+        const uint32_t ci = row0 + rr - raw_union_count;
+        const int32_t c = __ldg(sparse_indices + ci);
+        const int valid = c >= 0 && (uint32_t)c < sparse_visible;
+        rec_plane[rr] = make_int2(valid ? c : 0, valid);
+    }
+}
+
 template <uint32_t TT_STAGE_ROWS, bool USE_SMEM_RECORDS>
 __device__ __forceinline__ void tt_issue_kv_stage_cp_async(
         half * __restrict__ dst,
@@ -9063,14 +9018,19 @@ __device__ __forceinline__ void tt_issue_kv_stage_cp_async(
 
     if (active && rr >= raw_rows && rr < nr) {
         uint32_t comp_id = 0u;
+        bool comp_live = true;
         if (USE_SMEM_RECORDS) {
-            comp_id = (uint32_t)rec_plane[rr].x;
+            const int2 rec = rec_plane[rr];
+            comp_id = (uint32_t)rec.x;
+            comp_live = rec.y != 0;
         } else {
             const uint32_t ci = row0 + rr - raw_union_count;
             comp_id = (uint32_t)union_records_tile[ci].x;
         }
-        const half *src = comp_kv + (uint64_t)comp_id * kTTHeadDim;
-        tt_issue_cp_async_row(dst, rr, lane16, src, true);
+        const half *src = comp_live
+            ? comp_kv + (uint64_t)comp_id * kTTHeadDim
+            : NULL;
+        tt_issue_cp_async_row(dst, rr, lane16, src, comp_live);
     }
 
     if (active && rr >= nr) {
@@ -9078,6 +9038,7 @@ __device__ __forceinline__ void tt_issue_kv_stage_cp_async(
     }
 }
 
+template <uint32_t TT_TILE_TOKENS, uint32_t TT_G>
 __device__ __forceinline__ void tt_load_score_q_frag(
         uint32_t (&q_frag)[kTTScoreKStepsPerQuarter][4],
         const float * __restrict__ q,
@@ -9085,6 +9046,8 @@ __device__ __forceinline__ void tt_load_score_q_frag(
         uint32_t n_head,
         uint32_t tile_base,
         uint32_t head_base) {
+    static_assert(TT_TILE_TOKENS * TT_G == kTTM,
+                  "token/head factorization must preserve M32");
     constexpr uint32_t kMtiles = kTTM / 16u;
     constexpr uint32_t kScoreWarps = kMtiles * kTTScoreKQuarters;
     const uint32_t warp = tt_warp_id();
@@ -9104,8 +9067,8 @@ __device__ __forceinline__ void tt_load_score_q_frag(
 #pragma unroll
         for (uint32_t r = 0; r < 4u; ++r) {
             const uint32_t m = mtile * 16u + a_group + ((r & 1u) ? 8u : 0u);
-            const uint32_t tok = m / kTTG;
-            const uint32_t h = m - tok * kTTG;
+            const uint32_t tok = m / TT_G;
+            const uint32_t h = m - tok * TT_G;
             const uint32_t gt = tile_base + tok;
             const uint32_t gh = head_base + h;
             const uint32_t d = k0 + a_col_pair + ((r & 2u) ? 8u : 0u);
@@ -9180,7 +9143,7 @@ __device__ __forceinline__ void tt_hmma_score_stage(
     }
 }
 
-template <uint32_t TT_STAGE_ROWS>
+template <uint32_t TT_STAGE_ROWS, uint32_t TT_G>
 __device__ __forceinline__ void tt_softmax_stage(
         half * __restrict__ probs,
         float * __restrict__ stage_rescale,
@@ -9211,7 +9174,7 @@ __device__ __forceinline__ void tt_softmax_stage(
 #pragma unroll
     for (uint32_t mi = 0; mi < kMPerWarp; ++mi) {
         const uint32_t m = warp + mi * kTTWarps;
-        const uint32_t tok = m / kTTG;
+        const uint32_t tok = m / TT_G;
         const bool valid_token = tok < tile_count;
         const uint32_t score_idx = m * TT_STAGE_ROWS + lane;
         const uint32_t prob_idx = prob_lane_base + mi * kTTWarps * kProbStride;
@@ -9320,6 +9283,7 @@ __device__ __forceinline__ void tt_pv_mma_stage(
     }
 }
 
+template <uint32_t TT_G>
 __device__ __forceinline__ void tt_pv_mma_epilogue(
         const float (&o_acc)[2u * kTTTileTokens * kTTG],
         const float * __restrict__ final_scale,
@@ -9346,8 +9310,8 @@ __device__ __forceinline__ void tt_pv_mma_epilogue(
             for (int l = 0; l < 4; ++l) {
                 const uint32_t idx = ((mtile * kPvNTiles + ntile) << 2) + (uint32_t)l;
                 const uint32_t m = mtile * 16u + (uint32_t)tt_mma_c_i(lane, l);
-                const uint32_t tok = m / kTTG;
-                const uint32_t h = m - tok * kTTG;
+                const uint32_t tok = m / TT_G;
+                const uint32_t h = m - tok * TT_G;
                 const uint32_t gt = tile_base + tok;
                 const uint32_t gh = head_base + h;
                 const uint32_t d =
@@ -9361,6 +9325,7 @@ __device__ __forceinline__ void tt_pv_mma_epilogue(
     }
 }
 
+template <uint32_t TT_TILE_TOKENS, uint32_t TT_G, bool TT_DIRECT_SPARSE>
 __global__ static void __launch_bounds__(512, 1) attention_tokentile_hmma_kernel(
         float *heads,
         const float *sinks,
@@ -9369,27 +9334,50 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_hmma_kernel
         const half *comp_kv,
         const int2 *union_records,
         const uint32_t *union_counts,
+        const int32_t *sparse_indices,
+        uint32_t sparse_pos0,
+        uint32_t sparse_ratio,
+        uint32_t sparse_n_comp,
+        uint32_t sparse_topk,
         uint32_t rec_stride,
         uint32_t n_tokens,
         uint32_t n_head,
         uint32_t raw_row_min) {
+    static_assert(TT_TILE_TOKENS * TT_G == kTTM,
+                  "token/head factorization must preserve M32");
+    static_assert(!TT_DIRECT_SPARSE || TT_TILE_TOKENS == 1u,
+                  "direct sparse mapping owns exactly one query token");
+    static_assert(!TT_DIRECT_SPARSE || kTTRawWindow % kTTStageRows == 0u,
+                  "direct sparse records must begin on a stage boundary");
     constexpr uint32_t kKvElems = tt_TokentileLayout<kTTStageRows>::ring_plane_elems;
     constexpr uint32_t kProbStride = tt_TokentileLayout<kTTStageRows>::prob_stride;
     const uint32_t tid = threadIdx.x;
-    const uint32_t tile_idx = blockIdx.x;
-    const uint32_t head_group = blockIdx.y;
-    const uint32_t tile_base = tile_idx * kTTTileTokens;
-    const uint32_t head_base = head_group * kTTG;
+    const uint32_t tile_idx = TT_DIRECT_SPARSE ? blockIdx.y : blockIdx.x;
+    const uint32_t head_group = TT_DIRECT_SPARSE ? blockIdx.x : blockIdx.y;
+    const uint32_t tile_base = tile_idx * TT_TILE_TOKENS;
+    const uint32_t head_base = head_group * TT_G;
     if (tile_base >= n_tokens) {
         return;
     }
     const uint32_t tile_count =
-        n_tokens - tile_base < kTTTileTokens ? n_tokens - tile_base : kTTTileTokens;
+        n_tokens - tile_base < TT_TILE_TOKENS ? n_tokens - tile_base : TT_TILE_TOKENS;
     const uint32_t raw_union_count = tile_count + kTTRawWindow - 1u;
-    const uint32_t comp_union_count = union_counts[tile_idx];
+    uint32_t sparse_visible = sparse_n_comp;
+    if constexpr (TT_DIRECT_SPARSE) {
+        sparse_visible = sparse_ratio
+            ? (sparse_pos0 + tile_base + 1u) / sparse_ratio
+            : sparse_n_comp;
+        if (sparse_visible > sparse_n_comp) sparse_visible = sparse_n_comp;
+    }
+    const uint32_t comp_union_count = TT_DIRECT_SPARSE
+        ? (sparse_topk < sparse_visible ? sparse_topk : sparse_visible)
+        : union_counts[tile_idx];
     const uint32_t n_score = raw_union_count + comp_union_count;
     const uint64_t union_tile_off = (uint64_t)tile_idx * rec_stride;
-    const int2 * __restrict__ union_records_tile = union_records + union_tile_off;
+    const int2 * __restrict__ union_records_tile = TT_DIRECT_SPARSE
+        ? NULL : union_records + union_tile_off;
+    const int32_t * __restrict__ sparse_indices_tile = TT_DIRECT_SPARSE
+        ? sparse_indices + union_tile_off : NULL;
     const float score_scale = rsqrtf((float)kTTHeadDim);
 
     extern __shared__ unsigned char smem[];
@@ -9424,7 +9412,7 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_hmma_kernel
         float o_acc[2u * kTTTileTokens * kTTG];
     };
     tt_TokentileRoleRegs role_regs;
-    tt_load_score_q_frag(
+    tt_load_score_q_frag<TT_TILE_TOKENS, TT_G>(
         role_regs.score_q_frag, q, n_tokens, n_head, tile_base, head_base);
     if (tt_warp_id() >= 8u) {
 #pragma unroll
@@ -9437,32 +9425,63 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_hmma_kernel
     uint32_t free = 1u;
     if (n_score != 0u) {
         const uint32_t nr0 = n_score < kTTStageRows ? n_score : kTTStageRows;
-        tt_issue_kv_stage_cp_async<kTTStageRows, false>(
-            kv_h + cur * kKvElems,
-            rec_ring,
-            0u,
-            nr0,
-            raw_union_count,
-            union_records_tile,
-            tile_base,
-            raw_kv,
-            comp_kv,
-            tid);
-        tt_issue_record_stage_cp_async<kTTStageRows>(
-            rec_ring,
-            0u,
-            nr0,
-            raw_union_count,
-            union_records_tile);
+        if constexpr (TT_DIRECT_SPARSE) {
+            tt_issue_kv_stage_cp_async<kTTStageRows, true>(
+                kv_h + cur * kKvElems,
+                rec_ring,
+                0u,
+                nr0,
+                raw_union_count,
+                NULL,
+                tile_base,
+                raw_kv,
+                comp_kv,
+                tid);
+            tt_issue_sparse_record_stage<kTTStageRows>(
+                rec_ring,
+                0u,
+                nr0,
+                raw_union_count,
+                sparse_indices_tile,
+                sparse_visible);
+        } else {
+            tt_issue_kv_stage_cp_async<kTTStageRows, false>(
+                kv_h + cur * kKvElems,
+                rec_ring,
+                0u,
+                nr0,
+                raw_union_count,
+                union_records_tile,
+                tile_base,
+                raw_kv,
+                comp_kv,
+                tid);
+            tt_issue_record_stage_cp_async<kTTStageRows>(
+                rec_ring,
+                0u,
+                nr0,
+                raw_union_count,
+                union_records_tile);
+        }
         if (kTTStageRows < n_score) {
             const uint32_t nr1 =
                 n_score - kTTStageRows < kTTStageRows ? n_score - kTTStageRows : kTTStageRows;
-            tt_issue_record_stage_cp_async<kTTStageRows>(
-                rec_ring + kTTStageRows,
-                kTTStageRows,
-                nr1,
-                raw_union_count,
-                union_records_tile);
+            if constexpr (TT_DIRECT_SPARSE) {
+                tt_issue_sparse_record_stage<kTTStageRows>(
+                    rec_ring + kTTStageRows,
+                    kTTStageRows,
+                    nr1,
+                    raw_union_count,
+                    sparse_indices_tile,
+                    sparse_visible);
+            } else {
+                tt_issue_record_stage_cp_async<kTTStageRows>(
+                    rec_ring + kTTStageRows,
+                    kTTStageRows,
+                    nr1,
+                    raw_union_count,
+                    union_records_tile);
+            }
         }
         tt_cp_async_commit();
         tt_cp_async_wait_group<0>();
@@ -9496,7 +9515,7 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_hmma_kernel
                 next_row0,
                 next_nr,
                 raw_union_count,
-                union_records_tile,
+                TT_DIRECT_SPARSE ? NULL : union_records_tile,
                 tile_base,
                 raw_kv,
                 comp_kv,
@@ -9507,18 +9526,28 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_hmma_kernel
                     n_score - prefetch_row0 < kTTStageRows
                         ? n_score - prefetch_row0
                         : kTTStageRows;
-                tt_issue_record_stage_cp_async<kTTStageRows>(
-                    rec_ring + (((row0 / kTTStageRows) + 2u) & 3u) * kTTStageRows,
-                    prefetch_row0,
-                    prefetch_nr,
-                    raw_union_count,
-                    union_records_tile);
+                if constexpr (TT_DIRECT_SPARSE) {
+                    tt_issue_sparse_record_stage<kTTStageRows>(
+                        rec_ring + (((row0 / kTTStageRows) + 2u) & 3u) * kTTStageRows,
+                        prefetch_row0,
+                        prefetch_nr,
+                        raw_union_count,
+                        sparse_indices_tile,
+                        sparse_visible);
+                } else {
+                    tt_issue_record_stage_cp_async<kTTStageRows>(
+                        rec_ring + (((row0 / kTTStageRows) + 2u) & 3u) * kTTStageRows,
+                        prefetch_row0,
+                        prefetch_nr,
+                        raw_union_count,
+                        union_records_tile);
+                }
             }
             tt_cp_async_commit();
         }
 
         half *probs_cur = probs + prob_cur * kTTM * kProbStride;
-        tt_softmax_stage<kTTStageRows>(
+        tt_softmax_stage<kTTStageRows, TT_G>(
             probs_cur,
             stage_rescale,
             max_s,
@@ -9547,8 +9576,8 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_hmma_kernel
     __syncthreads();
 
     for (uint32_t m = tid; m < kTTM; m += blockDim.x) {
-        const uint32_t tok = m / kTTG;
-        const uint32_t h = m - tok * kTTG;
+        const uint32_t tok = m / TT_G;
+        const uint32_t h = m - tok * TT_G;
         const uint32_t gt = tile_base + tok;
         const uint32_t gh = head_base + h;
         if (gt < n_tokens && gh < n_head) {
@@ -9567,7 +9596,7 @@ __global__ static void __launch_bounds__(512, 1) attention_tokentile_hmma_kernel
     }
     __syncthreads();
 
-    tt_pv_mma_epilogue(
+    tt_pv_mma_epilogue<TT_G>(
         role_regs.o_acc, final_scale, heads, n_tokens, n_head, tile_base, head_base);
 }
 
@@ -9575,9 +9604,9 @@ constexpr size_t tt_align16_const(size_t x) {
     return (x + 15u) & ~size_t(15u);
 }
 
-template <uint32_t TT_STAGE_ROWS, uint32_t TT_G>
+template <uint32_t TT_STAGE_ROWS, uint32_t TT_TILE_TOKENS, uint32_t TT_G>
 struct tt_TokentileSmemBudget {
-    static constexpr uint32_t M = kTTTileTokens * TT_G;
+    static constexpr uint32_t M = TT_TILE_TOKENS * TT_G;
     static constexpr uint32_t prob_stride = tt_TokentileLayout<TT_STAGE_ROWS>::prob_stride;
     static constexpr size_t q_bytes = 0;
     static constexpr size_t ring_bytes = 2ull * tt_TokentileLayout<TT_STAGE_ROWS>::ring_plane_bytes;
@@ -9597,17 +9626,26 @@ struct tt_TokentileSmemBudget {
         partial_bytes) + stats_bytes) + record_bytes);
 };
 
-static_assert(tt_TokentileSmemBudget<32, 2>::p_bytes == 5120ull,
+static_assert(tt_TokentileSmemBudget<32, 16, 2>::p_bytes == 5120ull,
               "M32/R32 P double-buffer must use R+8 stride");
 static_assert(sizeof(float4) == 16u, "score partial records must stay 16 bytes");
-static_assert(tt_TokentileSmemBudget<32, 2>::partial_bytes == 16ull * 1024ull,
+static_assert(tt_TokentileSmemBudget<32, 16, 2>::partial_bytes == 16ull * 1024ull,
               "M32/R32 score partial records must be M*R float4");
-static_assert(tt_TokentileSmemBudget<32, 2>::record_bytes == 1024ull,
+static_assert(tt_TokentileSmemBudget<32, 16, 2>::record_bytes == 1024ull,
               "M32/R32 record ring must be four R-row int2 planes");
-static_assert(tt_TokentileSmemBudget<32, 2>::total == 88576ull,
+static_assert(tt_TokentileSmemBudget<32, 16, 2>::total == 88576ull,
               "M32/R32 total dynamic shared memory changed unexpectedly");
-static_assert(tt_TokentileSmemBudget<kTTStageRows, kTTG>::total <= kTTSmemHardCap,
+static_assert(tt_TokentileSmemBudget<kTTStageRows,
+                                    kTTTileTokens,
+                                    kTTG>::total <= kTTSmemHardCap,
               "token-tile dynamic shared memory must stay under the 90 KiB pass gate");
+static_assert(tt_TokentileSmemBudget<kTTStageRows,
+                                    kTTSparseTileTokens,
+                                    kTTSparseG>::total ==
+                  tt_TokentileSmemBudget<kTTStageRows,
+                                         kTTTileTokens,
+                                         kTTG>::total,
+              "sparse head-major mapping must not increase shared memory");
 static_assert(2ull * tt_TokentileLayout<64>::ring_plane_bytes > kTTSmemHardCap,
               "a double-buffered 64-row KV ring cannot fit in GB10 shared memory");
 
@@ -14530,7 +14568,7 @@ static int cuda_attention_tokentile_indexed_launch(
         uint32_t              ratio,
         uint32_t              n_head,
         uint32_t              head_dim) {
-    if (n_tokens < 128u || head_dim != kTTHeadDim || n_head != 64u ||
+    if (!topk || n_tokens < 128u || head_dim != kTTHeadDim || n_head != 64u ||
         top_k != 512u || window != kTTRawWindow || ratio == 0u ||
         n_comp == 0u || n_comp > 32768u || n_raw < n_tokens ||
         (uint64_t)n_raw > (uint64_t)pos0 + n_tokens ||
@@ -14543,8 +14581,8 @@ static int cuda_attention_tokentile_indexed_launch(
             "ds4/prefill/attention/token_tile/indexed",
             cuda_nvtx_payload(n_comp, n_tokens));
 
-    const uint32_t n_tiles = (n_tokens + kTTTileTokens - 1u) / kTTTileTokens;
-    const uint32_t rec_stride = kTTTileTokens * top_k;
+    const uint32_t n_tiles = n_tokens;
+    const uint32_t rec_stride = top_k;
     const uint32_t n_mirror_rows = n_tokens + kTTRawWindow - 1u;
     const uint32_t raw_before = n_raw - n_tokens;
     const uint32_t available_before = raw_before < pos0 ? raw_before : pos0;
@@ -14554,10 +14592,6 @@ static int cuda_attention_tokentile_indexed_launch(
     const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
 
     uint64_t off = 0;
-    const uint64_t records_off = off;
-    off = cuda_align256_u64(off + (uint64_t)n_tiles * rec_stride * sizeof(int2));
-    const uint64_t counts_off = off;
-    off = cuda_align256_u64(off + (uint64_t)n_tiles * sizeof(uint32_t));
     const uint64_t raw_mirror_off = off;
     off = cuda_align256_u64(off +
             (uint64_t)n_mirror_rows * kTTHeadDim * sizeof(half));
@@ -14569,46 +14603,27 @@ static int cuda_attention_tokentile_indexed_launch(
     unsigned char *scratch = (unsigned char *)
         cuda_attention_tokentile_scratch_alloc(off);
     if (!scratch) return 0;
-    int2 *records = (int2 *)(scratch + records_off);
-    uint32_t *counts = (uint32_t *)(scratch + counts_off);
     half *raw_mirror = (half *)(scratch + raw_mirror_off);
     half *comp_mirror = comp_kv_f16
         ? (half *)comp_kv->ptr
         : (half *)(scratch + comp_mirror_off);
 
-    const uint32_t bitmap_words = (n_comp + 1u) >> 1u;
-    const size_t bitmap_smem = (size_t)bitmap_words * sizeof(uint32_t);
-    static size_t union_smem_configured;
-    if (bitmap_smem > union_smem_configured) {
-        if (!cuda_ok(cudaFuncSetAttribute(
-                    attention_tokentile_union_build_kernel,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    (int)bitmap_smem),
-                "attention token-tile union shared memory")) {
-            return -1;
-        }
-        union_smem_configured = bitmap_smem;
-    }
     static int hmma_smem_configured;
     if (!hmma_smem_configured) {
         if (!cuda_ok(cudaFuncSetAttribute(
-                    attention_tokentile_hmma_kernel,
+                    attention_tokentile_hmma_kernel<kTTSparseTileTokens,
+                                                    kTTSparseG,
+                                                    true>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    (int)tt_TokentileSmemBudget<kTTStageRows, kTTG>::total),
-                "attention token-tile HMMA shared memory")) {
+                    (int)tt_TokentileSmemBudget<kTTStageRows,
+                                                   kTTSparseTileTokens,
+                                                   kTTSparseG>::total),
+                "attention FlashMLA sparse HMMA shared memory")) {
             return -1;
         }
         hmma_smem_configured = 1;
     }
 
-    {
-        cuda_nvtx_scope stage("ds4/prefill/attention/token_tile/union",
-                              cuda_nvtx_payload(n_comp, n_tokens));
-        attention_tokentile_union_build_kernel<<<n_tiles, kTTThreads, bitmap_smem>>>(
-                records, counts, topk, NULL, pos0, n_tokens, top_k, ratio,
-                n_comp, rec_stride);
-        if (!cuda_ok(cudaGetLastError(), "attention token-tile union launch")) return -1;
-    }
     {
         cuda_nvtx_scope stage("ds4/prefill/attention/token_tile/raw_mirror",
                               cuda_nvtx_payload(n_mirror_rows, n_tokens));
@@ -14625,16 +14640,22 @@ static int cuda_attention_tokentile_indexed_launch(
         if (!cuda_ok(cudaGetLastError(), "attention token-tile comp mirror launch")) return -1;
     }
 
-    dim3 grid(n_tiles, n_head / kTTG, 1);
+    /* x is the fast launch dimension: place both head groups for one token
+     * next to each other so the second CTA can reuse selected KV from L2. */
+    dim3 grid(n_head / kTTSparseG, n_tiles, 1);
     {
-        cuda_nvtx_scope stage("ds4/prefill/attention/token_tile/hmma",
+        cuda_nvtx_scope stage("ds4/prefill/attention/flashmla/hmma",
                               cuda_nvtx_payload(n_tiles, n_tokens));
-        attention_tokentile_hmma_kernel<<<grid, kTTThreads,
-                tt_TokentileSmemBudget<kTTStageRows, kTTG>::total>>>(
+        attention_tokentile_hmma_kernel<kTTSparseTileTokens, kTTSparseG, true>
+            <<<grid, kTTThreads,
+                tt_TokentileSmemBudget<kTTStageRows,
+                                       kTTSparseTileTokens,
+                                       kTTSparseG>::total>>>(
                 (float *)heads->ptr, sinks, (const float *)q->ptr,
-                raw_mirror, comp_mirror, records, counts, rec_stride,
+                raw_mirror, comp_mirror, NULL, NULL, topk,
+                pos0, ratio, n_comp, top_k, rec_stride,
                 n_tokens, n_head, raw_row_min);
-        if (!cuda_ok(cudaGetLastError(), "attention token-tile indexed HMMA launch")) {
+        if (!cuda_ok(cudaGetLastError(), "attention FlashMLA sparse HMMA launch")) {
             return -1;
         }
     }
@@ -14642,8 +14663,8 @@ static int cuda_attention_tokentile_indexed_launch(
     if (!notice_printed) {
         notice_printed = 1;
         fprintf(stderr,
-                "ds4: CUDA token-tile HMMA indexed prefill enabled "
-                "(tile=16, heads=2, stage=32, exact-topk=512, comp-kv=%s)\n",
+                "ds4: CUDA FlashMLA-style exact sparse prefill enabled "
+                "(token=1, heads=32, stage=32, direct-topk=512, comp-kv=%s)\n",
                 comp_kv_f16 ? "direct-f16" : "f32-mirror");
     }
     return 1;
@@ -14680,7 +14701,7 @@ static int cuda_attention_tokentile_dense_launch(
             cuda_nvtx_payload(n_comp, n_tokens));
 
     const uint32_t n_tiles = (n_tokens + kTTTileTokens - 1u) / kTTTileTokens;
-    const uint32_t rec_stride = 32768u;
+    const uint32_t rec_stride = n_comp ? n_comp : 1u;
     const uint32_t n_mirror_rows = n_tokens + kTTRawWindow - 1u;
     const uint32_t raw_before = n_raw - n_tokens;
     const uint32_t available_before = raw_before < pos0 ? raw_before : pos0;
@@ -14717,9 +14738,11 @@ static int cuda_attention_tokentile_dense_launch(
     static int hmma_smem_configured;
     if (!hmma_smem_configured) {
         if (!cuda_ok(cudaFuncSetAttribute(
-                    attention_tokentile_hmma_kernel,
+                    attention_tokentile_hmma_kernel<kTTTileTokens, kTTG, false>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
-                    (int)tt_TokentileSmemBudget<kTTStageRows, kTTG>::total),
+                    (int)tt_TokentileSmemBudget<kTTStageRows,
+                                                   kTTTileTokens,
+                                                   kTTG>::total),
                 "attention token-tile HMMA shared memory")) {
             return -1;
         }
@@ -14753,10 +14776,14 @@ static int cuda_attention_tokentile_dense_launch(
     {
         cuda_nvtx_scope stage("ds4/prefill/attention/token_tile/hmma",
                               cuda_nvtx_payload(n_tiles, n_tokens));
-        attention_tokentile_hmma_kernel<<<grid, kTTThreads,
-                tt_TokentileSmemBudget<kTTStageRows, kTTG>::total>>>(
+        attention_tokentile_hmma_kernel<kTTTileTokens, kTTG, false>
+            <<<grid, kTTThreads,
+                tt_TokentileSmemBudget<kTTStageRows,
+                                       kTTTileTokens,
+                                       kTTG>::total>>>(
                 (float *)heads->ptr, sinks, (const float *)q->ptr,
-                raw_mirror, comp_mirror, records, counts, rec_stride,
+                raw_mirror, comp_mirror, records, counts, NULL,
+                0u, 0u, 0u, 0u, rec_stride,
                 n_tokens, n_head, raw_row_min);
         if (!cuda_ok(cudaGetLastError(), "attention token-tile mixed HMMA launch")) {
             return -1;
@@ -14813,9 +14840,9 @@ extern "C" int ds4_gpu_attention_tokentile_self_test(void) {
     const uint32_t n_tokens = 128u;
     const uint32_t n_head = 64u;
     const uint32_t head_dim = 512u;
-    /* Exactly 48 KiB of union bitmap: opt-in is still required because the
-     * union kernel also owns about 2 KiB of static shared state. */
-    const uint32_t n_comp = 24576u;
+    /* Sparse metadata is staged directly now; a moderate compressed cache is
+     * enough to exercise causal visibility without a 50 MiB host fixture. */
+    const uint32_t n_comp = 4608u;
     const uint32_t top_k = 512u;
     const uint32_t pos0 = 1024u;
     const uint32_t n_raw = n_tokens + kTTRawWindow - 1u;
@@ -14841,8 +14868,13 @@ extern "C" int ds4_gpu_attention_tokentile_self_test(void) {
         comp_host[i] = (float)((int)(i * 43u % 257u) - 128) * 0.0004f;
     }
     for (uint32_t t = 0; t < n_tokens; ++t) {
+        const uint32_t visible = (pos0 + t + 1u) / 4u;
         for (uint32_t i = 0; i < top_k; ++i) {
-            topk_host[(uint64_t)t * top_k + i] = (int32_t)i;
+            /* Keep the visible prefix expected by the reference kernel, but
+             * rotate it per token so sparse gather order is still exercised. */
+            topk_host[(uint64_t)t * top_k + i] = i < visible
+                ? (int32_t)((i + t * 53u) % visible)
+                : (int32_t)i;
         }
     }
 

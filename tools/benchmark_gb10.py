@@ -121,20 +121,27 @@ def benchmark_env() -> dict[str, str]:
         "DS4_CUDA_COPY_SECONDARY_MODEL": "1",
         "DS4_CUDA_DSPARK_CACHE_PRIORITY": "1",
         "DS4_CUDA_DEFER_END_SYNC": "1",
+        "DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS": "0",
         "DS4_CUDA_FUSED_COMPRESSOR_UPDATE": "1",
         "DS4_CUDA_TOKEN_GRAPH": "1",
         "DS4_CUDA_DSPARK_GRAPH": "1",
+        "DS4_CUDA_COALESCED_F16_MATMUL": "1",
+        "DS4_CUDA_Q8_U16_LOADS": "1",
         "DS4_CUDA_Q8_BATCH_REUSE": "1",
         "DS4_CUDA_MOE_TINY_DIRECT": "1",
         "DS4_CUDA_MOE_TINY_DIRECT_Q4_ONLY": "1",
         "DS4_CUDA_DSPARK_TENSOR_CORES": "1",
         "DS4_CUDA_DSPARK_TENSOR_CORES_Q8": "1",
+        "DS4_CUDA_DSPARK_TC_PAD_N": "8",
         "DS4_DSPARK_ALWAYS_DRAFT": "1",
         "DS4_DSPARK_NO_CIRCUIT_BREAKER": "1",
         "DS4_PREFILL_FINAL_LOGITS_ONLY": "1",
     }
     for name, value in defaults.items():
         env.setdefault(name, value)
+    for name in ("DS4_CUDA_TOKEN_GRAPH_PIPELINE", "DS4_CUDA_MTP_GRAPH",
+                 "DS4_CUDA_MTP_TENSOR_CORES"):
+        env.pop(name, None)
     return env
 
 

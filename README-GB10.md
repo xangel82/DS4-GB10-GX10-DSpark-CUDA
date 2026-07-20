@@ -252,9 +252,10 @@ Log di attivazione attesi, quando le relative forme vengono realmente eseguite:
 ```text
 ds4: CUDA target MoE replaced in place: ... (zero permanent duplication)
 ds4: CUDA in-place aligned MoE execution active ...
+ds4: CUDA complete fused MoE D2R prefill enabled ...
 ds4: CUDA packed MXFP4 indexer scorer enabled ...
 ds4: CUDA exact radix Top-512 enabled ...
-ds4: CUDA token-tile HMMA indexed prefill enabled (... stage=32 ... comp-kv=direct-f16)
+ds4: CUDA FlashMLA-style exact sparse prefill enabled (... direct-topk=512, comp-kv=direct-f16)
 ds4: CUDA Blackwell exact GVR Top-512 enabled ...
 ```
 
@@ -460,12 +461,12 @@ Log principali attesi durante startup e primo prompt:
 
 ```text
 ds4: CUDA pipelined model copy ...
-ds4: CUDA Entrpi batched MMQ MoE prefill enabled (... token-bound stream-K; decode excluded)
+ds4: CUDA complete fused MoE D2R prefill enabled ...
 ds4: CUDA token-tile HMMA raw/mixed prefill enabled ...
-ds4: CUDA token-tile HMMA indexed prefill enabled ...
+ds4: CUDA FlashMLA-style exact sparse prefill enabled ...
 ```
 
-Gli ultimi due messaggi compaiono soltanto quando una forma token-tile
+I messaggi dei percorsi prefill compaiono soltanto quando una forma larga
 eleggibile viene realmente eseguita.
 
 ## Deploy dal Mac
@@ -1923,6 +1924,64 @@ chiuso 61.214 token in 123,273 secondi, pari a 496,57 t/s. Il decode a circa
 86K e' rimasto integro e ha chiuso 802 token a 23,58 t/s; il costo iniziale di
 warm-up dei graph si riassorbe entro i primi blocchi da 50 token.
 
+#### Epilogue prefill fuse: HC, RMS, RoPE e MoE sum
+
+Il profilo Nsight del chunk indexed a 98K attribuiva circa 0,813 s alla
+conversione F32->F16, 0,644 s alla RMS plain, 0,547 s a HC expand, 0,448 s
+alla head RMS, 0,342 s al packing e 0,168 s alla sola somma dei sei esperti.
+Sono passate di memoria dipendenti che preparano GEMM o lo stato HC, non
+calcolo attention/MoE utile.
+
+Il nuovo percorso CUDA largo, eleggibile da 128 token, riduce queste
+materializzazioni senza aggiungere buffer permanenti:
+
+- RMS HC scrive direttamente l'attivazione F16 gia' consumata dal GEMM
+  successivo; la stessa riga F16 viene portata da attention a FFN e fra layer;
+- HC expand scrive ancora lo stato canonico FP32, ma produce nello stesso CTA
+  anche la RMS F16 per il blocco successivo;
+- la proiezione attention applica inverse RoPE durante il packing group-major
+  F16, evitando la passata in-place separata sui 64 head;
+- il routed MoE largo puo' lasciare i sei down output nel layout per-esperto;
+  un'unica epilogue esegue somma finita in ordine di slot, add dello shared
+  expert, HC expand e RMS F16.
+
+Decode monoriga, verifier target/DSpark 2..6, debug dump, steering e percorsi
+shared-down F16 conservano la pipeline precedente. La patch riusa scratch gia'
+allocato (`batch_flat_hc` e routed-down), quindi non aumenta il picco RAM del
+server. Non modifica pesi, Top-K, KV o formule del modello; rimuove soltanto
+round-trip intermedi. `cuda-regression` confronta la pipeline materializzata e
+quella fusa su 128 token, compresi NaN/Inf nel down MoE, e richiede parita'
+FP32 entro `2e-6` e scarto massimo di un ULP F16. Lo stesso limite di un ULP
+vale per inverse-RoPE + packing; il test registra anche indice e bit della
+prima differenza e rifiuta qualunque scarto superiore.
+
+L'integrazione ha superato il gate Athena del 20 luglio 2026. La regression
+`sm_121a` ha chiuso con `cuda long-context regression: OK`; il confronto fra
+pipeline materializzata e fusa ha rilevato al massimo un ULP F16 e nessun
+errore FP32 oltre `2e-6`.
+
+Risultati end-to-end osservati con profilo `balanced`, chunk 8192, contesto
+fisico 131072 e sidecar DSpark copiato:
+
+```text
+Richiesta / intervallo       Prefill medio   Chunk significativi
+cold 0..25352                902.67 t/s      835.81, 991.09, 977.94 t/s
+cold 0..13376                952.97 t/s      1009.78, 952.66 t/s
+append 57846..78243          730.56 t/s      653.93, 898.45 t/s
+append 77157..90505          760.77 t/s      642.33, 891.13 t/s
+append 90505..93565          628.27 t/s      coda singola da 3060 token
+```
+
+Il decode DSpark e' rimasto nel profilo atteso: 21.85 t/s dopo il cold prefill
+da 25K, 24.00 t/s a circa 90K e 23.46 t/s a circa 93.5K. Tool call, checkpoint
+canonici e ripresa append hanno continuato a funzionare.
+
+La memoria di sistema era 118 GiB usati su 121 GiB, con circa 2.9 GiB
+disponibili. Dei circa 1.6 GiB in swap, soltanto 141 MiB appartenevano al
+processo `ds4-server`; dieci campioni `vmstat` non hanno mostrato paging
+sostenuto. Il margine GB10 resta stretto, ma non e' emersa crescita persistente
+attribuibile alle fusioni.
+
 #### Copia iniziale CUDA pipelined
 
 Il caricamento del target da 80.76 GiB non usa piu' un unico `cudaMemcpy`
@@ -2270,11 +2329,12 @@ lavoro utile per verifier ma anche il costo dei draft rifiutati.
 ## File modificati
 
 - `Makefile`: target CUDA Graph, build nativa `sm_121a` e oggetti MMQ Entrpi.
-- `ds4.c`: DSpark, confidence scheduler, commit diretto, ring rollback e payload KV.
+- `ds4.c`: DSpark, confidence scheduler, commit diretto, ring rollback, payload
+  KV e carry F16 confinato al prefill largo.
 - `ds4_cuda.cu`: residenza multi-GGUF, kernel DSpark, graph K-aware, routed-MoE
-  MMQ e token-tile HMMA confinati al prefill target.
+  MMQ, token-tile HMMA ed epilogue HC/RMS/RoPE fuse confinate al prefill target.
 - `ds4_gpu.h`: API interne per token graph, ring backup, verifier DSpark e test
-  di parità MMQ/token-tile.
+  di parità MMQ/token-tile/epilogue prefill.
 - `cuda/mmq/`: kernel llama.cpp e adattatore CUDA importati dal fork Entrpi.
 - `ds4_server.c`: speculative sampling DSpark anche con temperatura non nulla.
 - `ds4_kvstore.c`: ABI payload 3 per rifiutare checkpoint incompleti.

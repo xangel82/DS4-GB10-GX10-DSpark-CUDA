@@ -40,6 +40,9 @@ on a single GB10/GX10 machine without changing the target model distribution.
   down projection and a token-bounded stream-K schedule.
 - Added token-tile HMMA attention for exact Top-K indexed and dense raw/mixed
   prefill batches, structurally excluding decode and the DSpark verifier.
+- Fused wide-prefill HC expansion, RMS, inverse RoPE packing and routed-MoE
+  reduction epilogues while preserving the canonical FP32 state and reusing
+  existing scratch buffers.
 - Added a compact 68-byte MXFP4 indexer cache and native SM121a block-scaled
   scoring, using token tiles for prefill and head tiles for 1-6 row verifier
   batches.
@@ -52,7 +55,7 @@ on a single GB10/GX10 machine without changing the target model distribution.
   from the stage-32 token-tile path without a persistent F32 duplicate.
 - Added reproducible cold/append GB10 sweeps with DSpark decode, process-memory
   high-water marks and deterministic token hashes. The complete path has been
-  validated end to end on Athena through 84k context.
+  validated end to end on Athena through 93.5k context.
 - Added pipelined direct-I/O model upload and release of copied GGUF source
   pages to reduce startup time and host page residency.
 - Added long-prefix KV reuse so repeated tool turns can prefill only the
@@ -91,12 +94,15 @@ on a single GB10/GX10 machine without changing the target model distribution.
   `max_input_tokens` reserves the configured completion budget so clients can
   compact before generation runs into the physical context ceiling.
 
-The latest measured profile reached 787.06 prefill token/s for a cold
-13,597-token prompt and 724.69 token/s while appending 41,674 tokens up to 55k
-context. Full central 8192-token chunks remained between 790.72 and 761.57
-token/s during that long append. DSpark decode reached 25.13 token/s at 55k
-context and 24.39 token/s at 70k. Exact numbers vary with prompt, seed,
-sampling and chunk-boundary tails.
+The latest measured profile reached 902.67 prefill token/s for a cold
+25,352-token prompt and 952.97 token/s for a cold 13,376-token prompt. Full
+central 8192-token chunks reached 991.09, 977.94 and 1009.78 token/s. Long
+append-prefill remained at 760.77 token/s from 77k to 90.5k context, while
+DSpark decode measured 24.00 token/s at 90.5k and 23.46 token/s at 93.5k.
+At 93.5k the host reported about 2.9 GiB available; only 141 MiB of the 1.6
+GiB total swap belonged to `ds4-server`, with no sustained paging in the live
+`vmstat` samples. Exact numbers vary with prompt, seed, sampling and
+chunk-boundary tails.
 
 ## Measured GB10 results
 
@@ -114,10 +120,12 @@ They are useful as a sanity check, not as a guaranteed benchmark.
 | DSpark p/q rejection + GPU verifier + Tensor Core tiny batches | ~18.2 t/s weighted decode | Earlier release milestone; chunks reached about 19 t/s. |
 | Raw-GGUF MMQ MoE + token-bounded stream-K | 404.46 t/s prefill | Weighted baseline over `ctx=24576..81920`; decode remained 23.00 t/s at 83k. |
 | Token-tile HMMA indexed + raw/mixed attention | 509.14 t/s prefill | Same 57,344-token interval, **+25.88%**; full 61,214-token request averaged 496.57 t/s. |
-| Current full pipeline, cold 13.6k prompt | 787.06 t/s prefill | First 8192-token chunk reached 854.26 t/s; average through 12,288 tokens was 834.49 t/s. The total includes the smaller final tail. |
-| Current full pipeline, append 13.6k -> 55.3k | 724.69 t/s prefill | 41,674 appended tokens; the four complete central chunks measured 790.72, 780.88, 777.00 and 761.57 t/s. |
-| Current full pipeline, append 69.7k -> 84.6k | 664.92 t/s prefill | Main complete chunk reached 725.18 t/s; partial boundary chunks reduce the request average. |
-| Current DSpark decode at 55k / 70k | 25.13 / 24.39 t/s | Measured over 454 and 501 generated tokens respectively, with the small-batch recovery paths active. |
+| Pre-epilogue pipeline, cold 13.6k prompt | 787.06 t/s prefill | Historical same-machine baseline; first 8192-token chunk reached 854.26 t/s. |
+| Fused epilogue pipeline, cold 25.3k prompt | 902.67 t/s prefill | Three complete chunks measured 835.81, 991.09 and 977.94 t/s; the 776-token tail reduced the request average. |
+| Fused epilogue pipeline, cold 13.4k prompt | 952.97 t/s prefill | First 8192-token chunk reached 1009.78 t/s; the next 4096-token chunk reached 952.66 t/s. |
+| Fused epilogue pipeline, append 57.8k -> 78.2k | 730.56 t/s prefill | 20,397 appended tokens; the central 8192-token chunk reached 898.45 t/s. |
+| Fused epilogue pipeline, append 77.2k -> 90.5k | 760.77 t/s prefill | 13,348 appended tokens; the complete central chunk reached 891.13 t/s. |
+| Current DSpark decode at 90.5k / 93.5k | 24.00 / 23.46 t/s | Measured over 284 and 222 generated tokens respectively; tool-call generation and canonical KV reuse remained active. |
 
 Representative earlier DSpark analyzer output (kept as scheduler history):
 
@@ -143,9 +151,11 @@ The earlier 509.14 t/s prefill comparison was position matched. Across its seven
 57,344-token interval fell from 141.78 to 112.63 seconds. The primary 80.76 GiB
 model upload completed in 19.076 seconds at 4.23 GiB/s; the separate 10.70 GiB
 sidecar copy took 69.999 seconds in that run. The newer figures above include
-the MXFP4 scorer, exact shape-specific Top-K dispatch and split target-MoE
-execution: large batches use the prefill tiers, while decode and speculative
-verification use the Q8_K small-batch path.
+the MXFP4 scorer, exact shape-specific Top-K dispatch, FlashMLA-style exact
+sparse attention and fused HC/RMS/RoPE/MoE epilogues. Large batches use the
+prefill tiers, while decode and speculative verification remain on the Q8_K
+small-batch path. The CUDA regression permits at most one F16 ULP between the
+materialized and fused epilogues and rejects FP32 differences above `2e-6`.
 
 ## Install on GB10/GX10
 
@@ -184,9 +194,9 @@ cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && /usr/local/cuda/bin/nvcc --version 
 
 The regression must end with `cuda long-context regression: OK`. It validates
 large Radix Top-K, the exact small-batch chunk tree and GVR dispatch, packed
-MXFP4 scoring, aligned-SoA D2R and Q8_K MoE parity, and both token-tile
-attention variants. Stop an already running server first if memory is close to
-the GB10 limit.
+MXFP4 scoring, aligned-SoA D2R and Q8_K MoE parity, both attention variants,
+and the fused HC/RMS/RoPE/MoE prefill epilogues. Stop an already running server
+first if memory is close to the GB10 limit.
 
 ### 2. Prepare model directory
 
@@ -341,11 +351,12 @@ The detailed lab notes, memory accounting and longer A/B history live in
 
 ## Useful rollback switches
 
-The routed-MoE MMQ and token-tile HMMA prefill paths are selected by structural
-shape guards and intentionally have no launcher flag. For a full rollback,
-keep the previous binary or build stable commit `59a5614` in a separate
-checkout; do not restore only `ds4_cuda.cu` because MMQ also depends on
-`cuda/mmq`, `ds4_gpu.h` and the CUDA regression test.
+The routed-MoE MMQ, sparse-attention and fused-epilogue prefill paths are
+selected by structural shape guards and intentionally have no launcher flag.
+For a full rollback, keep the previous binary or build a known stable commit
+in a separate checkout; do not restore only `ds4_cuda.cu` because the complete
+path also depends on `cuda/mmq`, `cuda/indexer`, `ds4.c`, `ds4_gpu.h` and the
+CUDA regression test.
 
 Disable Tensor Core tiny-batch completely:
 
@@ -387,13 +398,14 @@ The first eligible long prefill should also show:
 
 ```text
 ds4: CUDA Entrpi batched MMQ MoE prefill enabled (... token-bound stream-K; decode excluded)
+ds4: CUDA complete fused MoE D2R prefill enabled (preallocated workspace, register gate/up, direct SwiGLU Q8 down)
 ds4: CUDA in-place aligned MoE execution active (Q8_K small-batch + D2R/MMQ prefill tiers)
 ds4: CUDA packed MXFP4 indexer scorer enabled (68-byte rows, native block-scaled MMA; token-tile prefill + head-tile verifier on sm_121a)
 ds4: CUDA exact radix Top-512 enabled (...)
 ds4: CUDA exact parallel Top-512 enabled for small batches (4096-column chunk tree, low-index tie break)
 ds4: CUDA Blackwell exact GVR Top-512 enabled (...)
 ds4: CUDA token-tile HMMA raw/mixed prefill enabled (tile=16, heads=2)
-ds4: CUDA token-tile HMMA indexed prefill enabled (tile=16, heads=2, exact-topk=512)
+ds4: CUDA FlashMLA-style exact sparse prefill enabled (token=1, heads=32, stage=32, direct-topk=512, comp-kv=direct-f16)
 ```
 
 These lines are shape dependent and may appear only after the first request

@@ -24647,7 +24647,11 @@ int ds4_gpu_routed_moe_batch_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                layer_index,
         uint32_t                n_tokens,
-        bool                   *mid_is_f16) {
+        bool                   *mid_is_f16,
+        bool                    defer_sum,
+        bool                   *output_unsummed) {
+    (void)defer_sum;
+    if (output_unsummed) *output_unsummed = false;
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!out || !gate || !up || !mid || !x || !model_map || !selected || !weights ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 || n_expert > 6) {

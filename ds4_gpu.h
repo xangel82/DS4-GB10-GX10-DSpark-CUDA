@@ -34,6 +34,10 @@ int ds4_gpu_mmq_prefill_self_test(void);
  * established exact Top-K online kernel on a deterministic wide batch. */
 int ds4_gpu_attention_tokentile_self_test(void);
 
+/* CUDA regression hook: compare the fused wide-prefill HC/RMS epilogues
+ * with the established materialized pipeline. */
+int ds4_gpu_prefill_epilogue_self_test(void);
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
@@ -404,6 +408,16 @@ int ds4_gpu_matmul_f16_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+int ds4_gpu_matmul_f16_f16_input_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x_h,
+        uint64_t                n_tok);
+
 int ds4_gpu_matmul_f16_pair_tensor(
         ds4_gpu_tensor       *out_a,
         ds4_gpu_tensor       *out_b,
@@ -440,6 +454,13 @@ int ds4_gpu_rms_norm_plain_tensor(
 
 int ds4_gpu_rms_norm_plain_rows_tensor(
         ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *x,
+        uint32_t                n,
+        uint32_t                rows,
+        float                   eps);
+
+int ds4_gpu_rms_norm_plain_rows_f16_tensor(
+        ds4_gpu_tensor       *out_h,
         const ds4_gpu_tensor *x,
         uint32_t                n,
         uint32_t                rows,
@@ -892,6 +913,32 @@ int ds4_gpu_attention_output_q8_batch_tensor(
         const ds4_gpu_tensor *heads,
         uint32_t                n_tokens);
 
+int ds4_gpu_attention_output_q8_batch_inverse_rope_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos0,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow);
+
 int ds4_gpu_attention_output_q8_batch_f16_tensor(
         ds4_gpu_tensor       *out_h,
         ds4_gpu_tensor       *low,
@@ -1043,7 +1090,9 @@ int ds4_gpu_routed_moe_batch_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                layer_index,
         uint32_t                n_tokens,
-        bool                   *mid_is_f16);
+        bool                   *mid_is_f16,
+        bool                    defer_sum,
+        bool                   *output_unsummed);
 
 /* =========================================================================
  * Hyper-Connection Kernels.
@@ -1138,6 +1187,16 @@ int ds4_gpu_hc_expand_split_tensor(
         uint32_t                n_embd,
         uint32_t                n_hc);
 
+int ds4_gpu_hc_expand_split_norm_f16_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *norm_h,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        float                   eps);
+
 int ds4_gpu_hc_expand_split_half_tensor(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out_h,
@@ -1154,6 +1213,28 @@ int ds4_gpu_hc_expand_add_split_tensor(
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc);
+
+int ds4_gpu_hc_expand_add_split_norm_f16_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *norm_h,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        float                   eps);
+
+int ds4_gpu_moe_down_hc_expand_add_norm_f16_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *norm_h,
+        const ds4_gpu_tensor *routed_down,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_expert,
+        float                   eps);
 
 int ds4_gpu_hc_expand_add_split_half_add_tensor(
         ds4_gpu_tensor       *out_hc,

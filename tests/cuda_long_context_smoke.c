@@ -790,6 +790,10 @@ int main(void) {
         fprintf(stderr, "cuda-regression: FAILED routed-MoE MMQ\n");
         rc = 1;
     }
+    if (!ds4_gpu_prefill_epilogue_self_test()) {
+        fprintf(stderr, "cuda-regression: FAILED fused prefill epilogue\n");
+        rc = 1;
+    }
     if (!ds4_gpu_attention_tokentile_self_test()) {
         fprintf(stderr, "cuda-regression: FAILED token-tile attention\n");
         rc = 1;

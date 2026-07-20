@@ -13969,7 +13969,7 @@ extern "C" int ds4_gpu_indexer_scores_packed_tensor(
         if (ds4_indexer_sm121_has_native_mxfp4()) {
             fprintf(stderr,
                     "ds4: CUDA packed MXFP4 indexer scorer enabled "
-                    "(68-byte rows, native block-scaled MMA; token-tile prefill "
+                    "(68-byte rows, native block-scaled MMA; N128 ping-pong prefill "
                     "+ head-tile verifier on sm_121a)\n");
         } else {
             fprintf(stderr,

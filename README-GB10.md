@@ -2025,6 +2025,60 @@ la RAM e' rimasta costante rispetto al riferimento. La patch viene quindi
 accettata come ottimizzazione MoE senza aumento del budget di memoria; non va
 interpretata come soluzione al decadimento attention oltre 80K.
 
+Un esperimento successivo ha provato un tile gate/up N64 con 16 warp, divisi
+in due gruppi N32 che condividevano il caricamento IQ2 senza raddoppiare gli
+accumulatori per thread. Insieme e' stato provato il bilanciamento dell'ultima
+coppia di chunk, trasformando un `8192 + coda breve` in due chunk di dimensione
+simile. La prova del 20 luglio 2026 e' stata respinta.
+
+Sul cold, i primi 24.576 token sono scesi da circa 976 a 908 t/s (`-6,9%`).
+L'append lungo confrontabile e' sceso da circa 845 a 789 t/s (`-6,6%`), mentre
+il decode e' rimasto sano a 27,85 t/s intorno a 68K. Il tile N64 riduceva la
+flessibilita' di scheduling delle CTA senza recuperarla con il riuso IQ2. Il
+bilanciamento trasformava invece un lancio pieno efficiente e una coda breve
+in due lanci da circa 5.230 token, entrambi osservati intorno a 630 t/s.
+Inoltre il cold anchor a 24.576 spezzava il range prima dello scheduler, quindi
+la coda cold da 776 token non poteva essere bilanciata. Il codice N64 e il
+bilanciamento sono stati rimossi; resta il percorso N32 tail-aware del commit
+`453eec4`.
+
+#### Scorer MXFP4 N128 ping-pong
+
+Lo scorer indexer prefill SM121a elabora ora due gruppi N64 indipendenti per
+CTA, formando un tile N128 che riusa la stessa query MXFP4. Due buffer shared
+ping-pong precaricano la testa successiva e riducono da due a una le barriere
+per testa, conservando l'ordine crescente dell'accumulo e il Top-K esatto. Il
+percorso verifier da 1-6 righe non cambia e non vengono aggiunte allocazioni
+persistenti. Il kernel compilato usa 64 registri, 3328 byte di shared statica e
+non genera spill locali.
+
+La regressione CUDA esercita il percorso prefill con 17 token e 641 righe
+compresse, incluse entrambe le code N128. Il confronto fra forme ha misurato al
+massimo 2 ULP su 1457 valori di 98073, con tutti gli 8704 indici Top-K identici:
+
+```text
+cuda-regression: ... shape-consistency-max=0.00012207031 ulp=2 changed=1457 topk=8704/8704 causal-topk=8704/8704
+cuda long-context regression: OK
+```
+
+Un run applicativo ha mantenuto 964,90 t/s medi sui sette chunk completi fra
+16K e 73K e 923,09 t/s sui due chunk completi fra 82K e 98K. Il benchmark
+riproducibile append, eseguito subito dopo con prompt fisso, ha confermato:
+
+```text
+Frontiera   Token prefill   Prefill
+65536       65536           913,61 t/s
+81920       16384           937,77 t/s
+98304       16384           913,54 t/s
+```
+
+Il percorso lungo resta quindi sopra 900 t/s fino a 98K senza aumentare la
+memoria persistente. Il `gen_tps` greedy breve di questo benchmark non e'
+confrontabile direttamente con il server: 128 token includono il warm-up dei
+CUDA Graph e il testo fisso ha prodotto soltanto 1,68-1,88 token accettati per
+ciclo. Nel run HTTP, non modificato da questa patch, il decode ha mantenuto
+23,92 t/s a 78K e 22,19 t/s a 100K.
+
 #### Copia iniziale CUDA pipelined
 
 Il caricamento del target da 80.76 GiB non usa piu' un unico `cudaMemcpy`

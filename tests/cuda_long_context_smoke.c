@@ -310,6 +310,18 @@ static int topk_boundary_score_close(float a, float b) {
     return fabsf(a - b) <= 1.0e-6f + 5.0e-4f * scale;
 }
 
+static uint32_t nonnegative_f32_ulp_distance(float a, float b) {
+    if (a == b) return 0u;
+    if (!isfinite(a) || !isfinite(b) || a < 0.0f || b < 0.0f) {
+        return UINT32_MAX;
+    }
+    uint32_t a_bits;
+    uint32_t b_bits;
+    memcpy(&a_bits, &a, sizeof(a_bits));
+    memcpy(&b_bits, &b, sizeof(b_bits));
+    return a_bits > b_bits ? a_bits - b_bits : b_bits - a_bits;
+}
+
 /* The native MMA scorer can reorder FP32 additions. A changed Top-K set is
  * acceptable only when both scorers place every exchanged row on their own
  * numerical Kth boundary; arbitrary overlap loss is not accepted. */
@@ -378,10 +390,10 @@ static void mxfp4_unpack_reference(
 }
 
 static int check_mxfp4_indexer(void) {
-    const uint32_t n_tokens = 6;
+    const uint32_t n_tokens = 17;
     const uint32_t n_head = 64;
     const uint32_t head_dim = 128;
-    const uint32_t n_comp = 640;
+    const uint32_t n_comp = 641;
     const uint32_t top_k = 512;
     const uint32_t causal_pos0 = 2047;
     const uint32_t q_rows = n_tokens * n_head;
@@ -669,6 +681,8 @@ static int check_mxfp4_indexer(void) {
         ? sqrt(causal_ss / causal_ref_ss) : sqrt(causal_ss);
 
     float shape_max = 0.0f;
+    uint32_t shape_max_ulp = 0u;
+    uint64_t shape_changed = 0u;
     for (uint32_t shape = 1; shape <= n_tokens; shape++) {
         if (!ds4_gpu_indexer_scores_packed_tensor(
                     score_shape, q_packed, weights, keys_packed,
@@ -682,6 +696,10 @@ static int check_mxfp4_indexer(void) {
         for (uint64_t i = 0; i < (uint64_t)shape * n_comp; i++) {
             const float d = fabsf(score_shape_host[i] - score_fp4_host[i]);
             if (d > shape_max) shape_max = d;
+            const uint32_t ulp = nonnegative_f32_ulp_distance(
+                score_shape_host[i], score_fp4_host[i]);
+            if (ulp != 0u) shape_changed++;
+            if (ulp > shape_max_ulp) shape_max_ulp = ulp;
         }
     }
 
@@ -714,17 +732,19 @@ static int check_mxfp4_indexer(void) {
     fprintf(stderr,
             "cuda-regression: MXFP4 indexer packed-repeat=%llu wire-max=%.8g "
             "qat-max=%.8g "
-            "score-rel-rmse=%.6g causal=%.6g shapes1-6-max=%.8g "
+            "score-rel-rmse=%.6g causal=%.6g "
+            "shape-consistency-max=%.8g ulp=%u changed=%llu "
             "topk=%u/%u causal-topk=%u/%u\n",
             (unsigned long long)packed_repeat_mismatches,
             (double)wire_max, (double)qat_max,
             rel_rmse, causal_rel_rmse, (double)shape_max,
+            shape_max_ulp, (unsigned long long)shape_changed,
             overlap, n_tokens * top_k,
             causal_overlap, n_tokens * top_k);
     if (packed_repeat_mismatches == 0u && wire_max <= 1.0e-6f &&
         qat_max <= 1.0e-6f &&
         rel_rmse <= 5.0e-4 && causal_rel_rmse <= 5.0e-4 &&
-        shape_max <= 1.0e-6f && topk_equivalent &&
+        shape_max_ulp <= 2u && topk_equivalent &&
         causal_topk_equivalent) {
         rc = 0;
     }

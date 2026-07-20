@@ -237,109 +237,222 @@ __global__ void indexer_scores_mxfp4_kernel(
     const uint32_t lane = tid & 31u;
     const uint32_t warp = tid >> 5u;
     const uint32_t tile_token = blockIdx.y * 16u;
-    const uint32_t tile_comp = blockIdx.x * 64u;
-    const uint32_t comp_base = tile_comp + warp * 8u;
+    const uint32_t tile_comp = blockIdx.x * 128u;
+    const uint32_t comp_base0 = tile_comp + warp * 8u;
+    const uint32_t comp_base1 = comp_base0 + 64u;
 
-    __shared__ __align__(16) uint8_t q_shared[16 * DS4_INDEXER_FP4_ROW_BYTES];
-    __shared__ float weight_shared[16];
+    /* Two independent N64 groups reuse each query tile. Ping-pong buffers
+     * prefetch the next head while preserving ascending-head accumulation. */
+    __shared__ __align__(16) uint8_t
+        q_shared[2][16 * DS4_INDEXER_FP4_ROW_BYTES];
+    __shared__ float weight_shared[2][16];
 
-    const uint32_t n = comp_base + (lane >> 2u);
+    const uint32_t n0 = comp_base0 + (lane >> 2u);
+    const uint32_t n1 = comp_base1 + (lane >> 2u);
     const uint32_t k_byte = (lane & 3u) * 4u;
-    uint32_t b00 = 0, b01 = 0, b10 = 0, b11 = 0;
-    uint32_t sfb0 = 0, sfb1 = 0;
-    if (n < n_comp) {
-        const uint8_t *key = keys + (uint64_t)n * DS4_INDEXER_FP4_ROW_BYTES;
-        b00 = load_u32(key + k_byte);
-        b01 = load_u32(key + 16u + k_byte);
-        b10 = load_u32(key + 32u + k_byte);
-        b11 = load_u32(key + 48u + k_byte);
-        sfb0 = load_scale_pair(key, 0u);
-        sfb1 = load_scale_pair(key, 1u);
+    uint32_t b000 = 0, b001 = 0, b010 = 0, b011 = 0;
+    uint32_t b100 = 0, b101 = 0, b110 = 0, b111 = 0;
+    uint32_t sfb00 = 0, sfb01 = 0, sfb10 = 0, sfb11 = 0;
+    if (n0 < n_comp) {
+        const uint8_t *key = keys + (uint64_t)n0 * DS4_INDEXER_FP4_ROW_BYTES;
+        b000 = load_u32(key + k_byte);
+        b001 = load_u32(key + 16u + k_byte);
+        b010 = load_u32(key + 32u + k_byte);
+        b011 = load_u32(key + 48u + k_byte);
+        sfb00 = load_scale_pair(key, 0u);
+        sfb01 = load_scale_pair(key, 1u);
+    }
+    if (n1 < n_comp) {
+        const uint8_t *key = keys + (uint64_t)n1 * DS4_INDEXER_FP4_ROW_BYTES;
+        b100 = load_u32(key + k_byte);
+        b101 = load_u32(key + 16u + k_byte);
+        b110 = load_u32(key + 32u + k_byte);
+        b111 = load_u32(key + 48u + k_byte);
+        sfb10 = load_scale_pair(key, 0u);
+        sfb11 = load_scale_pair(key, 1u);
     }
 
-    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    for (uint32_t i = tid; i < 16u * 17u; i += blockDim.x) {
+        const uint32_t m = i / 17u;
+        const uint32_t word = i - m * 17u;
+        const uint32_t token = tile_token + m;
+        uint32_t value = 0u;
+        if (token < n_tokens) {
+            const uint8_t *src = q +
+                (uint64_t)token * n_head * DS4_INDEXER_FP4_ROW_BYTES;
+            value = load_u32(src + word * 4u);
+        }
+        reinterpret_cast<uint32_t *>(q_shared[0] +
+            (uint64_t)m * DS4_INDEXER_FP4_ROW_BYTES)[word] = value;
+    }
+    if (tid < 16u) {
+        const uint32_t token = tile_token + tid;
+        weight_shared[0][tid] = token < n_tokens
+            ? weights[(uint64_t)token * n_head]
+            : 0.0f;
+    }
+    __syncthreads();
+
+    float acc00 = 0.0f, acc01 = 0.0f;
+    float acc02 = 0.0f, acc03 = 0.0f;
+    float acc10 = 0.0f, acc11 = 0.0f;
+    float acc12 = 0.0f, acc13 = 0.0f;
     for (uint32_t h = 0; h < n_head; h++) {
-        for (uint32_t i = tid; i < 16u * 17u; i += blockDim.x) {
+        const uint32_t current = h & 1u;
+        const uint32_t next = current ^ 1u;
+        const uint32_t m0 = lane >> 2u;
+        const uint32_t m1 = m0 + 8u;
+        const uint32_t scale_m = (lane & 1u) * 8u + m0;
+        const uint8_t *a_row0 = q_shared[current] +
+            (uint64_t)m0 * DS4_INDEXER_FP4_ROW_BYTES;
+        const uint8_t *a_row1 = q_shared[current] +
+            (uint64_t)m1 * DS4_INDEXER_FP4_ROW_BYTES;
+        const uint8_t *a_scale = q_shared[current] +
+            (uint64_t)scale_m * DS4_INDEXER_FP4_ROW_BYTES;
+
+        const uint32_t a00 = load_u32(a_row0 + k_byte);
+        const uint32_t a01 = load_u32(a_row1 + k_byte);
+        const uint32_t a02 = load_u32(a_row0 + 16u + k_byte);
+        const uint32_t a03 = load_u32(a_row1 + 16u + k_byte);
+        const uint32_t a10 = load_u32(a_row0 + 32u + k_byte);
+        const uint32_t a11 = load_u32(a_row1 + 32u + k_byte);
+        const uint32_t a12 = load_u32(a_row0 + 48u + k_byte);
+        const uint32_t a13 = load_u32(a_row1 + 48u + k_byte);
+        const uint32_t sfa0 = load_scale_pair(a_scale, 0u);
+        const uint32_t sfa1 = load_scale_pair(a_scale, 1u);
+        const float weight0 = weight_shared[current][m0];
+        const float weight1 = weight_shared[current][m1];
+
+        const bool have_next = h + 1u < n_head;
+        uint32_t next_word0 = 0u;
+        uint32_t next_word1 = 0u;
+        float next_weight = 0.0f;
+        if (have_next) {
+            const uint32_t i = tid;
             const uint32_t m = i / 17u;
             const uint32_t word = i - m * 17u;
             const uint32_t token = tile_token + m;
-            uint32_t value = 0;
             if (token < n_tokens) {
                 const uint8_t *src = q +
-                    ((uint64_t)token * n_head + h) * DS4_INDEXER_FP4_ROW_BYTES;
-                value = load_u32(src + word * 4u);
+                    ((uint64_t)token * n_head + h + 1u) *
+                    DS4_INDEXER_FP4_ROW_BYTES;
+                next_word0 = load_u32(src + word * 4u);
             }
-            reinterpret_cast<uint32_t *>(q_shared +
-                (uint64_t)m * DS4_INDEXER_FP4_ROW_BYTES)[word] = value;
+            if (tid < 16u) {
+                const uint32_t i1 = tid + blockDim.x;
+                const uint32_t m_next = i1 / 17u;
+                const uint32_t word_next = i1 - m_next * 17u;
+                const uint32_t token_next = tile_token + m_next;
+                if (token_next < n_tokens) {
+                    const uint8_t *src = q +
+                        ((uint64_t)token_next * n_head + h + 1u) *
+                        DS4_INDEXER_FP4_ROW_BYTES;
+                    next_word1 = load_u32(src + word_next * 4u);
+                }
+                const uint32_t weight_token = tile_token + tid;
+                if (weight_token < n_tokens) {
+                    next_weight = weights[
+                        (uint64_t)weight_token * n_head + h + 1u];
+                }
+            }
         }
-        if (tid < 16u) {
-            const uint32_t token = tile_token + tid;
-            weight_shared[tid] = token < n_tokens
-                ? weights[(uint64_t)token * n_head + h]
-                : 0.0f;
-        }
-        __syncthreads();
-
-        const uint32_t m0 = lane >> 2u;
-        const uint32_t m1 = m0 + 8u;
-        const uint32_t scale_m = (lane & 1u) * 8u + (lane >> 2u);
-        const uint8_t *a_row0 = q_shared + (uint64_t)m0 * DS4_INDEXER_FP4_ROW_BYTES;
-        const uint8_t *a_row1 = q_shared + (uint64_t)m1 * DS4_INDEXER_FP4_ROW_BYTES;
-        const uint8_t *a_scale = q_shared +
-            (uint64_t)scale_m * DS4_INDEXER_FP4_ROW_BYTES;
 
         float d0, d1, d2, d3;
         mxfp4_mma_m16n8k64(
             d0, d1, d2, d3,
-            load_u32(a_row0 + k_byte),
-            load_u32(a_row1 + k_byte),
-            load_u32(a_row0 + 16u + k_byte),
-            load_u32(a_row1 + 16u + k_byte),
-            b00, b01,
+            a00, a01, a02, a03,
+            b000, b001,
             0.0f, 0.0f, 0.0f, 0.0f,
-            load_scale_pair(a_scale, 0u), sfb0);
+            sfa0, sfb00);
         mxfp4_mma_m16n8k64(
             d0, d1, d2, d3,
-            load_u32(a_row0 + 32u + k_byte),
-            load_u32(a_row1 + 32u + k_byte),
-            load_u32(a_row0 + 48u + k_byte),
-            load_u32(a_row1 + 48u + k_byte),
-            b10, b11,
+            a10, a11, a12, a13,
+            b010, b011,
             d0, d1, d2, d3,
-            load_scale_pair(a_scale, 1u), sfb1);
+            sfa1, sfb01);
+        acc00 += fmaxf(d0, 0.0f) * weight0;
+        acc01 += fmaxf(d1, 0.0f) * weight0;
+        acc02 += fmaxf(d2, 0.0f) * weight1;
+        acc03 += fmaxf(d3, 0.0f) * weight1;
 
-        acc0 += fmaxf(d0, 0.0f) * weight_shared[m0];
-        acc1 += fmaxf(d1, 0.0f) * weight_shared[m0];
-        acc2 += fmaxf(d2, 0.0f) * weight_shared[m1];
-        acc3 += fmaxf(d3, 0.0f) * weight_shared[m1];
-        __syncthreads();
+        mxfp4_mma_m16n8k64(
+            d0, d1, d2, d3,
+            a00, a01, a02, a03,
+            b100, b101,
+            0.0f, 0.0f, 0.0f, 0.0f,
+            sfa0, sfb10);
+        mxfp4_mma_m16n8k64(
+            d0, d1, d2, d3,
+            a10, a11, a12, a13,
+            b110, b111,
+            d0, d1, d2, d3,
+            sfa1, sfb11);
+        acc10 += fmaxf(d0, 0.0f) * weight0;
+        acc11 += fmaxf(d1, 0.0f) * weight0;
+        acc12 += fmaxf(d2, 0.0f) * weight1;
+        acc13 += fmaxf(d3, 0.0f) * weight1;
+
+        if (have_next) {
+            const uint32_t i = tid;
+            const uint32_t m = i / 17u;
+            const uint32_t word = i - m * 17u;
+            reinterpret_cast<uint32_t *>(q_shared[next] +
+                (uint64_t)m * DS4_INDEXER_FP4_ROW_BYTES)[word] = next_word0;
+            if (tid < 16u) {
+                const uint32_t i1 = tid + blockDim.x;
+                const uint32_t m_next = i1 / 17u;
+                const uint32_t word_next = i1 - m_next * 17u;
+                reinterpret_cast<uint32_t *>(q_shared[next] +
+                    (uint64_t)m_next * DS4_INDEXER_FP4_ROW_BYTES)[word_next] =
+                    next_word1;
+                weight_shared[next][tid] = next_weight;
+            }
+            __syncthreads();
+        }
     }
 
-    const uint32_t col0 = comp_base + (lane & 3u) * 2u;
+    const uint32_t col00 = comp_base0 + (lane & 3u) * 2u;
+    const uint32_t col10 = comp_base1 + (lane & 3u) * 2u;
     const uint32_t row0 = tile_token + (lane >> 2u);
     const uint32_t row1 = row0 + 8u;
+    const uint32_t visible0 = causal
+        ? (pos0 + row0 + 1u) / ratio : 0xffffffffu;
+    const uint32_t visible1 = causal
+        ? (pos0 + row1 + 1u) / ratio : 0xffffffffu;
     if (row0 < n_tokens) {
-        if (col0 < n_comp) {
-            scores[(uint64_t)row0 * n_comp + col0] =
-                causal && col0 >= (pos0 + row0 + 1u) / ratio
-                    ? -CUDART_INF_F : acc0 * scale;
+        if (col00 < n_comp) {
+            scores[(uint64_t)row0 * n_comp + col00] =
+                col00 >= visible0 ? -CUDART_INF_F : acc00 * scale;
         }
-        if (col0 + 1u < n_comp) {
-            scores[(uint64_t)row0 * n_comp + col0 + 1u] =
-                causal && col0 + 1u >= (pos0 + row0 + 1u) / ratio
-                    ? -CUDART_INF_F : acc1 * scale;
+        if (col00 + 1u < n_comp) {
+            scores[(uint64_t)row0 * n_comp + col00 + 1u] =
+                col00 + 1u >= visible0 ? -CUDART_INF_F : acc01 * scale;
+        }
+        if (col10 < n_comp) {
+            scores[(uint64_t)row0 * n_comp + col10] =
+                col10 >= visible0 ? -CUDART_INF_F : acc10 * scale;
+        }
+        if (col10 + 1u < n_comp) {
+            scores[(uint64_t)row0 * n_comp + col10 + 1u] =
+                col10 + 1u >= visible0 ? -CUDART_INF_F : acc11 * scale;
         }
     }
     if (row1 < n_tokens) {
-        if (col0 < n_comp) {
-            scores[(uint64_t)row1 * n_comp + col0] =
-                causal && col0 >= (pos0 + row1 + 1u) / ratio
-                    ? -CUDART_INF_F : acc2 * scale;
+        if (col00 < n_comp) {
+            scores[(uint64_t)row1 * n_comp + col00] =
+                col00 >= visible1 ? -CUDART_INF_F : acc02 * scale;
         }
-        if (col0 + 1u < n_comp) {
-            scores[(uint64_t)row1 * n_comp + col0 + 1u] =
-                causal && col0 + 1u >= (pos0 + row1 + 1u) / ratio
-                    ? -CUDART_INF_F : acc3 * scale;
+        if (col00 + 1u < n_comp) {
+            scores[(uint64_t)row1 * n_comp + col00 + 1u] =
+                col00 + 1u >= visible1 ? -CUDART_INF_F : acc03 * scale;
+        }
+        if (col10 < n_comp) {
+            scores[(uint64_t)row1 * n_comp + col10] =
+                col10 >= visible1 ? -CUDART_INF_F : acc12 * scale;
+        }
+        if (col10 + 1u < n_comp) {
+            scores[(uint64_t)row1 * n_comp + col10 + 1u] =
+                col10 + 1u >= visible1 ? -CUDART_INF_F : acc13 * scale;
         }
     }
 #else
@@ -557,7 +670,8 @@ extern "C" cudaError_t ds4_indexer_sm121_scores(
                 static_cast<const uint8_t *>(key_packed),
                 n_comp, n_tokens, pos0, n_head, ratio, scale, causal);
         } else {
-            const dim3 grid((n_comp + 63u) / 64u, (n_tokens + 15u) / 16u, 1u);
+            const dim3 grid((n_comp + 127u) / 128u,
+                            (n_tokens + 15u) / 16u, 1u);
             indexer_scores_mxfp4_kernel<<<grid, 256, 0, stream>>>(
                 scores,
                 static_cast<const uint8_t *>(q_packed),

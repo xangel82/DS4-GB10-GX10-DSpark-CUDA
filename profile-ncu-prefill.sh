@@ -18,9 +18,16 @@ MODE="${DS4_NCU_PREFILL_MODE:-occupancy}"
 OUTPUT="${DS4_NCU_PREFILL_OUTPUT:-/tmp/ds4-ncu-prefill-${RANGE}-${MODE}-$(date +%Y%m%d-%H%M%S)}"
 
 case "$RANGE" in
-  indexed|dense) ;;
+  indexed|dense)
+    NVTX_INCLUDE="regex:ds4\\/prefill\\/attention\\/token_tile\\/${RANGE}/"
+    KERNEL_NAME="regex:attention_tokentile_hmma_kernel"
+    ;;
+  scorer)
+    NVTX_INCLUDE="regex:ds4\\/prefill\\/indexer\\/score-mxfp4/"
+    KERNEL_NAME="regex:indexer_scores_mxfp4_kernel"
+    ;;
   *)
-    echo "DS4_NCU_PREFILL_RANGE must be indexed or dense" >&2
+    echo "DS4_NCU_PREFILL_RANGE must be indexed, dense or scorer" >&2
     exit 2
     ;;
 esac
@@ -81,8 +88,8 @@ ncu_args=(
   --target-processes all
   --profile-from-start off
   --nvtx
-  --nvtx-include "regex:ds4\\/prefill\\/attention\\/token_tile\\/${RANGE}/"
-  --kernel-name "regex:attention_tokentile_hmma_kernel"
+  --nvtx-include "$NVTX_INCLUDE"
+  --kernel-name "$KERNEL_NAME"
   --launch-count 1
   --cache-control none
   --clock-control none

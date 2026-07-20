@@ -1982,6 +1982,49 @@ processo `ds4-server`; dieci campioni `vmstat` non hanno mostrato paging
 sostenuto. Il margine GB10 resta stretto, ma non e' emersa crescita persistente
 attribuibile alle fusioni.
 
+#### D2R MoE tail-aware
+
+La pipeline fused D2R non assegna piu' sempre una CTA larga al residuo di ogni
+bucket esperto. Gate/up usa specializzazioni da 8, 16 e 32 righe; il down Q2_K
+usa 8, 16, 32 e 64 righe. Una singola costruzione expert-major separa in modo
+deterministico i tile pieni dalle code e conserva ordine degli assignment,
+routing weight, formule SwiGLU e accumulo esistenti. Le nuove liste richiedono
+soltanto pochi KiB nello scratch preallocato e non aggiungono copie permanenti
+dei pesi o delle attivazioni.
+
+Il self-test MMQ costruisce bucket con tutte le classi di coda usate in
+produzione e confronta la pipeline D2R con il riferimento. La regression CUDA
+`sm_121a` ha chiuso con `cuda long-context regression: OK`. Il log runtime che
+conferma il percorso e':
+
+```text
+ds4: CUDA complete fused MoE D2R prefill enabled (tail-aware 8/16/32 gate-up, 8/16/32/64 down, preallocated workspace)
+```
+
+Risultati Athena del 20 luglio 2026, con profilo `balanced`, chunk 8192 e lo
+stesso carico applicativo usato per il riferimento precedente:
+
+```text
+Richiesta / intervallo       Prefill medio   Chunk significativi
+cold 0..25785                940.93 t/s      994.65, 974.03, 958.98 t/s
+append 15877..57754          909.96 t/s      905.84, 940.13, 941.65, 938.11, 927.28 t/s
+append 28050..69918          844.86 t/s      942.80, 937.55, 930.84, 885.79 t/s
+append 69918..83345          751.28 t/s      625.11, 879.78, 577.96 t/s
+append 83345..98266          636.72 t/s      637.87, 635.77 t/s
+```
+
+Il cold prefill da circa 25K migliora da 902.67 a 940.93 t/s (`+4.2%`); sui
+tre chunk pieni il guadagno e' circa `+5%`. Il beneficio piu' importante e' la
+tenuta dei chunk pieni mentre cresce il contesto. Oltre 83K il costo della
+sparse attention torna dominante e limita il prefill a circa 637 t/s: questo
+tratto non e' un limite del residuo MoE.
+
+Il decode DSpark e' rimasto integro: 27.44 t/s a circa 70K, 26.00 t/s a 83K e
+24.66 t/s a 98K. Checkpoint canonici e append hanno continuato a funzionare e
+la RAM e' rimasta costante rispetto al riferimento. La patch viene quindi
+accettata come ottimizzazione MoE senza aumento del budget di memoria; non va
+interpretata come soluzione al decadimento attention oltre 80K.
+
 #### Copia iniziale CUDA pipelined
 
 Il caricamento del target da 80.76 GiB non usa piu' un unico `cudaMemcpy`

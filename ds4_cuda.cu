@@ -19761,7 +19761,8 @@ static int routed_moe_aligned_launch(
                 g_moe_complete_fused_notice = 1;
                 fprintf(stderr,
                         "ds4: CUDA complete fused MoE D2R prefill enabled "
-                        "(preallocated workspace, register gate/up, direct SwiGLU Q8 down)\n");
+                        "(tail-aware 8/16/32 gate-up, 8/16/32/64 down, "
+                        "preallocated workspace)\n");
             }
         } else {
             rc = -1;
@@ -20757,17 +20758,37 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
         const float unit = (float)(next_u32() >> 8u) * (1.0f / 16777216.0f);
         x_host[i] = 2.0f * unit - 1.0f;
     }
+    /* Exercise every production D2R tail specialization. Each token omits
+     * two distinct experts; the resulting expert counts are
+     * [192,180,170,160,150,132,120,48], covering 8/16/32 gate-up tails and
+     * 8/16/32/64 down tails while preserving a valid top-6 route. */
+    int omission_remaining[n_total_expert] = {0, 12, 22, 32, 42, 60, 72, 144};
     for (uint32_t t = 0; t < n_tokens; ++t) {
-        for (uint32_t s = 0; s < n_expert; ++s) {
-            const uint64_t pair = (uint64_t)t * n_expert + s;
-            /* Expert zero receives the maximum valid top-k load: exactly one
-             * assignment from every token. The other five slots remain
-             * distinct and rotate over the remaining experts. */
-            selected_host[pair] = s == 0u
-                ? 0
-                : (int32_t)(1u + ((t + s - 1u) % (n_total_expert - 1u)));
-            weights_host[pair] = 0.20f + 0.015f * (float)s;
+        int omit0 = -1;
+        int omit1 = -1;
+        for (uint32_t e = 0; e < n_total_expert; ++e) {
+            if (omit0 < 0 || omission_remaining[e] > omission_remaining[omit0]) {
+                omit1 = omit0;
+                omit0 = (int)e;
+            } else if (omit1 < 0 || omission_remaining[e] > omission_remaining[omit1]) {
+                omit1 = (int)e;
+            }
         }
+        if (omit0 < 0 || omit1 < 0 || omission_remaining[omit0] <= 0 ||
+            omission_remaining[omit1] <= 0) {
+            return 0;
+        }
+        --omission_remaining[omit0];
+        --omission_remaining[omit1];
+        uint32_t slot = 0;
+        for (uint32_t e = 0; e < n_total_expert; ++e) {
+            if ((int)e == omit0 || (int)e == omit1) continue;
+            const uint64_t pair = (uint64_t)t * n_expert + slot;
+            selected_host[pair] = (int32_t)e;
+            weights_host[pair] = 0.20f + 0.015f * (float)slot;
+            ++slot;
+        }
+        if (slot != n_expert) return 0;
     }
 
     std::vector<ds4_gpu_tensor *> allocations;

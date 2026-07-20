@@ -65,6 +65,32 @@ Log di attivazione atteso alla prima verifica speculativa:
 ds4: CUDA GB10 aligned MoE verifier enabled (computed IQ2 signs, coalesced Q8 staging, sum6 row span=64)
 ```
 
+### Tentativo Q8 exact-MMA del vocab head scartato
+
+E' stato portato in forma circoscritta l'exact-MMA Q8 pubblicato da
+`antirez/ds4` sul solo vocab head del target verifier `N=2..6`. Il kernel usava
+`mma.sync.m16n8k32.s8`, pesi Q8_0 raw e un tile interno completato a otto
+righe. La regressione ha confermato parita' bit per bit con il precedente
+kernel Q8 per tutte le cinque forme (`max-abs=0`, `bad=0`). Anche il confronto
+end-to-end contro il binario stabile `99b8dee` ha prodotto cinque risposte
+identiche, 82 cicli, 275 token proposti e 182 token committati in entrambi i
+casi.
+
+Il gate prestazionale e' invece fallito. Nel run di produzione il decode a
+66,7K token ha ottenuto `23,09 t/s`, contro il riferimento stabile di
+`26,47 t/s` a 63,5K, circa `-12,8%`; gli altri turni non hanno mostrato un
+incremento ripetibile. Il prefill e' rimasto invariato, con circa `976 t/s`
+sui primi due chunk lunghi. Sul profilo GB10 attuale il vocab head e' gia'
+servito dalla cache F16 calda: quantizzazione delle attivazioni, padding e
+riduzione del percorso Q8 raw costano piu' del traffico risparmiato. Il kernel,
+il dispatch e il relativo self-test sono stati quindi rimossi completamente.
+
+Rimane disponibile `tools/dspark_acceptance_fixture.py` come gate generico per
+le prossime ottimizzazioni. Confronta due binari entrambi con DSpark attivo e
+verifica contenuto, reasoning, finish reason, cicli, token proposti e token
+committati. Una comparazione target-only contro DSpark non e' un gate ASIS
+valido, perche' misura due percorsi di esecuzione differenti gia' nel baseline.
+
 ### Tentativo DSpark HMMA attention scartato
 
 Dopo `5d54db3` e' stato provato un percorso dedicato alla forma DSpark
@@ -947,6 +973,21 @@ ds4: CUDA Nsight capture started pos=6000 tokens=20
 ds4: CUDA Nsight capture stopped after 20 tokens reason=window-complete
 ```
 
+Per profilare il decode DSpark stabile sullo stesso workload senza includere il
+warm-up dei graph, usare lo script dedicato. Il default esegue il prefill fino a
+65.536 token, lascia 128 token al warm-up, cattura i 64 successivi e produce
+automaticamente sia il `.nsys-rep` sia le statistiche NVTX/kernel/API/memoria:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && ./profile-nsys-decode.sh 2>&1 | tee /tmp/ds4-nsys-decode.log
+```
+
+Prima del lancio non devono essere attivi `ds4-server` o `ds4-bench`. Le
+dimensioni possono essere cambiate con `DS4_NSYS_DECODE_FRONTIER`,
+`DS4_NSYS_DECODE_WARMUP` e `DS4_NSYS_DECODE_TOKENS`. Il trace usa
+`--cuda-graph-trace=node`, quindi serve per attribuire il tempo e non per
+confrontare direttamente i token/s con il run di produzione.
+
 ### 8a. Trace NVTX one-shot del prefill
 
 Il backend CUDA include range NVTX gerarchici che non modificano il calcolo e
@@ -1241,6 +1282,25 @@ costo di coordinamento tra stream supera il parallelismo disponibile.
 Il test con `DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6` non ha prodotto un miglioramento
 misurabile. Il percorso MoE non è quindi il candidato prioritario per la
 prossima modifica minimale.
+
+### Albero Markov tardivo su K3
+
+Il 20 luglio e' stato provato un secondo candidato Markov soltanto dopo
+`t1/t2` accettati e il rifiuto di `t3`. Il verifier target principale restava
+lineare; il ramo conservava il residuo esatto `max(p-q1,0)`, campionava
+un'alternativa senza replacement e, se accettata, eseguiva un singolo replay
+target dalla frontier dopo `t2`. La regressione CUDA sul doppio rifiuto e sulla
+seconda correzione residua e' passata, quindi la distribuzione target era
+preservata.
+
+Nel test end-to-end tra 9K e 66K token il decode e' rimasto nel profilo atteso,
+ma non e' emerso un incremento materiale. Il ramo interviene solo nel
+sottoinsieme dei cicli K3 che falliscono esattamente alla terza proposta, mentre
+un'alternativa accettata paga comunque un decode target aggiuntivo. Il rapporto
+beneficio/complessita' non era quindi sufficiente e l'intervento e' stato
+rimosso integralmente. Per migliorare il decode bisogna ridurre il costo del
+drafter/verifier gia' eseguito in tutti i cicli, non aggiungere lavoro dopo un
+fallimento raro.
 
 ### Aumentare soltanto la cache FP16
 

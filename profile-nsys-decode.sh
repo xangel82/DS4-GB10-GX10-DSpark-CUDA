@@ -13,19 +13,23 @@ FRONTIER="${DS4_NSYS_DECODE_FRONTIER:-65536}"
 WARMUP="${DS4_NSYS_DECODE_WARMUP:-128}"
 CAPTURE_TOKENS="${DS4_NSYS_DECODE_TOKENS:-64}"
 TAIL_TOKENS="${DS4_NSYS_DECODE_TAIL:-16}"
+DRAFT="${DS4_NSYS_DECODE_DRAFT:-5}"
+FIXED_VERIFY="${DS4_NSYS_DECODE_FIXED_VERIFY:-0}"
+GRAPHS="${DS4_NSYS_DECODE_GRAPHS:-1}"
 CTX="${DS4_CTX:-131072}"
 CHUNK="${DS4_PREFILL_CHUNK:-8192}"
 THREADS="${DS4_THREADS:-10}"
 OUTPUT="${DS4_NSYS_DECODE_OUTPUT:-/tmp/ds4-decode-dspark-$(date +%Y%m%d-%H%M%S)}"
 
-for value in "$FRONTIER" "$WARMUP" "$CAPTURE_TOKENS" "$TAIL_TOKENS" "$CTX" "$CHUNK" "$THREADS"; do
+for value in "$FRONTIER" "$WARMUP" "$CAPTURE_TOKENS" "$TAIL_TOKENS" "$DRAFT" "$FIXED_VERIFY" "$GRAPHS" "$CTX" "$CHUNK" "$THREADS"; do
   if [[ ! "$value" =~ ^[0-9]+$ ]]; then
     echo "Decode profile values must be non-negative integers" >&2
     exit 2
   fi
 done
-if (( FRONTIER == 0 || CAPTURE_TOKENS == 0 || CHUNK == 0 || THREADS == 0 )); then
-  echo "Frontier, capture tokens, chunk and threads must be positive" >&2
+if (( FRONTIER == 0 || CAPTURE_TOKENS == 0 || DRAFT == 0 || DRAFT > 5 ||
+      FIXED_VERIFY > 1 || GRAPHS > 1 || CHUNK == 0 || THREADS == 0 )); then
+  echo "Frontier, capture tokens, draft, chunk and threads must be valid; fixed-verify/graphs must be 0 or 1" >&2
   exit 2
 fi
 CAPTURE_START=$((FRONTIER + WARMUP))
@@ -56,7 +60,11 @@ export DS4_CUDA_DEFER_END_SYNC=1
 export DS4_METAL_GRAPH_TOKEN_SPLIT_LAYERS=0
 export DS4_CUDA_FUSED_COMPRESSOR_UPDATE=1
 export DS4_CUDA_TOKEN_GRAPH=1
-export DS4_CUDA_DSPARK_GRAPH=1
+if (( GRAPHS == 1 )); then
+  export DS4_CUDA_DSPARK_GRAPH=1
+else
+  unset DS4_CUDA_DSPARK_GRAPH
+fi
 export DS4_CUDA_COALESCED_F16_MATMUL=1
 export DS4_CUDA_Q8_U16_LOADS=1
 export DS4_CUDA_Q8_BATCH_REUSE=1
@@ -67,6 +75,11 @@ export DS4_CUDA_DSPARK_TENSOR_CORES_Q8=1
 export DS4_CUDA_DSPARK_TC_PAD_N=8
 export DS4_DSPARK_ALWAYS_DRAFT=1
 export DS4_DSPARK_NO_CIRCUIT_BREAKER=1
+if (( FIXED_VERIFY == 1 )); then
+  export DS4_DSPARK_FIXED_VERIFY=1
+else
+  unset DS4_DSPARK_FIXED_VERIFY
+fi
 export DS4_PREFILL_FINAL_LOGITS_ONLY=1
 export DS4_CUDA_NSYS_CAPTURE_START_POS="$CAPTURE_START"
 export DS4_CUDA_NSYS_CAPTURE_TOKENS="$CAPTURE_TOKENS"
@@ -77,7 +90,7 @@ unset DS4_CUDA_TOKEN_GRAPH_TIMING
 unset DS4_DSPARK_TIMING
 unset DS4_DSPARK_LOG
 
-echo "Nsight DSpark decode: frontier=$FRONTIER warmup=$WARMUP capture=$CAPTURE_TOKENS gen=$GEN_TOKENS"
+echo "Nsight DSpark decode: frontier=$FRONTIER warmup=$WARMUP capture=$CAPTURE_TOKENS gen=$GEN_TOKENS draft=$DRAFT fixed-verify=$FIXED_VERIFY graphs=$GRAPHS"
 echo "Report: ${OUTPUT}.nsys-rep"
 
 "$NSYS" profile \
@@ -94,7 +107,7 @@ echo "Report: ${OUTPUT}.nsys-rep"
     --cuda \
     --model "$MODEL" \
     --dspark "$DSPARK" \
-    --dspark-draft 5 \
+    --dspark-draft "$DRAFT" \
     --prompt-file "$PROMPT" \
     --frontiers "$FRONTIER" \
     --ctx-alloc "$CTX" \

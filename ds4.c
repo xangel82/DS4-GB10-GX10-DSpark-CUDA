@@ -18445,6 +18445,20 @@ static bool metal_graph_encode_layer_attention_batch(
             ok = metal_graph_q_stage_profile_boundary((name), il, pos0, n_tokens, &q_stage_t0); \
         } \
     } while (0)
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
+#define DS4_CUDA_NVTX_ATTN_BEGIN(name) do { \
+        if (nvtx_profile) { \
+            ds4_gpu_nvtx_range_push((name), \
+                                    cuda_prefill_nvtx_payload(il, n_tokens)); \
+        } \
+    } while (0)
+#define DS4_CUDA_NVTX_ATTN_END() do { \
+        if (nvtx_profile) ds4_gpu_nvtx_range_pop(); \
+    } while (0)
+#else
+#define DS4_CUDA_NVTX_ATTN_BEGIN(name) do { (void)(name); } while (0)
+#define DS4_CUDA_NVTX_ATTN_END() do { } while (0)
+#endif
     const float freq_base = layer_rope_freq_base(il);
     const float freq_scale = layer_rope_freq_scale(il);
     const float ext_factor = compressed && DS4_ROPE_SCALE_FACTOR > 1.0f ? 1.0f : 0.0f;
@@ -18468,6 +18482,7 @@ static bool metal_graph_encode_layer_attention_batch(
                               !metal_graph_use_reference_hc_decode() &&
                               metal_graph_enable_batch_hc_norm_fusion();
     bool flat_hc_f16 = input_hc_norm_f16_ready;
+    DS4_CUDA_NVTX_ATTN_BEGIN("ds4/layer/attn/hc-pre");
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     if (ok && !flat_hc_f16 && n_tokens >= 128u) {
         flat_hc_f16 = ds4_gpu_rms_norm_plain_rows_f16_tensor(
@@ -18558,6 +18573,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("hc_pre");
+    DS4_CUDA_NVTX_ATTN_END();
     if (ok && !fuse_hc_norm) {
         ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_attn_norm,
                                                   g->batch_attn_cur,
@@ -18574,6 +18590,7 @@ static bool metal_graph_encode_layer_attention_batch(
     }
     DS4_METAL_PROFILE_ATTN_STAGE("norm");
     DS4_METAL_PROFILE_Q_STAGE("pre_q");
+    DS4_CUDA_NVTX_ATTN_BEGIN("ds4/layer/attn/q-project");
     bool qkv_pair_projected = false;
     if (ok && qkv_rms_fused && n_tokens > 1) {
         qkv_pair_projected = ds4_gpu_matmul_q8_0_pair_tensor(
@@ -18760,6 +18777,8 @@ static bool metal_graph_encode_layer_attention_batch(
         DS4_METAL_PROFILE_Q_STAGE("rope");
     }
     DS4_METAL_PROFILE_ATTN_STAGE("q_path");
+    DS4_CUDA_NVTX_ATTN_END();
+    DS4_CUDA_NVTX_ATTN_BEGIN("ds4/layer/attn/kv-compressor");
     if (!qkv_rms_fused) {
         if (ok) ok = metal_graph_matmul_q8_0_named_tensor("attn_kv",
                                                           il,
@@ -19201,6 +19220,8 @@ static bool metal_graph_encode_layer_attention_batch(
             n_comp = g->layer_n_comp[il];
         }
         DS4_METAL_PROFILE_ATTN_STAGE("compressor");
+        DS4_CUDA_NVTX_ATTN_END();
+        DS4_CUDA_NVTX_ATTN_BEGIN("ds4/layer/attn/indexer");
 
         if (ok && ratio == 4) {
             const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
@@ -19496,6 +19517,8 @@ static bool metal_graph_encode_layer_attention_batch(
             }
         }
         if (ratio == 4) DS4_METAL_PROFILE_ATTN_STAGE("indexer_setup");
+        DS4_CUDA_NVTX_ATTN_END();
+        DS4_CUDA_NVTX_ATTN_BEGIN("ds4/layer/attn/core");
 
         if (ok && !zero_prefix && n_tokens <= g->raw_cap) {
             const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos0, n_tokens);
@@ -19769,6 +19792,10 @@ static bool metal_graph_encode_layer_attention_batch(
         }
     }
 
+    if (ratio == 0u) {
+        DS4_CUDA_NVTX_ATTN_END();
+        DS4_CUDA_NVTX_ATTN_BEGIN("ds4/layer/attn/core");
+    }
     if (ok && !raw_batch_attention && !batch_attention_done) {
         uint32_t raw_prefix_tokens = 0;
         if (zero_prefix && ratio != 0 && n_tokens <= g->raw_cap && comp_counts != NULL) {
@@ -19915,6 +19942,8 @@ static bool metal_graph_encode_layer_attention_batch(
         }
     }
     DS4_METAL_PROFILE_ATTN_STAGE("attention");
+    DS4_CUDA_NVTX_ATTN_END();
+    DS4_CUDA_NVTX_ATTN_BEGIN("ds4/layer/attn/output-project");
 
     if (ok) {
         metal_graph_debug_dump_tensor("kqv_out", g->batch_heads,
@@ -20022,6 +20051,8 @@ static bool metal_graph_encode_layer_attention_batch(
         }
     }
     DS4_METAL_PROFILE_ATTN_STAGE("output_proj");
+    DS4_CUDA_NVTX_ATTN_END();
+    DS4_CUDA_NVTX_ATTN_BEGIN("ds4/layer/attn/hc-post");
     if (ok && !attn_out_f16 && metal_graph_directional_steering_attn_enabled(g)) {
         ok = metal_graph_apply_directional_steering_attn(g, g->batch_attn_out, il, n_tokens);
     }
@@ -20062,6 +20093,7 @@ static bool metal_graph_encode_layer_attention_batch(
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("hc_post");
+    DS4_CUDA_NVTX_ATTN_END();
     ds4_gpu_tensor_free(after_attn_hc_view);
     ds4_gpu_tensor_free(attn_cur_view);
     ds4_gpu_tensor_free(hc_split_view);
@@ -20070,6 +20102,8 @@ static bool metal_graph_encode_layer_attention_batch(
     free(comp_counts);
 #undef DS4_METAL_PROFILE_ATTN_STAGE
 #undef DS4_METAL_PROFILE_Q_STAGE
+#undef DS4_CUDA_NVTX_ATTN_BEGIN
+#undef DS4_CUDA_NVTX_ATTN_END
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && !defined(DS4_NO_GPU)
     if (nvtx_profile) ds4_gpu_nvtx_range_pop();
 #endif

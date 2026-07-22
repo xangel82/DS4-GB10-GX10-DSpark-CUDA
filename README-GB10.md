@@ -2530,11 +2530,42 @@ La build esegue anche un test statistico indipendente: per distribuzioni
 artificiali `p=(0.7,0.3)` e `q=(0.2,0.8)`, draft + rejection devono ricostruire
 `p`; quando `p=q`, ogni proposta deve essere accettata.
 
+### Esperimento expert DSpark MXFP4 nativi: respinto
+
+Il 22 luglio 2026 è stato provato un sidecar alternativo che conservava gli
+expert FP4 ufficiali senza il passaggio `FP4 -> F32 -> Q4_K`. Il convertitore
+copiava le scale E8M0 e riordinava soltanto le nibble nel layout GGUF MXFP4;
+il target `ds4flash.gguf`, il sidecar Q4_K stabile e i pesi numerici FP4 non
+venivano modificati. Il runtime collegava poi gate, up e down al MMQ MXFP4 con
+attivazioni FP4 e MMA block-scaled native `sm_121a`.
+
+Il test end-to-end sul server Athena ha però mostrato una regressione grave:
+`5.94 t/s` nei primi 50 token e `4.86 t/s` nei successivi 50, con media
+`5.34 t/s`, contro l'area precedente di circa 19-22 t/s. Durante il run sono
+stati istanziati graph ausiliari da circa 4.300-4.800 nodi. Le righe denominate
+`CUDA MTP graph` non indicavano un avvio accidentale di MTP: DSpark condivide lo
+stesso gestore e le variant osservate `34..54` e `92..95` appartenevano alle
+famiglie verifier/draft DSpark.
+
+La conversione lossless aveva superato il self-test, quindi il collo di
+bottiglia più probabile non era il formato dei pesi ma il kernel scelto. Il MMQ
+generico aggiunge, nei micro-batch DSpark da 1-6 righe, costruzione delle mappe
+expert, gather/quantizzazione delle attivazioni e matmul distinti gate/up/down.
+Questi costi possono annullare il vantaggio delle Tensor Core FP4; il codice
+ufficiale usa invece un `fp4_gemm`/MegaMoE specializzato. Questa spiegazione è
+una diagnosi architetturale, non ancora un profilo kernel conclusivo.
+
+Decisione: percorso MXFP4 rimosso dalla working tree, sidecar Q4_K confermato
+come default e rollback al commit `04ee700`. Non reintrodurre MXFP4 tramite il
+MMQ generico. Un eventuale nuovo tentativo richiede prima un kernel grouped-MoE
+FP4 specifico per tiny batch, un microbenchmark isolato che batta Q4_K di almeno
+il 5% e soltanto dopo l'integrazione nei CUDA Graph e il test end-to-end.
+
 ## Rollback
 
 MMQ e token-tile usano guardie strutturali e non hanno flag runtime nel launcher.
 Il rollback corretto è quindi conservare il binario stabile precedente oppure
-ricompilare il commit stabile `59a5614` in un checkout separato. Non ripristinare
+ricompilare il commit stabile `04ee700` in un checkout separato. Non ripristinare
 singoli file CUDA: MMQ coinvolge anche `cuda/mmq`, header e test di regressione.
 
 Rollback e diagnostica ancora supportati:

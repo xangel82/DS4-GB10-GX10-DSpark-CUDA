@@ -50,6 +50,13 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+/* Enqueue an ordered device copy without waiting for completion.  Callers
+ * must end or synchronize the current command sequence before consuming the
+ * result on the host.  CUDA frontier transactions use this to collapse many
+ * tiny synchronous D2D copies into one stream wait. */
+int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                              const ds4_gpu_tensor *src, uint64_t src_offset,
+                              uint64_t bytes);
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
@@ -102,6 +109,12 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
 #endif
 int ds4_gpu_end_commands(void);
 int ds4_gpu_synchronize(void);
+
+/* CUDA-only diagnostic events.  Recording is asynchronous; elapsed waits for
+ * the end event and is used only by opt-in DSpark telemetry. */
+int ds4_gpu_timing_record(uint32_t slot);
+int ds4_gpu_timing_elapsed(uint32_t start_slot, uint32_t end_slot,
+                           double *milliseconds);
 
 /* CUDA/Nsight diagnostics. These calls enqueue no GPU work and are no-ops
  * unless NVTX tracing is requested. The prefill helpers additionally delimit
@@ -314,16 +327,18 @@ int ds4_gpu_sample_min_p_tensor(
 /* Verify DSpark draft tokens with lossless p/q rejection sampling entirely on
  * the device.  spec_logits contains n_rows target rows; draft_probs contains
  * the normalized q rows produced by ds4_gpu_sample_min_p_tensor; dspark_tokens
- * stores the pending current token followed by draft tokens.  The outputs are
- * one token and one accepted flag per draft row. */
+ * stores the pending current token followed by draft tokens.  Acceptance and
+ * residual uniforms are passed as five host scalars in the kernel arguments,
+ * avoiding two synchronous H2D copies on every verifier cycle.  The outputs
+ * are one token and one accepted flag per draft row. */
 int ds4_gpu_dspark_rejection_verify_tensor(
         ds4_gpu_tensor       *out_tokens,
         ds4_gpu_tensor       *out_accept,
         const ds4_gpu_tensor *spec_logits,
         const ds4_gpu_tensor *draft_probs,
         const ds4_gpu_tensor *dspark_tokens,
-        const ds4_gpu_tensor *accept_uniforms,
-        const ds4_gpu_tensor *residual_uniforms,
+        const float           accept_uniforms[5],
+        const float           residual_uniforms[5],
         uint32_t                n_rows,
         uint32_t                n_vocab,
         float                   temperature,

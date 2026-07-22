@@ -6367,6 +6367,14 @@ int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     return 1;
 }
 
+int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                              const ds4_gpu_tensor *src, uint64_t src_offset,
+                              uint64_t bytes) {
+    /* Metal copies are already encoded into the current command buffer and
+     * become visible when the caller ends that batch. */
+    return ds4_gpu_tensor_copy(dst, dst_offset, src, src_offset, bytes);
+}
+
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count) {

@@ -47,6 +47,16 @@ function text_value(prefix,    i,a) {
   v = value("updates"); if (v >= 0) graph_updates = v
   v = value("rebuilds"); if (v >= 0) graph_rebuilds = v
 }
+/dspark phases/ {
+  phase_cycles++
+  v = value("frontier"); if (v >= 0) { phase_frontier += v; phase_frontier_n++ }
+  v = value("submit"); if (v >= 0) { phase_submit += v; phase_submit_n++ }
+  v = value("target-path"); if (v >= 0) { phase_target += v; phase_target_n++ }
+  v = value("rejection-gpu"); if (v >= 0) { phase_rejection += v; phase_rejection_n++ }
+  v = value("meta-readback"); if (v >= 0) { phase_meta += v; phase_meta_n++ }
+  v = value("logits-readback"); if (v >= 0) { phase_logits += v; phase_logits_n++ }
+  v = value("commit"); if (v >= 0) { phase_commit += v; phase_commit_n++ }
+}
 /dspark timing/ {
   cycles++
   f = value("fused")
@@ -157,6 +167,16 @@ END {
     printf "Mean verifier draft time:  %.3f ms\n", verifier_draft_ms / verifier_cycles
     printf "Mean verifier target time: %.3f ms\n", verifier_verify_ms / verifier_cycles
     printf "Mean fused cycle:          %.3f ms\n", verifier_total_ms / verifier_cycles
+    if (phase_cycles > 0) {
+      printf "Verifier phase samples:    %d\n", phase_cycles
+      if (phase_frontier_n > 0) printf "  frontier transaction:    %.3f ms\n", phase_frontier / phase_frontier_n
+      if (phase_submit_n > 0) printf "  graph submit (host):      %.3f ms\n", phase_submit / phase_submit_n
+      if (phase_target_n > 0) printf "  target critical path:     %.3f ms\n", phase_target / phase_target_n
+      if (phase_rejection_n > 0) printf "  rejection kernel:         %.3f ms\n", phase_rejection / phase_rejection_n
+      if (phase_meta_n > 0) printf "  acceptance readback:      %.3f ms\n", phase_meta / phase_meta_n
+      if (phase_logits_n > 0) printf "  logits readback:          %.3f ms\n", phase_logits / phase_logits_n
+      if (phase_commit_n > 0) printf "  partial commit:           %.3f ms\n", phase_commit / phase_commit_n
+    }
     if (verifier_total_ms > 0) printf "Verifier-cycle throughput: %.3f t/s\n", 1000.0 * verifier_emitted / verifier_total_ms
     for (k = 1; k <= 5; k++) if (kn[k] > 0) {
       printf "  K=%d n=%d accept=%.2f%% emitted=%.3f draft=%.3fms target=%.3fms total=%.3fms rate=%.3ft/s\n",

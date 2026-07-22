@@ -10651,8 +10651,6 @@ typedef struct {
     ds4_gpu_tensor *dspark_confidence;
     ds4_gpu_tensor *dspark_draft_probs;
     ds4_gpu_tensor *dspark_sample_uniforms;
-    ds4_gpu_tensor *dspark_accept_uniforms;
-    ds4_gpu_tensor *dspark_residual_uniforms;
     ds4_gpu_tensor *dspark_verify_tokens;
     ds4_gpu_tensor *dspark_verify_accept;
     uint32_t dspark_n_raw;
@@ -10827,8 +10825,6 @@ static void metal_graph_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->logits);
     ds4_gpu_tensor_free(g->dspark_verify_accept);
     ds4_gpu_tensor_free(g->dspark_verify_tokens);
-    ds4_gpu_tensor_free(g->dspark_residual_uniforms);
-    ds4_gpu_tensor_free(g->dspark_accept_uniforms);
     ds4_gpu_tensor_free(g->dspark_sample_uniforms);
     ds4_gpu_tensor_free(g->dspark_draft_probs);
     ds4_gpu_tensor_free(g->dspark_confidence);
@@ -11570,10 +11566,6 @@ static bool metal_graph_alloc_raw_cap(
                 DS4_N_VOCAB * sizeof(float));
         g->dspark_sample_uniforms = ds4_gpu_tensor_alloc(
                 (uint64_t)DS4_DSPARK_BLOCK_SIZE * sizeof(float));
-        g->dspark_accept_uniforms = ds4_gpu_tensor_alloc(
-                (uint64_t)DS4_DSPARK_BLOCK_SIZE * sizeof(float));
-        g->dspark_residual_uniforms = ds4_gpu_tensor_alloc(
-                (uint64_t)DS4_DSPARK_BLOCK_SIZE * sizeof(float));
         g->dspark_verify_tokens = ds4_gpu_tensor_alloc(
                 (uint64_t)DS4_DSPARK_BLOCK_SIZE * sizeof(int32_t));
         g->dspark_verify_accept = ds4_gpu_tensor_alloc(
@@ -11746,8 +11738,6 @@ static bool metal_graph_alloc_raw_cap(
                       g->dspark_markov_delta && g->dspark_confidence &&
                       g->dspark_draft_probs &&
                       g->dspark_sample_uniforms &&
-                      g->dspark_accept_uniforms &&
-                      g->dspark_residual_uniforms &&
                       g->dspark_verify_tokens &&
                       g->dspark_verify_accept)) &&
                     g->prefill_tokens &&
@@ -13695,17 +13685,52 @@ static bool metal_graph_capture_prefix_index_state(
 static bool metal_graph_capture_prefix_gvr_hint(
         ds4_gpu_graph *g, uint32_t il, uint32_t prefix_index) {
     if (prefix_index >= g->spec_capture_prefixes ||
-        prefix_index >= DS4_SPEC_PREFIX_MAX ||
-        !g->layer_gvr_hint_valid[il]) {
+        prefix_index >= DS4_SPEC_PREFIX_MAX) {
         return true;
     }
     ds4_gpu_tensor *dst = g->spec_prefix_gvr_hint[prefix_index][il];
     ds4_gpu_tensor *src = g->layer_gvr_hint[il];
     if (!dst || !src) return true;
+    /* Keep this D2D node present even before the temporal hint becomes valid.
+     * The validity bit remains authoritative, while fixed graph topology
+     * avoids destroying and reinstantiating an otherwise identical K graph. */
+    const bool hint_valid = g->layer_gvr_hint_valid[il];
     const uint64_t bytes =
         (uint64_t)DS4_N_INDEXER_TOP_K * sizeof(uint32_t);
     const bool ok = ds4_gpu_tensor_copy(dst, 0, src, 0, bytes) != 0;
-    if (ok) g->spec_prefix_gvr_hint_valid[prefix_index][il] = true;
+    if (ok) g->spec_prefix_gvr_hint_valid[prefix_index][il] = hint_valid;
+    return ok;
+}
+
+/* Enqueue the complete target compressor/indexer frontier backup, then let
+ * the caller end the transaction once after the full layer set. */
+static bool metal_graph_encode_spec_frontier_backup(ds4_gpu_graph *g) {
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
+        ok = ds4_gpu_tensor_copy_async(g->spec_attn_state_kv[il], 0,
+                                       g->layer_attn_state_kv[il], 0, ab) != 0 &&
+             ds4_gpu_tensor_copy_async(g->spec_attn_state_score[il], 0,
+                                       g->layer_attn_state_score[il], 0, ab) != 0;
+        if (ok && ratio == 4) {
+            const uint64_t ib =
+                ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
+            ok = ds4_gpu_tensor_copy_async(g->spec_index_state_kv[il], 0,
+                                           g->layer_index_state_kv[il], 0, ib) != 0 &&
+                 ds4_gpu_tensor_copy_async(g->spec_index_state_score[il], 0,
+                                           g->layer_index_state_score[il], 0, ib) != 0;
+            /* Copying stale hint bytes is harmless when the saved validity bit
+             * is false, and keeps CUDA Graph topology independent of history. */
+            if (ok && g->spec_gvr_hint[il] && g->layer_gvr_hint[il]) {
+                const uint64_t gb =
+                    (uint64_t)DS4_N_INDEXER_TOP_K * sizeof(uint32_t);
+                ok = ds4_gpu_tensor_copy_async(g->spec_gvr_hint[il], 0,
+                                               g->layer_gvr_hint[il], 0, gb) != 0;
+            }
+        }
+    }
     return ok;
 }
 
@@ -26570,39 +26595,23 @@ static void spec_frontier_free(ds4_spec_frontier *f) {
     memset(f, 0, sizeof(*f));
 }
 
-static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
+static bool spec_frontier_snapshot_host(ds4_spec_frontier *f, ds4_session *s) {
+    if (!f || !s) return false;
     memset(f, 0, sizeof(*f));
     ds4_gpu_graph *g = &s->graph;
     f->mtp_n_raw = g->mtp_n_raw;
-
-    bool ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         f->n_comp[il] = g->layer_n_comp[il];
         f->n_index_comp[il] = g->layer_n_index_comp[il];
         f->gvr_hint_valid[il] = g->layer_gvr_hint_valid[il];
-        const uint32_t ratio = ds4_layer_compress_ratio(il);
-        if (ratio == 0) continue;
-        const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-        ok = ds4_gpu_tensor_copy(g->spec_attn_state_kv[il], 0,
-                                   g->layer_attn_state_kv[il], 0, ab) != 0 &&
-             ds4_gpu_tensor_copy(g->spec_attn_state_score[il], 0,
-                                   g->layer_attn_state_score[il], 0, ab) != 0;
-        if (ratio == 4) {
-            const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-            ok = ok &&
-                 ds4_gpu_tensor_copy(g->spec_index_state_kv[il], 0,
-                                       g->layer_index_state_kv[il], 0, ib) != 0 &&
-                 ds4_gpu_tensor_copy(g->spec_index_state_score[il], 0,
-                                       g->layer_index_state_score[il], 0, ib) != 0;
-            if (ok && f->gvr_hint_valid[il] && g->spec_gvr_hint[il] &&
-                g->layer_gvr_hint[il]) {
-                const uint64_t gb =
-                    (uint64_t)DS4_N_INDEXER_TOP_K * sizeof(uint32_t);
-                ok = ds4_gpu_tensor_copy(g->spec_gvr_hint[il], 0,
-                                         g->layer_gvr_hint[il], 0, gb) != 0;
-            }
-        }
     }
+    return true;
+}
+
+static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
+    if (!spec_frontier_snapshot_host(f, s)) return false;
+    bool ok = ds4_gpu_begin_commands() != 0;
+    if (ok) ok = metal_graph_encode_spec_frontier_backup(&s->graph);
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     if (ok) return true;
@@ -26622,22 +26631,22 @@ static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
         const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-        ok = ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
-                                   g->spec_attn_state_kv[il], 0, ab) != 0 &&
-             ds4_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
-                                   g->spec_attn_state_score[il], 0, ab) != 0;
+        ok = ds4_gpu_tensor_copy_async(g->layer_attn_state_kv[il], 0,
+                                       g->spec_attn_state_kv[il], 0, ab) != 0 &&
+             ds4_gpu_tensor_copy_async(g->layer_attn_state_score[il], 0,
+                                       g->spec_attn_state_score[il], 0, ab) != 0;
         if (ok && ratio == 4) {
             const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-            ok = ds4_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
-                                       g->spec_index_state_kv[il], 0, ib) != 0 &&
-                 ds4_gpu_tensor_copy(g->layer_index_state_score[il], 0,
-                                       g->spec_index_state_score[il], 0, ib) != 0;
+            ok = ds4_gpu_tensor_copy_async(g->layer_index_state_kv[il], 0,
+                                           g->spec_index_state_kv[il], 0, ib) != 0 &&
+                 ds4_gpu_tensor_copy_async(g->layer_index_state_score[il], 0,
+                                           g->spec_index_state_score[il], 0, ib) != 0;
             if (ok && f->gvr_hint_valid[il] && g->spec_gvr_hint[il] &&
                 g->layer_gvr_hint[il]) {
                 const uint64_t gb =
                     (uint64_t)DS4_N_INDEXER_TOP_K * sizeof(uint32_t);
-                ok = ds4_gpu_tensor_copy(g->layer_gvr_hint[il], 0,
-                                         g->spec_gvr_hint[il], 0, gb) != 0;
+                ok = ds4_gpu_tensor_copy_async(g->layer_gvr_hint[il], 0,
+                                               g->spec_gvr_hint[il], 0, gb) != 0;
             }
         }
     }
@@ -26665,26 +26674,26 @@ static bool spec_frontier_commit_prefix(ds4_session *s, uint32_t prefix_tokens) 
 
         g->layer_n_comp[il] = g->spec_prefix_n_comp[p][il];
         const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
-        ok = ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
-                                   g->spec_prefix_attn_state_kv[p][il], 0, ab) != 0 &&
-             ds4_gpu_tensor_copy(g->layer_attn_state_score[il], 0,
-                                   g->spec_prefix_attn_state_score[p][il], 0, ab) != 0;
+        ok = ds4_gpu_tensor_copy_async(g->layer_attn_state_kv[il], 0,
+                                       g->spec_prefix_attn_state_kv[p][il], 0, ab) != 0 &&
+             ds4_gpu_tensor_copy_async(g->layer_attn_state_score[il], 0,
+                                       g->spec_prefix_attn_state_score[p][il], 0, ab) != 0;
         if (ok && ratio == 4) {
             g->layer_n_index_comp[il] = g->spec_prefix_n_index_comp[p][il];
             const uint64_t ib = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
-            ok = ds4_gpu_tensor_copy(g->layer_index_state_kv[il], 0,
-                                       g->spec_prefix_index_state_kv[p][il], 0, ib) != 0 &&
-                 ds4_gpu_tensor_copy(g->layer_index_state_score[il], 0,
-                                       g->spec_prefix_index_state_score[p][il], 0, ib) != 0;
+            ok = ds4_gpu_tensor_copy_async(g->layer_index_state_kv[il], 0,
+                                           g->spec_prefix_index_state_kv[p][il], 0, ib) != 0 &&
+                 ds4_gpu_tensor_copy_async(g->layer_index_state_score[il], 0,
+                                           g->spec_prefix_index_state_score[p][il], 0, ib) != 0;
             g->layer_gvr_hint_valid[il] =
                 g->spec_prefix_gvr_hint_valid[p][il];
             if (ok && g->layer_gvr_hint_valid[il] &&
                 g->spec_prefix_gvr_hint[p][il] && g->layer_gvr_hint[il]) {
                 const uint64_t gb =
                     (uint64_t)DS4_N_INDEXER_TOP_K * sizeof(uint32_t);
-                ok = ds4_gpu_tensor_copy(g->layer_gvr_hint[il], 0,
-                                         g->spec_prefix_gvr_hint[p][il], 0,
-                                         gb) != 0;
+                ok = ds4_gpu_tensor_copy_async(g->layer_gvr_hint[il], 0,
+                                               g->spec_prefix_gvr_hint[p][il], 0,
+                                               gb) != 0;
             }
         }
     }
@@ -31327,11 +31336,22 @@ static int ds4_session_eval_dspark_cycle(
                   sizeof(verify_logits[0]))
         : NULL;
 
+    double phase_frontier_ms = -1.0;
+    double phase_submit_ms = -1.0;
+    double phase_target_path_ms = -1.0;
+    double phase_rejection_gpu_ms = -1.0;
+    double phase_meta_readback_ms = -1.0;
+    double phase_logits_readback_ms = -1.0;
+    double phase_commit_ms = 0.0;
+    const double frontier_t0 = timing ? now_sec() : 0.0;
     const bool have_frontier = spec_frontier_snapshot(&frontier, s);
     const bool have_ring_backup = have_frontier &&
         dspark_spec_ring_save(&s->graph, (uint32_t)start, verify_rows);
+    if (timing) phase_frontier_ms = (now_sec() - frontier_t0) * 1000.0;
     bool verifier_started = false;
     bool ok = have_frontier && have_ring_backup;
+    bool phase_target_started = false;
+    bool phase_target_ended = false;
     if (ok) {
         token_vec_push(&s->checkpoint, first_token);
         for (int i = 0; i < draft_n; i++) {
@@ -31344,6 +31364,10 @@ static int ds4_session_eval_dspark_cycle(
                     cuda_prefill_nvtx_payload((uint32_t)draft_n,
                                               verify_rows));
         }
+        if (timing) {
+            phase_target_started = ds4_gpu_timing_record(0u) != 0;
+        }
+        const double submit_t0 = timing ? now_sec() : 0.0;
         ok = metal_graph_verify_suffix_tops(&s->graph,
                                             &e->model,
                                             &e->weights,
@@ -31353,6 +31377,10 @@ static int ds4_session_eval_dspark_cycle(
                                             (uint32_t)draft_n,
                                             use_rejection_sampling ? NULL : row_tops,
                                             verify_logits);
+        if (timing) phase_submit_ms = (now_sec() - submit_t0) * 1000.0;
+        if (ok && phase_target_started) {
+            phase_target_ended = ds4_gpu_timing_record(1u) != 0;
+        }
         if (decode_nvtx) ds4_gpu_nvtx_range_pop();
     }
 
@@ -31367,26 +31395,30 @@ static int ds4_session_eval_dspark_cycle(
                     cuda_prefill_nvtx_payload((uint32_t)draft_n,
                                               verify_rows));
         }
-        ok = ds4_gpu_tensor_write(s->graph.dspark_accept_uniforms,
-                                  0,
-                                  accept_uniforms,
-                                  (uint64_t)draft_n * sizeof(float)) != 0 &&
-             ds4_gpu_tensor_write(s->graph.dspark_residual_uniforms,
-                                  0,
-                                  residual_uniforms,
-                                  (uint64_t)draft_n * sizeof(float)) != 0 &&
-             ds4_gpu_dspark_rejection_verify_tensor(
+        ok = ds4_gpu_dspark_rejection_verify_tensor(
                                   s->graph.dspark_verify_tokens,
                                   s->graph.dspark_verify_accept,
                                   s->graph.spec_logits,
                                   s->graph.dspark_draft_probs,
                                   s->graph.dspark_tokens,
-                                  s->graph.dspark_accept_uniforms,
-                                  s->graph.dspark_residual_uniforms,
+                                  accept_uniforms,
+                                  residual_uniforms,
                                   (uint32_t)draft_n,
                                   DS4_N_VOCAB,
                                   temperature,
-                                  min_p) != 0 &&
+                                  min_p) != 0;
+        bool phase_rejection_ended = false;
+        if (ok && timing && phase_target_ended) {
+            phase_rejection_ended = ds4_gpu_timing_record(2u) != 0;
+            if (phase_rejection_ended) {
+                (void)ds4_gpu_timing_elapsed(0u, 1u,
+                                             &phase_target_path_ms);
+                (void)ds4_gpu_timing_elapsed(1u, 2u,
+                                             &phase_rejection_gpu_ms);
+            }
+        }
+        const double meta_readback_t0 = timing ? now_sec() : 0.0;
+        ok = ok &&
              ds4_gpu_tensor_read(s->graph.dspark_verify_tokens,
                                   0,
                                   verify_tokens,
@@ -31395,6 +31427,14 @@ static int ds4_session_eval_dspark_cycle(
                                   0,
                                   verify_accept,
                                   (uint64_t)draft_n * sizeof(verify_accept[0])) != 0;
+        if (timing) {
+            phase_meta_readback_ms =
+                (now_sec() - meta_readback_t0) * 1000.0;
+            if (phase_target_ended && !phase_rejection_ended) {
+                (void)ds4_gpu_timing_elapsed(0u, 1u,
+                                             &phase_target_path_ms);
+            }
+        }
         if (decode_nvtx) ds4_gpu_nvtx_range_pop();
         for (int i = 0; ok && i < draft_n; i++) {
             if (!verify_accept[i]) {
@@ -31423,6 +31463,7 @@ static int ds4_session_eval_dspark_cycle(
     }
 
     const uint32_t continuation_row = (uint32_t)committed;
+    const double logits_readback_t0 = timing ? now_sec() : 0.0;
     if (ok && verify_logits) {
         memcpy(continuation_logits,
                verify_logits + (size_t)continuation_row * DS4_N_VOCAB,
@@ -31432,7 +31473,16 @@ static int ds4_session_eval_dspark_cycle(
                                                continuation_row,
                                                continuation_logits);
     }
+    if (timing) {
+        phase_logits_readback_ms =
+            (now_sec() - logits_readback_t0) * 1000.0;
+        if (phase_target_ended && phase_target_path_ms < 0.0) {
+            (void)ds4_gpu_timing_elapsed(0u, 1u,
+                                         &phase_target_path_ms);
+        }
+    }
 
+    const double commit_t0 = timing ? now_sec() : 0.0;
     if (ok && committed < draft_n) {
         const uint32_t prefix_rows = (uint32_t)committed + 1u;
         s->checkpoint.len = start;
@@ -31452,6 +31502,7 @@ static int ds4_session_eval_dspark_cycle(
                 : DS4_DSPARK_WINDOW;
         }
     }
+    if (timing) phase_commit_ms = (now_sec() - commit_t0) * 1000.0;
 
     if (ok) {
         const int n_accept = 1 + committed;
@@ -31503,6 +31554,21 @@ static int ds4_session_eval_dspark_cycle(
                     (done - t0) * 1000.0,
                     use_rejection_sampling ? 1 : 0,
                     use_rejection_sampling && committed < draft_n ? 1 : 0);
+            if (timing) {
+                fprintf(stderr,
+                        "ds4: dspark phases target_rows=%u frontier=%.3f ms "
+                        "submit=%.3f ms target-path=%.3f ms "
+                        "rejection-gpu=%.3f ms meta-readback=%.3f ms "
+                        "logits-readback=%.3f ms commit=%.3f ms\n",
+                        verify_rows,
+                        phase_frontier_ms,
+                        phase_submit_ms,
+                        phase_target_path_ms,
+                        phase_rejection_gpu_ms,
+                        phase_meta_readback_ms,
+                        phase_logits_readback_ms,
+                        phase_commit_ms);
+            }
         }
         spec_frontier_free(&frontier);
         free(verify_logits);

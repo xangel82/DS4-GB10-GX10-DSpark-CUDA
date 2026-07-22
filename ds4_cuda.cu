@@ -322,6 +322,8 @@ static int g_q8_u16_validation = -1;
 static int g_moe_gb10_sign_validation = -1;
 static int g_moe_tiny_direct_notice;
 static int g_batched_argmax_notice;
+enum { DS4_CUDA_TIMING_EVENT_COUNT = 8 };
+static cudaEvent_t g_timing_events[DS4_CUDA_TIMING_EVENT_COUNT];
 
 struct cuda_nsys_capture_state {
     int initialized;
@@ -2913,6 +2915,12 @@ extern "C" int ds4_gpu_init(void) {
 
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
+    for (uint32_t i = 0; i < DS4_CUDA_TIMING_EVENT_COUNT; i++) {
+        if (g_timing_events[i]) {
+            (void)cudaEventDestroy(g_timing_events[i]);
+            g_timing_events[i] = NULL;
+        }
+    }
     g_mmq_prefill_ready = 0;
     g_mmq_prefill_notice = 0;
     g_mmq_prefill_fallback_notice = 0;
@@ -3120,12 +3128,8 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
      * so record an ordered D2D memcpy node in either CUDA graph.  Keep the
      * existing synchronous semantics everywhere else. */
     if (g_token_graph_capturing || g_mtp_graph_capturing) {
-        return cuda_ok(cudaMemcpyAsync(dst_ptr,
-                                       src_ptr,
-                                       (size_t)bytes,
-                                       cudaMemcpyDeviceToDevice,
-                                       cudaStreamPerThread),
-                       "tensor copy async");
+        return ds4_gpu_tensor_copy_async(dst, dst_offset, src, src_offset,
+                                         bytes);
     }
     return cuda_ok(cudaMemcpy(dst_ptr,
                               src_ptr,
@@ -3134,8 +3138,65 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                    "tensor copy");
 }
 
+extern "C" int ds4_gpu_tensor_copy_async(
+        ds4_gpu_tensor       *dst,
+        uint64_t              dst_offset,
+        const ds4_gpu_tensor *src,
+        uint64_t              src_offset,
+        uint64_t              bytes) {
+    if (!dst || !src || dst_offset > dst->bytes || src_offset > src->bytes ||
+        bytes > dst->bytes - dst_offset || bytes > src->bytes - src_offset) {
+        return 0;
+    }
+    if (bytes == 0) return 1;
+    return cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
+                                   (const char *)src->ptr + src_offset,
+                                   (size_t)bytes,
+                                   cudaMemcpyDeviceToDevice,
+                                   cudaStreamPerThread),
+                   "tensor copy async");
+}
+
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
+
+extern "C" int ds4_gpu_timing_record(uint32_t slot) {
+    if (slot >= DS4_CUDA_TIMING_EVENT_COUNT || g_token_graph_capturing ||
+        g_mtp_graph_capturing) {
+        return 0;
+    }
+    if (!g_timing_events[slot]) {
+        if (!cuda_ok(cudaEventCreate(&g_timing_events[slot]),
+                     "timing event create")) {
+            g_timing_events[slot] = NULL;
+            return 0;
+        }
+    }
+    return cuda_ok(cudaEventRecord(g_timing_events[slot], cudaStreamPerThread),
+                   "timing event record");
+}
+
+extern "C" int ds4_gpu_timing_elapsed(
+        uint32_t start_slot, uint32_t end_slot, double *milliseconds) {
+    if (!milliseconds || start_slot >= DS4_CUDA_TIMING_EVENT_COUNT ||
+        end_slot >= DS4_CUDA_TIMING_EVENT_COUNT ||
+        !g_timing_events[start_slot] || !g_timing_events[end_slot]) {
+        return 0;
+    }
+    if (!cuda_ok(cudaEventSynchronize(g_timing_events[end_slot]),
+                 "timing event synchronize")) {
+        return 0;
+    }
+    float elapsed = 0.0f;
+    if (!cuda_ok(cudaEventElapsedTime(&elapsed,
+                                      g_timing_events[start_slot],
+                                      g_timing_events[end_slot]),
+                 "timing event elapsed")) {
+        return 0;
+    }
+    *milliseconds = elapsed;
+    return 1;
+}
 
 static int cuda_token_graph_timing_enabled(void) {
 #ifdef DS4_CUDA_TOKEN_GRAPH_BUILD
@@ -11587,14 +11648,18 @@ __global__ static void sample_min_p_kernel(
     }
 }
 
+struct cuda_dspark_rejection_uniforms {
+    float accept[5];
+    float residual[5];
+};
+
 __global__ static void dspark_rejection_verify_kernel(
         int32_t *out_tokens,
         int32_t *out_accept,
         const float *target_logits,
         const float *draft_probs,
         const int32_t *dspark_tokens,
-        const float *accept_uniforms,
-        const float *residual_uniforms,
+        cuda_dspark_rejection_uniforms uniforms,
         uint32_t n_rows,
         uint32_t n_vocab,
         float temperature,
@@ -11669,7 +11734,7 @@ __global__ static void dspark_rejection_verify_kernel(
         float ap = q_tok > 0.0f ? p_tok / q_tok : 0.0f;
         if (ap > 1.0f) ap = 1.0f;
         if (ap < 0.0f || !isfinite(ap)) ap = 0.0f;
-        const float u = fminf(fmaxf(accept_uniforms[row], 0.0f),
+        const float u = fminf(fmaxf(uniforms.accept[row], 0.0f),
                               0.9999999403953552f);
         if (u <= ap) {
             accepted_shared = 1;
@@ -11725,7 +11790,7 @@ __global__ static void dspark_rejection_verify_kernel(
     scratch[tid] = range_mass;
     __syncthreads();
     if (tid == 0) {
-        float target = fminf(fmaxf(residual_uniforms[row], 0.0f),
+        float target = fminf(fmaxf(uniforms.residual[row], 0.0f),
                              0.9999999403953552f);
         float prefix = 0.0f;
         selected_thread = 0;
@@ -12729,8 +12794,8 @@ extern "C" int ds4_gpu_dspark_rejection_verify_tensor(
         const ds4_gpu_tensor *spec_logits,
         const ds4_gpu_tensor *draft_probs,
         const ds4_gpu_tensor *dspark_tokens,
-        const ds4_gpu_tensor *accept_uniforms,
-        const ds4_gpu_tensor *residual_uniforms,
+        const float           accept_uniforms[5],
+        const float           residual_uniforms[5],
         uint32_t                n_rows,
         uint32_t                n_vocab,
         float                   temperature,
@@ -12743,10 +12808,13 @@ extern "C" int ds4_gpu_dspark_rejection_verify_tensor(
         out_accept->bytes < (uint64_t)n_rows * sizeof(int32_t) ||
         spec_logits->bytes < (uint64_t)(n_rows + 1u) * n_vocab * sizeof(float) ||
         draft_probs->bytes < (uint64_t)n_rows * n_vocab * sizeof(float) ||
-        dspark_tokens->bytes < (uint64_t)(n_rows + 1u) * sizeof(int32_t) ||
-        accept_uniforms->bytes < (uint64_t)n_rows * sizeof(float) ||
-        residual_uniforms->bytes < (uint64_t)n_rows * sizeof(float)) {
+        dspark_tokens->bytes < (uint64_t)(n_rows + 1u) * sizeof(int32_t)) {
         return 0;
+    }
+    cuda_dspark_rejection_uniforms uniforms = {};
+    for (uint32_t i = 0; i < n_rows; i++) {
+        uniforms.accept[i] = accept_uniforms[i];
+        uniforms.residual[i] = residual_uniforms[i];
     }
     dspark_rejection_verify_kernel<<<n_rows, 1024>>>(
             (int32_t *)out_tokens->ptr,
@@ -12754,8 +12822,7 @@ extern "C" int ds4_gpu_dspark_rejection_verify_tensor(
             (const float *)spec_logits->ptr,
             (const float *)draft_probs->ptr,
             (const int32_t *)dspark_tokens->ptr,
-            (const float *)accept_uniforms->ptr,
-            (const float *)residual_uniforms->ptr,
+            uniforms,
             n_rows,
             n_vocab,
             temperature,

@@ -685,6 +685,7 @@ DS4_PREFILL_CHUNK=8192
 DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=112
 DS4_CUDA_Q8_F16_CACHE_MB=12288
 DS4_CUDA_COPY_SECONDARY_MODEL=1
+DS4_CUDA_SECONDARY_COPY_PIPELINED=1
 DS4_CUDA_DROP_COPIED_MODEL_PAGES=1
 DS4_CUDA_DSPARK_CACHE_PRIORITY=1
 DS4_CUDA_TOKEN_GRAPH=1
@@ -2284,9 +2285,21 @@ la disponibilita' dei byte sul device deve restare completa.
 
 Nel run del 17 luglio la copia primaria da 80,76 GiB ha impiegato 19,076
 secondi, pari a 4,23 GiB/s. La copia separata del sidecar da 10,70 GiB ha
-impiegato 69,999 secondi ed e' ora la parte dominante del caricamento modelli;
-non influisce sul risultato token-tile ma identifica il prossimo costo di
-startup misurabile.
+impiegato 69,999 secondi ed era diventata la parte dominante del caricamento.
+Il sidecar usa ora lo stesso upload pipelined del target, mantenendo invariati
+puntatore device, ownership e residenza finale. In caso di errore torna
+automaticamente alla copia monolitica; `DS4_CUDA_SECONDARY_COPY_PIPELINED=0`
+forza esplicitamente il percorso precedente per un confronto A/B o un rollback.
+Il log che prova l'attivazione e':
+
+```text
+ds4: CUDA pipelined secondary model copy 10.70 GiB (chunk=64 MiB, stages=4, direct-io=1)
+ds4: CUDA pipelined secondary model copy complete in ...s (10.70 GiB, ... GiB/s)
+```
+
+Questa patch modifica soltanto il trasferimento durante lo startup: formato
+GGUF, pesi, cache DSpark e kernel di decode non cambiano. Il tempo effettivo e
+la neutralita' del decode devono comunque essere confermati su Athena.
 
 I numeri Entrpi su PRO 6000 non vanno trasferiti direttamente alla GB10. Per
 accettare la patch servono sullo stesso prompt Athena: prefill superiore,

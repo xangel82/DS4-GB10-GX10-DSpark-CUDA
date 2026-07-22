@@ -46,6 +46,7 @@ function text_value(prefix,    i,a) {
   v = value("dspark_verify"); if (v >= 0) graph_verify = v
   v = value("updates"); if (v >= 0) graph_updates = v
   v = value("rebuilds"); if (v >= 0) graph_rebuilds = v
+  v = value("topology_reuses"); if (v >= 0) graph_topology_reuses = v
 }
 /dspark timing/ {
   cycles++
@@ -151,7 +152,7 @@ END {
   printf "K0 cooldown activations:   %d\n", k0_cooldowns
   printf "Pre-draft history bypasses:%6d\n", predraft_bypass
   printf "Circuit-breaker bypasses:  %d\n", bypass
-  if (graph_launches > 0) printf "DSpark graph launch/update: %d / %d (draft=%d verify=%d rebuilds=%d)\n", graph_launches, graph_updates, graph_draft, graph_verify, graph_rebuilds
+  if (graph_launches > 0) printf "DSpark graph launch/update: %d / %d (draft=%d verify=%d rebuilds=%d topology-reuses=%d)\n", graph_launches, graph_updates, graph_draft, graph_verify, graph_rebuilds, graph_topology_reuses
   if (verifier_cycles > 0) {
     printf "Mean verifier target rows: %.3f\n", verifier_rows / verifier_cycles
     printf "Mean verifier draft time:  %.3f ms\n", verifier_draft_ms / verifier_cycles

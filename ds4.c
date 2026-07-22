@@ -20898,9 +20898,14 @@ dspark_draft_encode_retry:
     }
     if (ok) ok = ds4_gpu_dspark_confidence_tensor(
             g->dspark_confidence,
-            /* The trained confidence head consumes proposal_hidden_states
-             * after the DSpark final RMSNorm, exactly like the LM head. */
-            g->batch_ffn_norm,
+            /* DeepSeek's forward_head() applies the final RMSNorm only to the
+             * LM-head input.  The confidence head consumes the HC-collapsed
+             * proposal hidden state before that norm, concatenated with the
+             * Markov embedding.  Keep the old buffer as an explicit A/B
+             * rollback, but make the released-model contract the default. */
+            getenv("DS4_DSPARK_CONFIDENCE_POST_NORM") != NULL
+                ? g->batch_ffn_norm
+                : g->batch_ffn_cur,
             g->dspark_markov_hidden,
             dspark_model->map,
             dspark_model->size,

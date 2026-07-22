@@ -8,6 +8,117 @@ conservare il throughput DSpark sui contesti lunghi.
 La sezione **Avvio rapido** è la procedura operativa aggiornata. Le sezioni
 successive conservano la cronologia tecnica, comprese prove scartate e rollback.
 
+## Resoconto rollback proiezioni — 22 luglio 2026
+
+Il branch `main` è stato riallineato alla versione pubblicata su `origin/main`,
+commit `3d113b8` (`Add detailed DSpark verifier profiling`). Il rollback ha
+rimosso da `main` sia il commit locale non pubblicato `0af7406` sia le modifiche
+non committate sviluppate durante l'esperimento sulle proiezioni.
+
+Prima del rollback è stato creato un backup completo e recuperabile:
+
+- branch locale: `codex/backup-projection-work-20260722-220423`;
+- commit del backup: `79c5072`;
+- bundle verificato: `/Users/MarcoPalaferri/Documents/Personale AI/ds4-gb10-lab-projection-backup-20260722-220423.bundle`.
+
+Il backup comprende l'infrastruttura per separare le policy di proiezione del
+target verifier e del DSpark decode, le policy sperimentali `auto`, i percorsi
+Q8/F16, la telemetria dei fallback, gli aggiornamenti del benchmark GB10, il
+microbenchmark dei blocchi di proiezione e la documentazione del piano.
+
+### Motivo del rollback
+
+L'obiettivo era aumentare il decode di almeno il 10% senza modificare la
+semantica del modello target. Nessuna delle policy sperimentali ha superato
+contemporaneamente i gate di prestazione e correttezza:
+
+- `target/auto` generale mostrava un aumento apparente del decode del 15,25%,
+  ma il tempo del target peggiorava del 5,72%, con hash differenti, fallback e
+  variazioni dell'acceptance;
+- `dspark/auto` peggiorava il decode del 5,49% e il drafter del 21,51%;
+- il solo riuso Q8 sul target produceva circa +1,31% di decode e +0,14% sul
+  target, insufficienti e accompagnati da hash e acceptance differenti;
+- la variante `narrow-f16` produceva +2,69% di decode, ma il target peggiorava
+  del 4,03% e l'hash non coincideva.
+
+Anche la promozione di `fixed-k2`, scelta da un benchmark greedy deterministico,
+non era rappresentativa del server reale con rejection sampling p/q. Nel
+carico server osservato, `fixed-k2` raggiungeva 18,619, 18,764 e 17,385 token/s
+ai contesti confrontabili. Ripristinando il draft completo e lo scheduler
+adaptive sono stati misurati 21,856, 22,289 e 21,548 token/s: un recupero
+rispettivamente del 17,39%, 18,79% e 23,95%, circa 19,86% aggregato. Questo è
+un recupero della regressione introdotta, non un miglioramento rispetto al
+baseline storico, che aveva mostrato richieste tra 25 e 29 token/s.
+
+La conclusione dell'esperimento è quindi negativa: l'obiettivo del +10% non è
+stato raggiunto e le modifiche non devono entrare nella pipeline di produzione.
+Il ramo pubblicato resta il riferimento stabile; le proiezioni devono rimanere
+sulla policy `legacy` finché un candidato non supera un confronto controllato
+end-to-end sul server reale.
+
+Per ispezionare nuovamente il lavoro senza modificare `main`:
+
+```bash
+git switch codex/backup-projection-work-20260722-220423
+```
+
+Gli eseguibili e gli oggetti di compilazione sono ignorati da Git e non vengono
+modificati da un reset del sorgente. In questo checkout sono stati rimossi con
+`make clean`; prima di distribuire il rollback occorre compilare nuovamente la
+versione `3d113b8`.
+
+## Patch DSpark circoscritte successive al rollback
+
+Il lavoro successivo non riapre le proiezioni e non modifica scheduler,
+sampling, quantizzazione o target verifier. Comprende soltanto due correzioni
+reversibili:
+
+1. la confidence head usa per default l'hidden DSpark dopo l'HC collapse e
+   prima della RMSNorm, come `forward_head()` nel modello DeepSeek pubblicato;
+2. ciascuna variante del verifier DSpark può conservare due topologie CUDA
+   Graph. Se `cudaGraphExecUpdate` non è compatibile con la prima, la seconda
+   viene riutilizzata invece di distruggere e ricostruire alternativamente gli
+   stessi eseguibili da 4K+ nodi osservati nei log Athena.
+
+Rollback A/B senza ricompilazione:
+
+```text
+DS4_DSPARK_CONFIDENCE_POST_NORM=1
+DS4_CUDA_DSPARK_GRAPH_TOPOLOGY_CACHE_DISABLE=1
+```
+
+Con `DS4_CUDA_DSPARK_GRAPH_VERBOSE=1`, il contatore `topology_reuses` indica
+quante ricostruzioni sono state evitate trovando una topologia compatibile nel
+secondo slot.
+
+### Risultato A/B Athena del 22 luglio 2026
+
+Un confronto sul server reale con telemetria attiva ha misurato il candidato
+con entrambe le correzioni abilitate e la baseline ottenuta impostando insieme
+le due variabili di rollback precedenti:
+
+| Metrica | Baseline | Correzioni attive | Variazione |
+| --- | ---: | ---: | ---: |
+| Decode pesato delle richieste | 19,362 t/s | 22,234 t/s | **+14,83%** |
+| Throughput dei cicli verifier | 19,438 t/s | 21,744 t/s | **+11,86%** |
+| Tempo medio target | 158,389 ms | 142,749 ms | **-9,87%** |
+| Tempo medio ciclo fused | 179,444 ms | 163,169 ms | **-9,07%** |
+| Acceptance verifier | 63,21% | 85,02% | **+21,81 punti** |
+| Ricostruzioni CUDA Graph nei primi 1000 launch | 77 | 33 | **-57,14%** |
+
+Il risultato è coerente con entrambi gli interventi. L'hidden pre-RMSNorm
+porta lo scheduler prevalentemente a `K=3` (605 cicli su 646), mentre la
+baseline post-RMSNorm sceglie prevalentemente `K=4` (760 cicli su 797). Le
+righe medie del target scendono così da 4,936 a 3,997. In parallelo, il secondo
+slot CUDA Graph registra 196 riusi di topologie che altrimenti avrebbero
+richiesto una nuova istanziazione.
+
+Il guadagno osservato supera quindi l'obiettivo del 10%. Il confronto conserva
+una cautela metodologica: l'aggregato candidato contiene sette request summary,
+quello baseline quattro. Le metriche interne concordano nella stessa direzione,
+ma una certificazione strettamente appaiata deve ripetere lo stesso insieme di
+richieste con telemetria disattivata.
+
 ## Stato corrente
 
 Stato al 18 luglio 2026:

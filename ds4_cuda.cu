@@ -260,7 +260,14 @@ static void cuda_token_graph_release(void);
  * MTP uses two eight-slot families.  DSpark gets five verifier and five
  * drafter eight-slot families, one for each K, so an adaptive K change never
  * forces a graph topology rebuild. */
-enum { DS4_CUDA_MTP_GRAPH_VARIANTS = 16 + 10 * 8 };
+enum {
+    DS4_CUDA_MTP_GRAPH_VARIANTS = 16 + 10 * 8,
+    /* The DSpark verifier has two observed, recurring graph topologies for a
+     * single logical K/position variant.  Retaining both prevents an
+     * alternating cudaGraphExecUpdate failure from destroying and rebuilding
+     * the executable that will be needed again a few cycles later. */
+    DS4_CUDA_MTP_GRAPH_TOPOLOGY_SLOTS = 2
+};
 enum {
     DS4_CUDA_MTP_GRAPH_VERIFY_FAMILY = 1u,
     DS4_CUDA_MTP_GRAPH_DRAFT_FAMILY = 2u,
@@ -268,7 +275,12 @@ enum {
     DS4_CUDA_DSPARK_DRAFT_GRAPH_K1_FAMILY = 128u,
     DS4_CUDA_MTP_GRAPH_ALL_FAMILIES = 4095u
 };
-static cudaGraphExec_t g_mtp_graph_exec[DS4_CUDA_MTP_GRAPH_VARIANTS];
+static cudaGraphExec_t
+    g_mtp_graph_exec[DS4_CUDA_MTP_GRAPH_VARIANTS]
+                    [DS4_CUDA_MTP_GRAPH_TOPOLOGY_SLOTS];
+static uint64_t
+    g_mtp_graph_exec_last_used[DS4_CUDA_MTP_GRAPH_VARIANTS]
+                              [DS4_CUDA_MTP_GRAPH_TOPOLOGY_SLOTS];
 static uint32_t g_mtp_graph_capture_variant;
 static int g_mtp_graph_capturing;
 static uint32_t g_mtp_graph_warm_mask;
@@ -283,7 +295,18 @@ static uint64_t g_dspark_graph_verifier_launches;
 static uint64_t g_dspark_graph_draft_launches;
 static uint64_t g_mtp_graph_updates;
 static uint64_t g_mtp_graph_rebuilds;
+static uint64_t g_mtp_graph_topology_reuses;
+static uint64_t g_mtp_graph_use_clock;
 static void cuda_mtp_graph_release(void);
+static uint32_t cuda_mtp_graph_topology_slots(uint32_t variant) {
+    /* Only DSpark verifier variants 16..55 exhibited the alternating
+     * topology.  MTP and DSpark drafter graphs retain their original single
+     * slot, keeping the extra graph memory tightly scoped. */
+    return variant >= 16u && variant < 56u &&
+           getenv("DS4_CUDA_DSPARK_GRAPH_TOPOLOGY_CACHE_DISABLE") == NULL
+        ? DS4_CUDA_MTP_GRAPH_TOPOLOGY_SLOTS
+        : 1u;
+}
 static uint32_t cuda_mtp_graph_family_bit(uint32_t variant) {
     if (variant < 8u) return DS4_CUDA_MTP_GRAPH_VERIFY_FAMILY;
     if (variant < 16u) return DS4_CUDA_MTP_GRAPH_DRAFT_FAMILY;
@@ -3606,9 +3629,13 @@ static void cuda_mtp_graph_release_family(uint32_t family) {
 #ifdef DS4_CUDA_TOKEN_GRAPH_BUILD
     for (uint32_t i = 0; i < DS4_CUDA_MTP_GRAPH_VARIANTS; i++) {
         if (cuda_mtp_graph_family_bit(i) != family) continue;
-        if (g_mtp_graph_exec[i]) {
-            (void)cudaGraphExecDestroy(g_mtp_graph_exec[i]);
-            g_mtp_graph_exec[i] = NULL;
+        for (uint32_t slot = 0;
+             slot < DS4_CUDA_MTP_GRAPH_TOPOLOGY_SLOTS; slot++) {
+            if (g_mtp_graph_exec[i][slot]) {
+                (void)cudaGraphExecDestroy(g_mtp_graph_exec[i][slot]);
+                g_mtp_graph_exec[i][slot] = NULL;
+            }
+            g_mtp_graph_exec_last_used[i][slot] = 0;
         }
     }
 #else
@@ -3625,9 +3652,13 @@ static void cuda_mtp_graph_release(void) {
         g_mtp_graph_capturing = 0;
     }
     for (uint32_t i = 0; i < DS4_CUDA_MTP_GRAPH_VARIANTS; i++) {
-        if (g_mtp_graph_exec[i]) {
-            (void)cudaGraphExecDestroy(g_mtp_graph_exec[i]);
-            g_mtp_graph_exec[i] = NULL;
+        for (uint32_t slot = 0;
+             slot < DS4_CUDA_MTP_GRAPH_TOPOLOGY_SLOTS; slot++) {
+            if (g_mtp_graph_exec[i][slot]) {
+                (void)cudaGraphExecDestroy(g_mtp_graph_exec[i][slot]);
+                g_mtp_graph_exec[i][slot] = NULL;
+            }
+            g_mtp_graph_exec_last_used[i][slot] = 0;
         }
     }
 #endif
@@ -3642,6 +3673,8 @@ static void cuda_mtp_graph_release(void) {
     g_dspark_graph_draft_launches = 0;
     g_mtp_graph_updates = 0;
     g_mtp_graph_rebuilds = 0;
+    g_mtp_graph_topology_reuses = 0;
+    g_mtp_graph_use_clock = 0;
 }
 
 static void cuda_token_graph_release(void) {
@@ -3968,6 +4001,26 @@ static cudaError_t cuda_token_graph_instantiate(cudaGraphExec_t *exec,
 #endif
 }
 
+static bool cuda_mtp_graph_try_update(cudaGraphExec_t exec,
+                                      cudaGraph_t graph,
+                                      cudaError_t *error_out) {
+    cudaError_t err = cudaSuccess;
+#if CUDART_VERSION >= 13000
+    cudaGraphExecUpdateResultInfo info = {};
+    err = cudaGraphExecUpdate(exec, graph, &info);
+    const bool updated = err == cudaSuccess &&
+                         info.result == cudaGraphExecUpdateSuccess;
+#else
+    cudaGraphNode_t error_node = NULL;
+    cudaGraphExecUpdateResult update_result = cudaGraphExecUpdateError;
+    err = cudaGraphExecUpdate(exec, graph, &error_node, &update_result);
+    const bool updated = err == cudaSuccess &&
+                         update_result == cudaGraphExecUpdateSuccess;
+#endif
+    if (error_out) *error_out = err;
+    return updated;
+}
+
 extern "C" int ds4_gpu_mtp_graph_end(void) {
 #ifndef DS4_CUDA_TOKEN_GRAPH_BUILD
     return 0;
@@ -3993,53 +4046,81 @@ extern "C" int ds4_gpu_mtp_graph_end(void) {
 
     size_t node_count = 0;
     (void)cudaGraphGetNodes(graph, NULL, &node_count);
-    cudaGraphExec_t *exec = &g_mtp_graph_exec[variant];
-    if (*exec) {
-#if CUDART_VERSION >= 13000
-        cudaGraphExecUpdateResultInfo info = {};
-        err = cudaGraphExecUpdate(*exec, graph, &info);
-        const bool updated = err == cudaSuccess &&
-                             info.result == cudaGraphExecUpdateSuccess;
-#else
-        cudaGraphNode_t error_node = NULL;
-        cudaGraphExecUpdateResult update_result = cudaGraphExecUpdateError;
-        err = cudaGraphExecUpdate(*exec, graph, &error_node, &update_result);
-        const bool updated = err == cudaSuccess &&
-                             update_result == cudaGraphExecUpdateSuccess;
-#endif
-        if (updated) {
+    const uint32_t slot_count = cuda_mtp_graph_topology_slots(variant);
+    cudaGraphExec_t *exec = NULL;
+    uint32_t exec_slot = 0;
+    uint32_t failed_updates = 0;
+    bool had_exec = false;
+    for (uint32_t slot = 0; slot < slot_count; slot++) {
+        if (!g_mtp_graph_exec[variant][slot]) continue;
+        had_exec = true;
+        if (cuda_mtp_graph_try_update(g_mtp_graph_exec[variant][slot],
+                                      graph, &err)) {
+            exec = &g_mtp_graph_exec[variant][slot];
+            exec_slot = slot;
             g_mtp_graph_updates++;
-        } else {
-            (void)cudaGetLastError();
-            (void)cudaGraphExecDestroy(*exec);
-            *exec = NULL;
+            if (failed_updates != 0) g_mtp_graph_topology_reuses++;
+            break;
         }
+        failed_updates++;
+        (void)cudaGetLastError();
     }
-    if (!*exec) {
-        err = cuda_token_graph_instantiate(exec, graph);
+    if (!exec) {
+        cudaGraphExec_t new_exec = NULL;
+        err = cuda_token_graph_instantiate(&new_exec, graph);
         if (err != cudaSuccess) {
             fprintf(stderr,
                     "ds4: CUDA MTP graph instantiate failed for variant %u: "
-                    "%s; disabling family=%s\n",
+                    "%s; %s family=%s\n",
                     variant,
                     cudaGetErrorString(err),
+                    had_exec ? "keeping cached topology for" : "disabling",
                     cuda_mtp_graph_family_name(variant));
             (void)cudaGraphDestroy(graph);
             (void)cudaGetLastError();
-            g_mtp_graph_disabled_families |= family;
-            cuda_mtp_graph_release_family(family);
+            if (!had_exec) {
+                g_mtp_graph_disabled_families |= family;
+                cuda_mtp_graph_release_family(family);
+            }
             return 0;
         }
+
+        exec_slot = slot_count;
+        for (uint32_t slot = 0; slot < slot_count; slot++) {
+            if (!g_mtp_graph_exec[variant][slot]) {
+                exec_slot = slot;
+                break;
+            }
+        }
+        if (exec_slot == slot_count) {
+            exec_slot = 0;
+            for (uint32_t slot = 1; slot < slot_count; slot++) {
+                if (g_mtp_graph_exec_last_used[variant][slot] <
+                    g_mtp_graph_exec_last_used[variant][exec_slot]) {
+                    exec_slot = slot;
+                }
+            }
+        }
+        const bool replaced = g_mtp_graph_exec[variant][exec_slot] != NULL;
+        if (replaced) {
+            (void)cudaGraphExecDestroy(
+                    g_mtp_graph_exec[variant][exec_slot]);
+        }
+        g_mtp_graph_exec[variant][exec_slot] = new_exec;
+        exec = &g_mtp_graph_exec[variant][exec_slot];
         g_mtp_graph_rebuilds++;
         fprintf(stderr,
-                "ds4: CUDA MTP graph variant=%u nodes=%zu %s\n",
+                "ds4: CUDA MTP graph variant=%u nodes=%zu topology-slot=%u "
+                "%s\n",
                 variant,
                 node_count,
-                g_mtp_graph_rebuilds <= DS4_CUDA_MTP_GRAPH_VARIANTS
-                    ? "instantiated"
-                    : "rebuilt after topology change");
+                exec_slot,
+                replaced ? "replaced" : "instantiated");
     }
     (void)cudaGraphDestroy(graph);
+
+    g_mtp_graph_exec_last_used[variant][exec_slot] =
+        ++g_mtp_graph_use_clock;
 
     err = cudaGraphLaunch(*exec, cudaStreamPerThread);
     if (err != cudaSuccess) {
@@ -4070,14 +4151,15 @@ extern "C" int ds4_gpu_mtp_graph_end(void) {
         fprintf(stderr,
                 "ds4: CUDA speculative graph launches=%llu mtp_draft=%llu "
                 "mtp_verify=%llu dspark_draft=%llu dspark_verify=%llu "
-                "updates=%llu rebuilds=%llu\n",
+                "updates=%llu rebuilds=%llu topology_reuses=%llu\n",
                 (unsigned long long)g_mtp_graph_launches,
                 (unsigned long long)g_mtp_graph_draft_launches,
                 (unsigned long long)g_mtp_graph_verifier_launches,
                 (unsigned long long)g_dspark_graph_draft_launches,
                 (unsigned long long)g_dspark_graph_verifier_launches,
                 (unsigned long long)g_mtp_graph_updates,
-                (unsigned long long)g_mtp_graph_rebuilds);
+                (unsigned long long)g_mtp_graph_rebuilds,
+                (unsigned long long)g_mtp_graph_topology_reuses);
     }
     return 1;
 #endif

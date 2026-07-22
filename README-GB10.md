@@ -87,6 +87,12 @@ DS4_DSPARK_CONFIDENCE_POST_NORM=1
 DS4_CUDA_DSPARK_GRAPH_TOPOLOGY_CACHE_DISABLE=1
 ```
 
+`run-dspark-server.sh` abilita esplicitamente entrambi i percorsi per default e
+stampa `confidence-input=pre-RMSNorm` e
+`verifier-topology-cache=two-slot` nella configurazione iniziale. Accetta le
+variabili di rollback precedenti soltanto con valore `1`; il valore `0` viene
+normalizzato rimuovendo la variabile dall'ambiente prima dell'avvio.
+
 Con `DS4_CUDA_DSPARK_GRAPH_VERBOSE=1`, il contatore `topology_reuses` indica
 quante ricostruzioni sono state evitate trovando una topologia compatibile nel
 secondo slot.

@@ -21,6 +21,8 @@ KV_COLD_MAX_TOKENS="${DS4_KV_CACHE_COLD_MAX_TOKENS:-$CTX}"
 ADVERTISE_CONTEXT_PCT="${DS4_ADVERTISE_CONTEXT_PCT:-85}"
 LONG_ANCHOR_MIN_TOKENS="${DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS:-$((CTX / 2))}"
 LONG_ANCHOR_TRIM_TOKENS="${DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS:-$((CTX / 16))}"
+CONFIDENCE_POST_NORM="${DS4_DSPARK_CONFIDENCE_POST_NORM:-0}"
+GRAPH_TOPOLOGY_CACHE_DISABLE="${DS4_CUDA_DSPARK_GRAPH_TOPOLOGY_CACHE_DISABLE:-0}"
 
 if [[ ! -f "$MODEL" ]]; then
   echo "Main model not found: $MODEL" >&2
@@ -36,6 +38,14 @@ mkdir -p "$KV_DIR"
 case "$PREFILL_POLICY" in
   canonical-only|coalesced|legacy) ;;
   *) echo "Invalid DS4_KV_PREFILL_CHECKPOINT_POLICY: $PREFILL_POLICY" >&2; exit 2 ;;
+esac
+case "$CONFIDENCE_POST_NORM" in
+  0|1) ;;
+  *) echo "Invalid DS4_DSPARK_CONFIDENCE_POST_NORM: $CONFIDENCE_POST_NORM (expected 0 or 1)" >&2; exit 2 ;;
+esac
+case "$GRAPH_TOPOLOGY_CACHE_DISABLE" in
+  0|1) ;;
+  *) echo "Invalid DS4_CUDA_DSPARK_GRAPH_TOPOLOGY_CACHE_DISABLE: $GRAPH_TOPOLOGY_CACHE_DISABLE (expected 0 or 1)" >&2; exit 2 ;;
 esac
 
 export DS4_CUDA_COPY_MODEL=1
@@ -147,6 +157,25 @@ else
   unset DS4_CUDA_MOE_TINY_DIRECT_Q4_ONLY
 fi
 
+# Match the released DeepSeek forward_head contract and retain both recurring
+# verifier graph topologies by default.  Normalize explicit zero values by
+# unsetting the rollback variables because the C/CUDA paths test their
+# presence, not their textual value.
+if [[ "$CONFIDENCE_POST_NORM" == "1" ]]; then
+  export DS4_DSPARK_CONFIDENCE_POST_NORM=1
+  CONFIDENCE_INPUT="post-RMSNorm (rollback)"
+else
+  unset DS4_DSPARK_CONFIDENCE_POST_NORM
+  CONFIDENCE_INPUT="pre-RMSNorm"
+fi
+if [[ "$GRAPH_TOPOLOGY_CACHE_DISABLE" == "1" ]]; then
+  export DS4_CUDA_DSPARK_GRAPH_TOPOLOGY_CACHE_DISABLE=1
+  GRAPH_TOPOLOGY_CACHE="single-slot (rollback)"
+else
+  unset DS4_CUDA_DSPARK_GRAPH_TOPOLOGY_CACHE_DISABLE
+  GRAPH_TOPOLOGY_CACHE="two-slot"
+fi
+
 # The look-ahead host capture is intentionally not used with DSpark yet.  The
 # normal token graphs remain available for fallback; separate K-aware families
 # handle the drafter and the fused [current + K draft] target verifier.
@@ -175,6 +204,7 @@ echo "Streaming: decode-heartbeat=${DS4_STREAM_HEARTBEAT_SEC}s"
 echo "KV:     policy=$DS4_KV_PREFILL_CHECKPOINT_POLICY keep-long-text-hits=$DS4_KV_KEEP_LONG_TEXT_HITS canonical-min-sec=$DS4_KV_CANONICAL_PREFILL_MIN_SEC cold-max=$KV_COLD_MAX_TOKENS long-anchor-min=$DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS trim=$DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS disk-mb=$KV_DISK_SPACE_MB"
 echo "Context guard: physical=$CTX advertise=${ADVERTISE_CONTEXT_PCT}%"
 echo "DSpark scheduler: full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY"
+echo "DSpark parity: confidence-input=$CONFIDENCE_INPUT, verifier-topology-cache=$GRAPH_TOPOLOGY_CACHE"
 echo "DSpark sampling: lossless p/q rejection for top_k=0 top_p=1 min-p policy (rollback DS4_DSPARK_REJECTION_DISABLE=1)"
 echo "GB10 verifier: Q8 batch-reuse=${DS4_CUDA_Q8_BATCH_REUSE:-0}, Q4-sidecar direct-MoE=${DS4_CUDA_MOE_TINY_DIRECT_Q4_ONLY:-0}, tiny-TC=${DS4_CUDA_DSPARK_TENSOR_CORES:-0}, tiny-TC-Q8=${DS4_CUDA_DSPARK_TENSOR_CORES_Q8:-0}"
 if [[ "${DS4_CUDA_NVTX:-0}" == "1" ||

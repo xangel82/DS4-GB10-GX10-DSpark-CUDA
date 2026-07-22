@@ -116,6 +116,28 @@ extern "C" int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map) {
     return ok;
 }
 
+extern "C" int ds4_gpu_set_projection_model_role(
+        const void *model_map,
+        ds4_gpu_model_role role) {
+    (void)model_map;
+    (void)role;
+    return 1;
+}
+
+
+extern "C" int ds4_gpu_projection_candidate_enabled(
+        const void *model_map) {
+    (void)model_map;
+    return 0;
+}
+
+
+extern "C" int ds4_gpu_set_projection_phase(
+        ds4_gpu_projection_phase phase) {
+    (void)phase;
+    return 1;
+}
+
 extern "C" int ds4_gpu_tensor_copy_f32_to_f16(
         ds4_gpu_tensor *dst,
         uint64_t dst_offset,

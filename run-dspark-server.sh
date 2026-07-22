@@ -11,7 +11,14 @@ MAX_TOKENS="${DS4_MAX_TOKENS:-2200}"
 THREADS="${DS4_THREADS:-10}"
 PORT="${DS4_PORT:-30007}"
 KV_DISK_SPACE_MB="${DS4_KV_DISK_SPACE_MB:-16384}"
-DRAFT="${DS4_DSPARK_DRAFT:-5}"
+# The final four-frontier GB10 sweep selected fixed K=2: it was the fastest
+# deterministic schedule (11.096 t/s) and kept the reference greedy hashes.
+# DS4_DSPARK_FIXED_VERIFY=0 restores the adaptive scheduler for diagnostics.
+DRAFT="${DS4_DSPARK_DRAFT:-2}"
+FIXED_VERIFY="${DS4_DSPARK_FIXED_VERIFY:-1}"
+PROJECTION_POLICY="${DS4_CUDA_PROJECTION_POLICY:-legacy}"
+TARGET_PROJECTION_POLICY="${DS4_CUDA_TARGET_PROJECTION_POLICY:-$PROJECTION_POLICY}"
+DSPARK_PROJECTION_POLICY="${DS4_CUDA_DSPARK_PROJECTION_POLICY:-legacy}"
 TELEMETRY="${DS4_TELEMETRY:-0}"
 STREAM_HEARTBEAT_SEC="${DS4_STREAM_HEARTBEAT_SEC:-140}"
 PREFILL_POLICY="${DS4_KV_PREFILL_CHECKPOINT_POLICY:-canonical-only}"
@@ -36,6 +43,26 @@ mkdir -p "$KV_DIR"
 case "$PREFILL_POLICY" in
   canonical-only|coalesced|legacy) ;;
   *) echo "Invalid DS4_KV_PREFILL_CHECKPOINT_POLICY: $PREFILL_POLICY" >&2; exit 2 ;;
+esac
+case "$PROJECTION_POLICY" in
+  legacy|auto|f16-real|f16-pad8|f16-out|q8-reuse) ;;
+  *) echo "Invalid DS4_CUDA_PROJECTION_POLICY: $PROJECTION_POLICY" >&2; exit 2 ;;
+esac
+case "$TARGET_PROJECTION_POLICY" in
+  legacy|auto|f16-real|f16-pad8|f16-out|q8-reuse) ;;
+  *) echo "Invalid DS4_CUDA_TARGET_PROJECTION_POLICY: $TARGET_PROJECTION_POLICY" >&2; exit 2 ;;
+esac
+case "$DSPARK_PROJECTION_POLICY" in
+  legacy|auto|f16-real|f16-pad8|f16-out|q8-reuse) ;;
+  *) echo "Invalid DS4_CUDA_DSPARK_PROJECTION_POLICY: $DSPARK_PROJECTION_POLICY" >&2; exit 2 ;;
+esac
+case "$DRAFT" in
+  1|2|3|4|5) ;;
+  *) echo "Invalid DS4_DSPARK_DRAFT: $DRAFT (expected 1..5)" >&2; exit 2 ;;
+esac
+case "$FIXED_VERIFY" in
+  0|1) ;;
+  *) echo "Invalid DS4_DSPARK_FIXED_VERIFY: $FIXED_VERIFY (expected 0 or 1)" >&2; exit 2 ;;
 esac
 
 export DS4_CUDA_COPY_MODEL=1
@@ -87,6 +114,10 @@ export DS4_CUDA_TOKEN_GRAPH=1
 export DS4_CUDA_DSPARK_GRAPH=1
 export DS4_CUDA_COALESCED_F16_MATMUL=1
 export DS4_CUDA_Q8_U16_LOADS=1
+export DS4_CUDA_PROJECTION_POLICY=legacy
+export DS4_CUDA_TARGET_PROJECTION_POLICY="$TARGET_PROJECTION_POLICY"
+export DS4_CUDA_DSPARK_PROJECTION_POLICY="$DSPARK_PROJECTION_POLICY"
+export DS4_CUDA_MTP_PROJECTION_POLICY=legacy
 export DS4_STREAM_HEARTBEAT_SEC="$STREAM_HEARTBEAT_SEC"
 # Long retries must find the exact full-prompt checkpoint even when the prompt
 # exceeds cold_max_tokens.  canonical-only writes no intermediate frontiers.
@@ -114,9 +145,18 @@ if [[ "${DS4_CUDA_DSPARK_TENSOR_CORES_Q8:-1}" == "1" ]]; then
 else
   unset DS4_CUDA_DSPARK_TENSOR_CORES_Q8
 fi
+# Fixed K=2 is the production default selected by the deterministic GB10
+# configuration sweep.  The implementation tests variable presence, so an
+# explicit zero must be removed from the child process environment.
+if [[ "$FIXED_VERIFY" == "1" ]]; then
+  export DS4_DSPARK_FIXED_VERIFY=1
+  DSPARK_SCHEDULE="fixed-k$DRAFT"
+else
+  unset DS4_DSPARK_FIXED_VERIFY
+  DSPARK_SCHEDULE="adaptive-k0..$DRAFT"
+fi
 # Athena serves one active decode stream, so never stop collecting DSpark
-# confidence/K telemetry because of a stale historical estimate.  K remains
-# adaptive after the draft; only the pre-draft performance bypass is removed.
+# confidence/K telemetry because of a stale historical estimate.
 if [[ "${DS4_DSPARK_ALWAYS_DRAFT:-1}" == "1" ]]; then
   export DS4_DSPARK_ALWAYS_DRAFT=1
 else
@@ -159,24 +199,26 @@ if [[ "$TELEMETRY" == "1" ]]; then
   export DS4_DSPARK_LOG=1
   export DS4_CUDA_TOKEN_GRAPH_VERBOSE=1
   export DS4_CUDA_DSPARK_GRAPH_VERBOSE=1
+  export DS4_CUDA_PROJECTION_VERBOSE=1
 else
   unset DS4_DSPARK_TIMING
   unset DS4_DSPARK_LOG
   unset DS4_CUDA_TOKEN_GRAPH_VERBOSE
   unset DS4_CUDA_DSPARK_GRAPH_VERBOSE
+  unset DS4_CUDA_PROJECTION_VERBOSE
 fi
 
 echo "Target: $MODEL"
-echo "DSpark: $DSPARK (draft=$DRAFT)"
+echo "DSpark: $DSPARK (draft=$DRAFT, schedule=$DSPARK_SCHEDULE)"
 echo "Cache:  profile=$MEMORY_PROFILE Q8->F16=${DS4_CUDA_Q8_F16_CACHE_MB} MiB compact-priority=${DS4_CUDA_DSPARK_CACHE_COMPACT:-0}, weight limit=${DS4_CUDA_WEIGHT_CACHE_LIMIT_GB} GiB"
 echo "Memory: secondary-copy=${DS4_CUDA_COPY_SECONDARY_MODEL:-1}, drop-copied-source-pages=${DS4_CUDA_DROP_COPIED_MODEL_PAGES:-0}"
 echo "Prefill: chunk=$PREFILL_CHUNK final-logits-only=${DS4_PREFILL_FINAL_LOGITS_ONLY:-0}"
 echo "Streaming: decode-heartbeat=${DS4_STREAM_HEARTBEAT_SEC}s"
 echo "KV:     policy=$DS4_KV_PREFILL_CHECKPOINT_POLICY keep-long-text-hits=$DS4_KV_KEEP_LONG_TEXT_HITS canonical-min-sec=$DS4_KV_CANONICAL_PREFILL_MIN_SEC cold-max=$KV_COLD_MAX_TOKENS long-anchor-min=$DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS trim=$DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS disk-mb=$KV_DISK_SPACE_MB"
 echo "Context guard: physical=$CTX advertise=${ADVERTISE_CONTEXT_PCT}%"
-echo "DSpark scheduler: full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY"
+echo "DSpark scheduler: $DSPARK_SCHEDULE, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY"
 echo "DSpark sampling: lossless p/q rejection for top_k=0 top_p=1 min-p policy (rollback DS4_DSPARK_REJECTION_DISABLE=1)"
-echo "GB10 verifier: Q8 batch-reuse=${DS4_CUDA_Q8_BATCH_REUSE:-0}, Q4-sidecar direct-MoE=${DS4_CUDA_MOE_TINY_DIRECT_Q4_ONLY:-0}, tiny-TC=${DS4_CUDA_DSPARK_TENSOR_CORES:-0}, tiny-TC-Q8=${DS4_CUDA_DSPARK_TENSOR_CORES_Q8:-0}"
+echo "GB10 projections: target-verifier=$DS4_CUDA_TARGET_PROJECTION_POLICY dspark-decode=$DS4_CUDA_DSPARK_PROJECTION_POLICY, Q8 batch-reuse=${DS4_CUDA_Q8_BATCH_REUSE:-0}, Q4-sidecar direct-MoE=${DS4_CUDA_MOE_TINY_DIRECT_Q4_ONLY:-0}, tiny-TC=${DS4_CUDA_DSPARK_TENSOR_CORES:-0}, tiny-TC-Q8=${DS4_CUDA_DSPARK_TENSOR_CORES_Q8:-0}"
 if [[ "${DS4_CUDA_NVTX:-0}" == "1" ||
       "${DS4_CUDA_NSYS_PREFILL_START_POS:-}" != "" ||
       "${DS4_CUDA_NSYS_PREFILL_START_POSITIONS:-}" != "" ||

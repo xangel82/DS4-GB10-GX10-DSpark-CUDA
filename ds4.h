@@ -146,9 +146,28 @@ typedef struct {
     uint64_t bytes;
 } ds4_session_payload_file;
 
+/* Aggregate DSpark work completed since the last reset.  The counters are
+ * deliberately session-local so benchmark frontiers can be measured without
+ * parsing diagnostic logs or enabling hot-path telemetry. */
+typedef struct {
+    uint64_t cycles;
+    uint64_t drafted_tokens;
+    uint64_t target_rows;
+    uint64_t committed_tokens;
+    uint64_t emitted_tokens;
+    double draft_seconds;
+    double target_seconds;
+    double total_seconds;
+} ds4_speculative_stats;
+
 int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt);
 void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
+/* CUDA-only, pre-graph diagnostic. Measures real DSpark projection blocks
+ * with persistent N<=6 scratch and CUDA events under explicit target/DSpark
+ * projection policies. Writes one CSV row per block and N. */
+int ds4_engine_projection_microbench(ds4_engine *e, FILE *out,
+                                     uint32_t iterations);
 int ds4_engine_vocab_size(ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
@@ -287,6 +306,8 @@ int ds4_session_eval_speculative_sample(ds4_session *s, int first_token,
                                         uint64_t *rng,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+void ds4_session_speculative_stats_reset(ds4_session *s);
+ds4_speculative_stats ds4_session_speculative_stats_get(const ds4_session *s);
 void ds4_session_invalidate(ds4_session *s);
 void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);

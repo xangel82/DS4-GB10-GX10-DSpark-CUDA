@@ -414,6 +414,22 @@ extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model
                                            in_dim, out_dim, x, n_tok, "q8_0");
 }
 
+extern "C" int ds4_gpu_matmul_q8_0_projection_tensor(
+        ds4_gpu_tensor *out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok,
+        ds4_gpu_projection_kind kind) {
+    (void)kind;
+    return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
+                                      weight_offset, in_dim, out_dim,
+                                      x, n_tok);
+}
+
 extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         ds4_gpu_tensor *out0,
         ds4_gpu_tensor *out1,
@@ -513,6 +529,28 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
             blocks,
             use_dp4a);
     return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp launch");
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_projection_pair_tensor(
+        ds4_gpu_tensor *out0,
+        ds4_gpu_tensor *out1,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight0_offset,
+        uint64_t weight1_offset,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok,
+        ds4_gpu_projection_kind kind0,
+        ds4_gpu_projection_kind kind1) {
+    (void)kind0;
+    (void)kind1;
+    return ds4_gpu_matmul_q8_0_pair_tensor(out0, out1, model_map, model_size,
+                                           weight0_offset, weight1_offset,
+                                           in_dim, out0_dim, out1_dim,
+                                           x, n_tok);
 }
 
 static int cuda_matmul_q8_0_hc_expand_tensor_labeled(

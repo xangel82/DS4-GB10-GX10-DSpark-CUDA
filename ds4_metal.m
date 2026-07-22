@@ -6197,6 +6197,12 @@ int ds4_gpu_init(void) {
     return 1;
 }
 
+int ds4_gpu_runtime_stats_get(ds4_gpu_runtime_stats *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    return 1;
+}
+
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
     if (!g_initialized && !ds4_gpu_init()) return NULL;
     if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax) return NULL;
@@ -7276,6 +7282,23 @@ int ds4_gpu_set_model_map_spans(
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size, 0);
+}
+
+int ds4_gpu_set_projection_model_role(const void *model_map,
+                                      ds4_gpu_model_role role) {
+    (void)model_map;
+    (void)role;
+    return 1;
+}
+
+int ds4_gpu_projection_candidate_enabled(const void *model_map) {
+    (void)model_map;
+    return 0;
+}
+
+int ds4_gpu_set_projection_phase(ds4_gpu_projection_phase phase) {
+    (void)phase;
+    return 1;
 }
 
 int ds4_gpu_set_model_fd(int fd) {
@@ -12980,6 +13003,22 @@ int ds4_gpu_matmul_q8_0_tensor(
     return ok;
 }
 
+int ds4_gpu_matmul_q8_0_projection_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        ds4_gpu_projection_kind kind) {
+    (void)kind;
+    return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
+                                      weight_offset, in_dim, out_dim,
+                                      x, n_tok);
+}
+
 int ds4_gpu_matmul_q8_0_pair_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,
@@ -12996,6 +13035,28 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
     (void)weight0_offset; (void)weight1_offset;
     (void)in_dim; (void)out0_dim; (void)out1_dim; (void)x; (void)n_tok;
     return 0;
+}
+
+int ds4_gpu_matmul_q8_0_projection_pair_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight0_offset,
+        uint64_t                weight1_offset,
+        uint64_t                in_dim,
+        uint64_t                out0_dim,
+        uint64_t                out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        ds4_gpu_projection_kind kind0,
+        ds4_gpu_projection_kind kind1) {
+    (void)kind0;
+    (void)kind1;
+    return ds4_gpu_matmul_q8_0_pair_tensor(out0, out1, model_map, model_size,
+                                           weight0_offset, weight1_offset,
+                                           in_dim, out0_dim, out1_dim,
+                                           x, n_tok);
 }
 
 int ds4_gpu_matmul_q8_0_f16_out_tensor(

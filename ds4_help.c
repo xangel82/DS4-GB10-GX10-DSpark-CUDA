@@ -120,7 +120,7 @@ static const char *tool_usage(ds4_help_tool tool) {
     case DS4_HELP_AGENT:
         return "Usage: ds4-agent [options]";
     case DS4_HELP_BENCH:
-        return "Usage: ds4-bench (--prompt-file FILE | --chat-prompt-file FILE) [options]";
+        return "Usage: ds4-bench ((--prompt-file FILE | --chat-prompt-file FILE) | --projection-microbench) [options]";
     case DS4_HELP_EVAL:
         return "Usage: ds4-eval [options]";
     }
@@ -356,6 +356,8 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
     opt(fp, c, "--dspark-draft N", "Maximum DSpark depth, 1..5. Default: model/runtime default.");
     opt(fp, c, "--csv FILE", "Write CSV there instead of stdout.");
     opt(fp, c, "--dump-frontier-logits-dir DIR", "Write one full-logit JSON file per frontier.");
+    opt(fp, c, "--projection-microbench", "CUDA: time real DSpark projection blocks for N=2..6 before graph capture; no prompt required.");
+    opt(fp, c, "--projection-microbench-iters N", "Measured iterations per block/N; N=5 runs twice this count. Default: 50");
     fputc('\n', fp);
 }
 

@@ -252,6 +252,7 @@ static uint64_t g_token_graph_prepared_launches;
 static uint64_t g_token_graph_prepares;
 static uint64_t g_token_graph_updates;
 static uint64_t g_token_graph_rebuilds;
+static size_t g_token_graph_nodes[DS4_CUDA_TOKEN_GRAPH_VARIANTS];
 static uint32_t *g_token_graph_token_device;
 static uint32_t *g_token_graph_token_host;
 static void cuda_token_graph_release(void);
@@ -283,6 +284,7 @@ static uint64_t g_dspark_graph_verifier_launches;
 static uint64_t g_dspark_graph_draft_launches;
 static uint64_t g_mtp_graph_updates;
 static uint64_t g_mtp_graph_rebuilds;
+static size_t g_mtp_graph_nodes[DS4_CUDA_MTP_GRAPH_VARIANTS];
 static void cuda_mtp_graph_release(void);
 static uint32_t cuda_mtp_graph_family_bit(uint32_t variant) {
     if (variant < 8u) return DS4_CUDA_MTP_GRAPH_VERIFY_FAMILY;
@@ -511,7 +513,8 @@ static uint64_t g_stream_expert_runtime_down_bytes;
 static uint64_t g_model_range_bytes;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
-static int g_q8_f16_disabled_after_oom;
+static int g_q8_f16_alloc_disabled[DS4_GPU_MODEL_ROLE_COUNT];
+static int g_q8_f16_use_disabled[DS4_GPU_MODEL_ROLE_COUNT];
 static int g_q8_f16_budget_notice_printed;
 static uint64_t g_model_load_progress_next;
 static uint64_t g_model_load_progress_last_bytes = UINT64_MAX;
@@ -519,6 +522,56 @@ static uint64_t g_model_load_progress_last_cgib = UINT64_MAX;
 static double g_model_load_progress_last;
 static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
+static const void *g_projection_model_maps[DS4_GPU_MODEL_ROLE_COUNT];
+static thread_local ds4_gpu_projection_phase g_projection_phase =
+    DS4_GPU_PROJECTION_PHASE_MODEL;
+
+static ds4_gpu_model_role cuda_projection_model_role(
+        const void *model_map) {
+    if (!model_map) return DS4_GPU_MODEL_OTHER;
+    for (int role = 0; role < DS4_GPU_MODEL_ROLE_COUNT; ++role) {
+        if (g_projection_model_maps[role] == model_map) {
+            return (ds4_gpu_model_role)role;
+        }
+    }
+    return DS4_GPU_MODEL_OTHER;
+}
+
+static ds4_gpu_model_role cuda_projection_active_role(
+        const void *model_map) {
+    if (g_projection_phase == DS4_GPU_PROJECTION_PHASE_TARGET ||
+        g_projection_phase == DS4_GPU_PROJECTION_PHASE_PREFILL) {
+        return DS4_GPU_MODEL_TARGET;
+    }
+    if (g_projection_phase == DS4_GPU_PROJECTION_PHASE_DSPARK) {
+        return DS4_GPU_MODEL_DSPARK;
+    }
+    if (g_projection_phase == DS4_GPU_PROJECTION_PHASE_MTP) {
+        return DS4_GPU_MODEL_MTP;
+    }
+    return cuda_projection_model_role(model_map);
+}
+
+static const char *cuda_projection_role_name(ds4_gpu_model_role role) {
+    switch (role) {
+    case DS4_GPU_MODEL_TARGET: return "target";
+    case DS4_GPU_MODEL_DSPARK: return "dspark";
+    case DS4_GPU_MODEL_MTP: return "mtp";
+    case DS4_GPU_MODEL_OTHER: return "other";
+    case DS4_GPU_MODEL_ROLE_COUNT: break;
+    }
+    return "other";
+}
+
+static int cuda_projection_cache_allows(
+        const void *model_map,
+        ds4_gpu_projection_kind kind);
+static void cuda_projection_cache_record(
+        ds4_gpu_projection_kind kind,
+        int cache_hit,
+        uint64_t resident_bytes);
+static void cuda_projection_cache_reset_resident(void);
+static void cuda_projection_prepare_scratch(void);
 
 /* Tensor offsets are only unique inside one GGUF.  Mix the mmap identity into
  * the lookup key so target and MTP caches stay O(1) even when both files use
@@ -946,6 +999,11 @@ static void cuda_q8_f16_cache_release_all(void) {
     g_q8_f16_ranges.clear();
     g_q8_f16_by_offset.clear();
     g_q8_f16_bytes = 0;
+    memset(g_q8_f16_alloc_disabled, 0,
+           sizeof(g_q8_f16_alloc_disabled));
+    memset(g_q8_f16_use_disabled, 0,
+           sizeof(g_q8_f16_use_disabled));
+    cuda_projection_cache_reset_resident();
 }
 
 static uint64_t cuda_parse_mib_env(const char *name, int *present) {
@@ -1080,26 +1138,40 @@ static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *labe
     return 1;
 }
 
-static void cuda_q8_f16_cache_disable_after_failure(const char *what, uint64_t request_bytes) {
-    if (!g_q8_f16_disabled_after_oom) {
+static void cuda_q8_f16_cache_disable_after_failure(
+        const void *model_map,
+        const char *what,
+        uint64_t request_bytes,
+        int disable_cached_use) {
+    const ds4_gpu_model_role role =
+        cuda_projection_active_role(model_map);
+    int *disabled = disable_cached_use
+        ? &g_q8_f16_use_disabled[role]
+        : &g_q8_f16_alloc_disabled[role];
+    if (!*disabled) {
         fprintf(stderr,
-                "ds4: CUDA q8 fp16 cache disabled after %s "
-                "(request=%.2f MiB cached=%.2f GiB); using q8 kernels\n",
+                "ds4: CUDA q8 fp16 %s disabled for %s after %s "
+                "(request=%.2f MiB cached=%.2f GiB); preserving other "
+                "projection scopes and using q8 kernels\n",
+                disable_cached_use ? "use" : "allocation",
+                cuda_projection_role_name(role),
                 what ? what : "allocation failure",
                 (double)request_bytes / 1048576.0,
                 (double)g_q8_f16_bytes / 1073741824.0);
     }
-    g_q8_f16_disabled_after_oom = 1;
-    if (!g_q8_f16_ranges.empty()) {
-        (void)cudaDeviceSynchronize();
-        cuda_q8_f16_cache_release_all();
-    }
+    *disabled = 1;
     (void)cudaGetLastError();
 }
 
-static int cuda_q8_f16_cache_allowed(const char *label, uint64_t in_dim, uint64_t out_dim) {
+static int cuda_q8_f16_cache_allowed(
+        const void *model_map,
+        const char *label,
+        uint64_t in_dim,
+        uint64_t out_dim) {
     if (g_quality_mode) return 0;
-    if (g_q8_f16_disabled_after_oom) return 0;
+    if (g_q8_f16_alloc_disabled[cuda_projection_active_role(model_map)]) {
+        return 0;
+    }
     if (getenv("DS4_CUDA_NO_Q8_F16_CACHE") != NULL) return 0;
     if (cuda_q8_f16_cache_limit_bytes() == 0) return 0;
     /* MTP verifies a tiny target batch.  Expanding its dense Q8 projections to
@@ -1164,6 +1236,12 @@ static const __half *cuda_q8_f16_ptr(
         uint64_t in_dim,
         uint64_t out_dim,
         const char *label) {
+    const ds4_gpu_model_role active_role =
+        cuda_projection_active_role(model_map);
+    if (g_projection_phase != DS4_GPU_PROJECTION_PHASE_PREFILL &&
+        g_q8_f16_use_disabled[active_role]) {
+        return NULL;
+    }
     auto exact = g_q8_f16_by_offset.find(
             cuda_model_offset_key(model_map, offset));
     if (exact != g_q8_f16_by_offset.end()) {
@@ -1184,7 +1262,8 @@ static const __half *cuda_q8_f16_ptr(
             return r.device_ptr;
         }
     }
-    if (!cuda_q8_f16_cache_allowed(label, in_dim, out_dim)) return NULL;
+    if (!cuda_q8_f16_cache_allowed(
+                model_map, label, in_dim, out_dim)) return NULL;
 
     const char *q8 = cuda_model_range_ptr(model_map, offset, weight_bytes, "q8_0");
     if (!q8) return NULL;
@@ -1198,7 +1277,8 @@ static const __half *cuda_q8_f16_ptr(
     if (err != cudaSuccess) {
         fprintf(stderr, "ds4: CUDA q8 fp16 cache alloc failed (%.2f MiB): %s\n",
                 (double)out_bytes / 1048576.0, cudaGetErrorString(err));
-        cuda_q8_f16_cache_disable_after_failure("allocation failure", out_bytes);
+        cuda_q8_f16_cache_disable_after_failure(
+                model_map, "allocation failure", out_bytes, 0);
         return NULL;
     }
     const uint64_t blocks = (in_dim + 31) / 32;
@@ -1210,7 +1290,8 @@ static const __half *cuda_q8_f16_ptr(
                                                           blocks);
     if (!cuda_ok(cudaGetLastError(), "q8 fp16 dequant launch")) {
         (void)cudaFree(dev);
-        cuda_q8_f16_cache_disable_after_failure("dequant launch failure", out_bytes);
+        cuda_q8_f16_cache_disable_after_failure(
+                model_map, "dequant launch failure", out_bytes, 0);
         return NULL;
     }
     g_q8_f16_ranges.push_back({model_map, offset, weight_bytes, in_dim, out_dim, dev});
@@ -2910,6 +2991,7 @@ extern "C" int ds4_gpu_init(void) {
      * K+1 batches, so prepare its byte-identical IQ2 lookup table before any
      * CUDA graph capture starts. */
     (void)cuda_moe_gb10_validate_signs();
+    cuda_projection_prepare_scratch();
     return 1;
 }
 
@@ -2942,8 +3024,9 @@ extern "C" void ds4_gpu_cleanup(void) {
     cuda_model_range_release_all();
     cuda_model_load_progress_reset();
     cuda_q8_f16_cache_release_all();
-    g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
+    memset(g_projection_model_maps, 0, sizeof(g_projection_model_maps));
+    g_projection_phase = DS4_GPU_PROJECTION_PHASE_MODEL;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
         (void)cudaFree(r.device_ptr);
     }
@@ -3671,6 +3754,7 @@ static void cuda_mtp_graph_release_family(uint32_t family) {
             (void)cudaGraphExecDestroy(g_mtp_graph_exec[i]);
             g_mtp_graph_exec[i] = NULL;
         }
+        g_mtp_graph_nodes[i] = 0;
     }
 #else
     (void)family;
@@ -3690,6 +3774,7 @@ static void cuda_mtp_graph_release(void) {
             (void)cudaGraphExecDestroy(g_mtp_graph_exec[i]);
             g_mtp_graph_exec[i] = NULL;
         }
+        g_mtp_graph_nodes[i] = 0;
     }
 #endif
     g_mtp_graph_capture_variant = 0;
@@ -3735,6 +3820,7 @@ static void cuda_token_graph_release(void) {
             (void)cudaGraphExecDestroy(g_token_graph_exec[i]);
             g_token_graph_exec[i] = NULL;
         }
+        g_token_graph_nodes[i] = 0;
     }
     if (g_token_graph_token_device) {
         (void)cudaFree(g_token_graph_token_device);
@@ -4100,6 +4186,7 @@ extern "C" int ds4_gpu_mtp_graph_end(void) {
                     ? "instantiated"
                     : "rebuilt after topology change");
     }
+    g_mtp_graph_nodes[variant] = node_count;
     (void)cudaGraphDestroy(graph);
 
     err = cudaGraphLaunch(*exec, cudaStreamPerThread);
@@ -4256,6 +4343,7 @@ extern "C" int ds4_gpu_token_graph_end_token(uint32_t token) {
                 g_token_graph_rebuilds <= DS4_CUDA_TOKEN_GRAPH_VARIANTS
                     ? "instantiated" : "rebuilt after topology change");
     }
+    g_token_graph_nodes[variant] = node_count;
     (void)cudaGraphDestroy(graph);
 
     if (prepare_only) {
@@ -4702,7 +4790,6 @@ static int cuda_model_set_host_map(const void *model_map, uint64_t model_size) {
         cuda_model_load_progress_reset();
     }
     cuda_q8_f16_cache_release_all();
-    g_q8_f16_disabled_after_oom = 0;
     g_q8_f16_budget_notice_printed = 0;
     for (const cuda_q8_f32_range &r : g_q8_f32_ranges) {
         (void)cudaFree(r.device_ptr);
@@ -4917,6 +5004,24 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
     return 1;
 }
 
+extern "C" int ds4_gpu_set_projection_model_role(
+        const void *model_map,
+        ds4_gpu_model_role role) {
+    if (!model_map || role < 0 || role >= DS4_GPU_MODEL_ROLE_COUNT) return 0;
+    g_projection_model_maps[role] = model_map;
+    return 1;
+}
+
+extern "C" int ds4_gpu_set_projection_phase(
+        ds4_gpu_projection_phase phase) {
+    if (phase < DS4_GPU_PROJECTION_PHASE_MODEL ||
+        phase > DS4_GPU_PROJECTION_PHASE_MTP) {
+        return 0;
+    }
+    g_projection_phase = phase;
+    return 1;
+}
+
 extern "C" int ds4_gpu_pro_q4_expert_table_auto_available(void) {
     return 0;
 }
@@ -5020,16 +5125,43 @@ extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_s
 }
 
 extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label) {
+    return ds4_gpu_cache_q8_f16_projection_range(
+            model_map, model_size, offset, bytes, in_dim, out_dim,
+            label, DS4_GPU_PROJ_OTHER);
+}
+
+extern "C" int ds4_gpu_cache_q8_f16_projection_range(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const char *label,
+        ds4_gpu_projection_kind kind) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
+    if (!cuda_projection_cache_allows(model_map, kind)) return 1;
     const char *cache_label = label ? label : "q8_0";
     if (getenv("DS4_CUDA_Q8_F32_PRELOAD") != NULL &&
         cuda_q8_f32_cache_allowed(cache_label, in_dim, out_dim)) {
         if (cuda_q8_f32_ptr(model_map, offset, bytes, in_dim, out_dim, cache_label)) return 1;
         return 1;
     }
-    if (!cuda_q8_f16_cache_allowed(cache_label, in_dim, out_dim)) return 1;
-    if (cuda_q8_f16_ptr(model_map, offset, bytes, in_dim, out_dim, cache_label)) return 1;
+    if (!cuda_q8_f16_cache_allowed(
+                model_map, cache_label, in_dim, out_dim)) return 1;
+    const size_t ranges_before = g_q8_f16_ranges.size();
+    const uint64_t bytes_before = g_q8_f16_bytes;
+    if (cuda_q8_f16_ptr(model_map, offset, bytes, in_dim, out_dim, cache_label)) {
+        cuda_projection_cache_record(
+                kind,
+                g_q8_f16_ranges.size() == ranges_before,
+                g_q8_f16_bytes >= bytes_before
+                    ? g_q8_f16_bytes - bytes_before
+                    : 0u);
+        return 1;
+    }
+    cuda_projection_cache_record(kind, 0, 0);
     return 1;
 }
 
@@ -5860,6 +5992,11 @@ __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n
     if (i < n) out[i] = __float2half(x[i]);
 }
 
+__global__ static void f16_to_f32_kernel(float *out, const __half *x, uint64_t n) {
+    uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __half2float(x[i]);
+}
+
 extern "C" int ds4_gpu_tensor_copy_f32_to_f16(
         ds4_gpu_tensor       *dst,
         uint64_t              dst_offset,
@@ -5942,6 +6079,130 @@ __global__ static void matmul_f16_pair_coalesced_warp8_kernel(
     if (lane == 0) {
         if (wr0) out0[row] = sum0;
         if (wr1) out1[row] = sum1;
+    }
+}
+
+/* Narrow verifier projections have many fewer output rows than input
+ * columns.  cuBLAS first rounds every activation to F16 and pads N to the
+ * Tensor Core tile, while the ordinary CUDA kernel rereads the same weight
+ * row once per token.  One warp owns an output row here and keeps all N=2..6
+ * accumulators live, so each F16 weight is fetched once and reused across the
+ * verifier batch.  Four warps per CTA provide enough independent rows for the
+ * 64/256-output shapes without inflating the HC 24-output launch. */
+__global__ static void matmul_f16_narrow_batch4_kernel(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_tok) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint64_t row = (uint64_t)blockIdx.x * 4u + warp;
+    if (row >= out_dim || warp >= 4u) return;
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    float sum2 = 0.0f;
+    float sum3 = 0.0f;
+    float sum4 = 0.0f;
+    float sum5 = 0.0f;
+    const __half *wr = w + row * in_dim;
+    for (uint64_t i = lane; i < in_dim; i += 32u) {
+        const float wf = __half2float(wr[i]);
+        sum0 += wf * x[i];
+        sum1 += wf * x[in_dim + i];
+        if (n_tok > 2u) sum2 += wf * x[2u * in_dim + i];
+        if (n_tok > 3u) sum3 += wf * x[3u * in_dim + i];
+        if (n_tok > 4u) sum4 += wf * x[4u * in_dim + i];
+        if (n_tok > 5u) sum5 += wf * x[5u * in_dim + i];
+    }
+    sum0 = warp_sum_f32(sum0);
+    sum1 = warp_sum_f32(sum1);
+    if (n_tok > 2u) sum2 = warp_sum_f32(sum2);
+    if (n_tok > 3u) sum3 = warp_sum_f32(sum3);
+    if (n_tok > 4u) sum4 = warp_sum_f32(sum4);
+    if (n_tok > 5u) sum5 = warp_sum_f32(sum5);
+    if (lane == 0u) {
+        out[row] = sum0;
+        out[out_dim + row] = sum1;
+        if (n_tok > 2u) out[2u * out_dim + row] = sum2;
+        if (n_tok > 3u) out[3u * out_dim + row] = sum3;
+        if (n_tok > 4u) out[4u * out_dim + row] = sum4;
+        if (n_tok > 5u) out[5u * out_dim + row] = sum5;
+    }
+}
+
+/* The ratio-4 indexer compressors share one activation.  Keeping both weight
+ * rows and all tiny-batch accumulators in the same warp also avoids the
+ * activation conversion and padded memset used by the paired cuBLAS path. */
+__global__ static void matmul_f16_narrow_pair_batch4_kernel(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_tok) {
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint64_t row = (uint64_t)blockIdx.x * 4u + warp;
+    if (row >= out_dim || warp >= 4u) return;
+
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+    float a3 = 0.0f, a4 = 0.0f, a5 = 0.0f;
+    float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f;
+    float b3 = 0.0f, b4 = 0.0f, b5 = 0.0f;
+    const __half *wr0 = w0 + row * in_dim;
+    const __half *wr1 = w1 + row * in_dim;
+    for (uint64_t i = lane; i < in_dim; i += 32u) {
+        const float wa = __half2float(wr0[i]);
+        const float wb = __half2float(wr1[i]);
+        const float x0 = x[i];
+        const float x1 = x[in_dim + i];
+        a0 += wa * x0; b0 += wb * x0;
+        a1 += wa * x1; b1 += wb * x1;
+        if (n_tok > 2u) {
+            const float xv = x[2u * in_dim + i];
+            a2 += wa * xv; b2 += wb * xv;
+        }
+        if (n_tok > 3u) {
+            const float xv = x[3u * in_dim + i];
+            a3 += wa * xv; b3 += wb * xv;
+        }
+        if (n_tok > 4u) {
+            const float xv = x[4u * in_dim + i];
+            a4 += wa * xv; b4 += wb * xv;
+        }
+        if (n_tok > 5u) {
+            const float xv = x[5u * in_dim + i];
+            a5 += wa * xv; b5 += wb * xv;
+        }
+    }
+#define DS4_NARROW_PAIR_REDUCE(index_) do { \
+        a##index_ = warp_sum_f32(a##index_); \
+        b##index_ = warp_sum_f32(b##index_); \
+    } while (0)
+    DS4_NARROW_PAIR_REDUCE(0);
+    DS4_NARROW_PAIR_REDUCE(1);
+    if (n_tok > 2u) DS4_NARROW_PAIR_REDUCE(2);
+    if (n_tok > 3u) DS4_NARROW_PAIR_REDUCE(3);
+    if (n_tok > 4u) DS4_NARROW_PAIR_REDUCE(4);
+    if (n_tok > 5u) DS4_NARROW_PAIR_REDUCE(5);
+#undef DS4_NARROW_PAIR_REDUCE
+    if (lane == 0u) {
+#define DS4_NARROW_PAIR_STORE(index_) do { \
+        out0[(uint64_t)(index_) * out_dim + row] = a##index_; \
+        out1[(uint64_t)(index_) * out_dim + row] = b##index_; \
+    } while (0)
+        DS4_NARROW_PAIR_STORE(0);
+        DS4_NARROW_PAIR_STORE(1);
+        if (n_tok > 2u) DS4_NARROW_PAIR_STORE(2);
+        if (n_tok > 3u) DS4_NARROW_PAIR_STORE(3);
+        if (n_tok > 4u) DS4_NARROW_PAIR_STORE(4);
+        if (n_tok > 5u) DS4_NARROW_PAIR_STORE(5);
+#undef DS4_NARROW_PAIR_STORE
     }
 }
 
@@ -6775,6 +7036,80 @@ __global__ static void head_rms_norm_rope_tail_kernel(
         float x1 = tail[i + 1] * scale;
         tail[i] = x0 * c - x1 * s;
         tail[i + 1] = x0 * s + x1 * c;
+    }
+}
+
+__global__ static void head_rms_norm_rope_tail_from_half_kernel(
+        float *out,
+        const __half *x,
+        uint32_t n_tok,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        uint32_t pos0,
+        uint32_t n_ctx_orig,
+        int inverse,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow,
+        float eps) {
+    const uint32_t row = blockIdx.x;
+    if (row >= n_tok * n_head) return;
+    const uint32_t t = row / n_head;
+    const __half *xr = x + (uint64_t)row * head_dim;
+    float *orow = out + (uint64_t)row * head_dim;
+    float sum = 0.0f;
+    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        const float v = __half2float(xr[i]);
+        sum += v * v;
+    }
+    __shared__ float partial[256];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
+    const uint32_t n_nope = head_dim - n_rot;
+    for (uint32_t i = threadIdx.x; i < n_nope; i += blockDim.x) {
+        orow[i] = __half2float(xr[i]) * scale;
+    }
+
+    float corr0 = 0.0f, corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        const float denom = 2.0f * logf(freq_base);
+        corr0 = floorf((float)n_rot *
+                logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+        corr1 = ceilf((float)n_rot *
+                logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(n_rot - 1u), corr1);
+    }
+    const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
+    const __half *tail = xr + n_nope;
+    float *otail = orow + n_nope;
+    for (uint32_t pair = threadIdx.x; pair < n_rot / 2u; pair += blockDim.x) {
+        const uint32_t i = pair * 2u;
+        const float theta_extrap = (float)(pos0 + t) * powf(theta_scale, (float)pair);
+        const float theta_interp = freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = attn_factor;
+        if (ext_factor != 0.0f) {
+            const float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+            theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        const float c = cosf(theta) * mscale;
+        float s = sinf(theta) * mscale;
+        if (inverse) s = -s;
+        const float x0 = __half2float(tail[i]) * scale;
+        const float x1 = __half2float(tail[i + 1u]) * scale;
+        otail[i] = x0 * c - x1 * s;
+        otail[i + 1u] = x0 * s + x1 * c;
     }
 }
 
@@ -10107,6 +10442,133 @@ __global__ static void hc_expand_kernel(
     out_hc[(uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d] = acc;
 }
 
+__global__ static void hc_expand_half_kernel(
+        float *out_hc,
+        const __half *block_out,
+        const float *residual_hc,
+        const float *post,
+        const float *comb,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint32_t n_tokens,
+        uint32_t post_stride,
+        uint32_t comb_stride) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+    if (gid >= n_elem) return;
+    const uint32_t d = gid % n_embd;
+    const uint64_t tmp = gid / n_embd;
+    const uint32_t dst_hc = tmp % n_hc;
+    const uint32_t t = tmp / n_hc;
+    const float block_v = __half2float(block_out[(uint64_t)t * n_embd + d]);
+    float acc = block_v * post[(uint64_t)t * post_stride + dst_hc];
+    for (uint32_t src_hc = 0; src_hc < n_hc; ++src_hc) {
+        const float comb_v = comb[(uint64_t)t * comb_stride + dst_hc +
+                                  (uint64_t)src_hc * n_hc];
+        const float res_v = residual_hc[(uint64_t)t * n_hc * n_embd +
+                                        (uint64_t)src_hc * n_embd + d];
+        acc += comb_v * res_v;
+    }
+    out_hc[(uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d] = acc;
+}
+
+__global__ static void hc_expand_add_half_kernel(
+        float *out_hc,
+        const float *block_out,
+        const __half *block_add,
+        const float *residual_hc,
+        const float *post,
+        const float *comb,
+        uint32_t n_embd,
+        uint32_t n_hc,
+        uint32_t n_tokens,
+        uint32_t post_stride,
+        uint32_t comb_stride) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+    if (gid >= n_elem) return;
+    const uint32_t d = gid % n_embd;
+    const uint64_t tmp = gid / n_embd;
+    const uint32_t dst_hc = tmp % n_hc;
+    const uint32_t t = tmp / n_hc;
+    const uint64_t td = (uint64_t)t * n_embd + d;
+    const float block_v = block_out[td] + __half2float(block_add[td]);
+    float acc = block_v * post[(uint64_t)t * post_stride + dst_hc];
+    for (uint32_t src_hc = 0; src_hc < n_hc; ++src_hc) {
+        const float comb_v = comb[(uint64_t)t * comb_stride + dst_hc +
+                                  (uint64_t)src_hc * n_hc];
+        const float res_v = residual_hc[(uint64_t)t * n_hc * n_embd +
+                                        (uint64_t)src_hc * n_embd + d];
+        acc += comb_v * res_v;
+    }
+    out_hc[(uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d] = acc;
+}
+
+__global__ static void hc_expand4_half_kernel(
+        float *out_hc,
+        const __half *block_out,
+        const float *residual_hc,
+        const float *split,
+        uint32_t n_embd,
+        uint32_t n_tokens) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * n_embd;
+    if (gid >= n) return;
+    const uint32_t d = gid % n_embd;
+    const uint32_t t = gid / n_embd;
+    const uint64_t td = (uint64_t)t * n_embd + d;
+    const uint64_t hc_base = (uint64_t)t * 4u * n_embd + d;
+    const float bv = __half2float(block_out[td]);
+    const float r0 = residual_hc[hc_base];
+    const float r1 = residual_hc[hc_base + n_embd];
+    const float r2 = residual_hc[hc_base + 2u * (uint64_t)n_embd];
+    const float r3 = residual_hc[hc_base + 3u * (uint64_t)n_embd];
+    const float *post = split + (uint64_t)t * 24u + 4u;
+    const float *comb = post + 4u;
+#pragma unroll
+    for (uint32_t dst = 0; dst < 4u; ++dst) {
+        float acc = bv * post[dst];
+        acc += comb[dst] * r0;
+        acc += comb[4u + dst] * r1;
+        acc += comb[8u + dst] * r2;
+        acc += comb[12u + dst] * r3;
+        out_hc[hc_base + (uint64_t)dst * n_embd] = acc;
+    }
+}
+
+__global__ static void hc_expand4_add_half_kernel(
+        float *out_hc,
+        const float *block_out,
+        const __half *block_add,
+        const float *residual_hc,
+        const float *split,
+        uint32_t n_embd,
+        uint32_t n_tokens) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * n_embd;
+    if (gid >= n) return;
+    const uint32_t d = gid % n_embd;
+    const uint32_t t = gid / n_embd;
+    const uint64_t td = (uint64_t)t * n_embd + d;
+    const uint64_t hc_base = (uint64_t)t * 4u * n_embd + d;
+    const float bv = block_out[td] + __half2float(block_add[td]);
+    const float r0 = residual_hc[hc_base];
+    const float r1 = residual_hc[hc_base + n_embd];
+    const float r2 = residual_hc[hc_base + 2u * (uint64_t)n_embd];
+    const float r3 = residual_hc[hc_base + 3u * (uint64_t)n_embd];
+    const float *post = split + (uint64_t)t * 24u + 4u;
+    const float *comb = post + 4u;
+#pragma unroll
+    for (uint32_t dst = 0; dst < 4u; ++dst) {
+        float acc = bv * post[dst];
+        acc += comb[dst] * r0;
+        acc += comb[4u + dst] * r1;
+        acc += comb[8u + dst] * r2;
+        acc += comb[12u + dst] * r3;
+        out_hc[hc_base + (uint64_t)dst * n_embd] = acc;
+    }
+}
+
 /* Wide prefill consumes an expanded HC row immediately through one F16
  * projection.  A token-owned CTA reuses the four residual values and the
  * split coefficients across all four destinations, then performs the same
@@ -13195,8 +13657,534 @@ static int cuda_q8_batch_reuse_enabled(void) {
     return enabled;
 }
 
-static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
-    if (!out || !x || !model_map) return 0;
+typedef enum {
+    CUDA_PROJECTION_PATH_LEGACY = 0,
+    CUDA_PROJECTION_PATH_F32_CACHE,
+    CUDA_PROJECTION_PATH_F16_REAL,
+    CUDA_PROJECTION_PATH_F16_PAD8,
+    CUDA_PROJECTION_PATH_Q8_REUSE,
+    CUDA_PROJECTION_PATH_Q8_NATIVE,
+    CUDA_PROJECTION_PATH_COUNT
+} cuda_projection_path;
+
+typedef enum {
+    CUDA_PROJECTION_POLICY_LEGACY = 0,
+    CUDA_PROJECTION_POLICY_AUTO,
+    CUDA_PROJECTION_POLICY_F16_REAL,
+    CUDA_PROJECTION_POLICY_F16_PAD8,
+    CUDA_PROJECTION_POLICY_F16_OUT,
+    CUDA_PROJECTION_POLICY_Q8_REUSE
+} cuda_projection_policy_kind;
+
+struct cuda_projection_dispatch_state {
+    int initialized;
+    int verbose;
+    cuda_projection_policy_kind policy[DS4_GPU_MODEL_ROLE_COUNT];
+    uint64_t calls[DS4_GPU_PROJ_COUNT][7][CUDA_PROJECTION_PATH_COUNT];
+    uint64_t f16_cache_hits[DS4_GPU_PROJ_COUNT][7];
+    uint64_t f16_cache_misses[DS4_GPU_PROJ_COUNT][7];
+    uint64_t fallbacks[DS4_GPU_PROJ_COUNT][7];
+    uint64_t f16_resident_bytes[DS4_GPU_PROJ_COUNT];
+    uint64_t total_fallbacks;
+    uint64_t phase_fallbacks[DS4_GPU_PROJECTION_PHASE_MTP + 1];
+    uint64_t total_calls;
+    uint64_t last_report_calls;
+};
+
+static cuda_projection_dispatch_state g_projection_dispatch;
+
+enum {
+    CUDA_PROJECTION_AUTO_Q8_REUSE = 1u << 0,
+    CUDA_PROJECTION_AUTO_F16_GEMM = 1u << 1,
+    CUDA_PROJECTION_AUTO_F16_OUT = 1u << 2,
+    CUDA_PROJECTION_AUTO_NARROW_F16 = 1u << 3,
+    CUDA_PROJECTION_AUTO_ALL =
+        CUDA_PROJECTION_AUTO_Q8_REUSE |
+        CUDA_PROJECTION_AUTO_F16_GEMM |
+        CUDA_PROJECTION_AUTO_F16_OUT |
+        CUDA_PROJECTION_AUTO_NARROW_F16
+};
+
+static int cuda_projection_list_has(const char *list, const char *item) {
+    if (!list || !item || !item[0]) return 0;
+    const size_t item_len = strlen(item);
+    const char *p = list;
+    while (*p) {
+        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+        const char *start = p;
+        while (*p && *p != ',') p++;
+        const char *end = p;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+        if ((size_t)(end - start) == item_len &&
+            memcmp(start, item, item_len) == 0) {
+            return 1;
+        }
+        if (*p == ',') p++;
+    }
+    return 0;
+}
+
+/* Diagnostic-only AUTO ablation.  Production has one policy switch; this
+ * mask exists so an end-to-end greedy-hash failure can be attributed to one
+ * family without creating additional permanent dispatch policies. */
+static uint32_t cuda_projection_auto_components(void) {
+    static int initialized = 0;
+    static uint32_t components = CUDA_PROJECTION_AUTO_ALL;
+    if (initialized) return components;
+    initialized = 1;
+    const char *env = getenv("DS4_CUDA_PROJECTION_AUTO_COMPONENTS");
+    if (!env || !env[0] || strcmp(env, "all") == 0) return components;
+    components = 0u;
+    if (strcmp(env, "none") != 0) {
+        if (cuda_projection_list_has(env, "q8-reuse")) {
+            components |= CUDA_PROJECTION_AUTO_Q8_REUSE;
+        }
+        if (cuda_projection_list_has(env, "f16-gemm")) {
+            components |= CUDA_PROJECTION_AUTO_F16_GEMM;
+        }
+        if (cuda_projection_list_has(env, "f16-out")) {
+            components |= CUDA_PROJECTION_AUTO_F16_OUT;
+        }
+        if (cuda_projection_list_has(env, "narrow-f16")) {
+            components |= CUDA_PROJECTION_AUTO_NARROW_F16;
+        }
+    }
+    fprintf(stderr,
+            "ds4: CUDA AUTO diagnostic components "
+            "q8-reuse=%s f16-gemm=%s f16-out=%s narrow-f16=%s\n",
+            components & CUDA_PROJECTION_AUTO_Q8_REUSE ? "on" : "off",
+            components & CUDA_PROJECTION_AUTO_F16_GEMM ? "on" : "off",
+            components & CUDA_PROJECTION_AUTO_F16_OUT ? "on" : "off",
+            components & CUDA_PROJECTION_AUTO_NARROW_F16 ? "on" : "off");
+    return components;
+}
+
+static const char *cuda_projection_kind_name(ds4_gpu_projection_kind kind) {
+    static const char *names[DS4_GPU_PROJ_COUNT] = {
+        "output", "attn-q-a", "attn-kv", "attn-q-b", "attn-out-a",
+        "attn-out-b", "shared-gate", "shared-up", "shared-down",
+        "indexer-q-b", "other"
+    };
+    return kind >= 0 && kind < DS4_GPU_PROJ_COUNT ? names[kind] : "invalid";
+}
+
+static const char *cuda_projection_path_name(cuda_projection_path path) {
+    static const char *names[CUDA_PROJECTION_PATH_COUNT] = {
+        "legacy", "f32-cache", "f16-real", "f16-pad8", "q8-reuse",
+        "q8-native"
+    };
+    return path >= 0 && path < CUDA_PROJECTION_PATH_COUNT ? names[path] : "invalid";
+}
+
+static const char *cuda_projection_policy_name(
+        cuda_projection_policy_kind policy) {
+    switch (policy) {
+    case CUDA_PROJECTION_POLICY_AUTO: return "auto";
+    case CUDA_PROJECTION_POLICY_F16_REAL: return "f16-real";
+    case CUDA_PROJECTION_POLICY_F16_PAD8: return "f16-pad8";
+    case CUDA_PROJECTION_POLICY_F16_OUT: return "f16-out";
+    case CUDA_PROJECTION_POLICY_Q8_REUSE: return "q8-reuse";
+    case CUDA_PROJECTION_POLICY_LEGACY: return "legacy";
+    }
+    return "legacy";
+}
+
+static cuda_projection_policy_kind cuda_projection_policy_parse(
+        const char *env_name,
+        cuda_projection_policy_kind fallback) {
+    const char *env = getenv(env_name);
+    if (!env || !env[0]) return fallback;
+    if (strcmp(env, "legacy") == 0) return CUDA_PROJECTION_POLICY_LEGACY;
+    if (strcmp(env, "auto") == 0) return CUDA_PROJECTION_POLICY_AUTO;
+    if (strcmp(env, "f16-real") == 0) return CUDA_PROJECTION_POLICY_F16_REAL;
+    if (strcmp(env, "f16-pad8") == 0) return CUDA_PROJECTION_POLICY_F16_PAD8;
+    if (strcmp(env, "f16-out") == 0) return CUDA_PROJECTION_POLICY_F16_OUT;
+    if (strcmp(env, "q8-reuse") == 0) return CUDA_PROJECTION_POLICY_Q8_REUSE;
+    fprintf(stderr, "ds4: unknown %s=%s; using %s\n",
+            env_name, env, cuda_projection_policy_name(fallback));
+    return fallback;
+}
+
+static cuda_projection_dispatch_state *cuda_projection_dispatch(void) {
+    cuda_projection_dispatch_state *state = &g_projection_dispatch;
+    if (state->initialized) return state;
+    state->initialized = 1;
+    state->verbose = getenv("DS4_CUDA_PROJECTION_VERBOSE") != NULL;
+    const cuda_projection_policy_kind common = cuda_projection_policy_parse(
+            "DS4_CUDA_PROJECTION_POLICY", CUDA_PROJECTION_POLICY_LEGACY);
+    state->policy[DS4_GPU_MODEL_TARGET] = cuda_projection_policy_parse(
+            "DS4_CUDA_TARGET_PROJECTION_POLICY", common);
+    state->policy[DS4_GPU_MODEL_DSPARK] = cuda_projection_policy_parse(
+            "DS4_CUDA_DSPARK_PROJECTION_POLICY",
+            CUDA_PROJECTION_POLICY_LEGACY);
+    state->policy[DS4_GPU_MODEL_MTP] = cuda_projection_policy_parse(
+            "DS4_CUDA_MTP_PROJECTION_POLICY",
+            CUDA_PROJECTION_POLICY_LEGACY);
+    state->policy[DS4_GPU_MODEL_OTHER] = CUDA_PROJECTION_POLICY_LEGACY;
+    fprintf(stderr,
+            "ds4: CUDA projection policies target=%s dspark=%s mtp=%s\n",
+            cuda_projection_policy_name(
+                state->policy[DS4_GPU_MODEL_TARGET]),
+            cuda_projection_policy_name(
+                state->policy[DS4_GPU_MODEL_DSPARK]),
+            cuda_projection_policy_name(
+                state->policy[DS4_GPU_MODEL_MTP]));
+    return state;
+}
+
+static cuda_projection_policy_kind cuda_projection_policy_for_model(
+        const void *model_map) {
+    if (g_projection_phase == DS4_GPU_PROJECTION_PHASE_PREFILL) {
+        return CUDA_PROJECTION_POLICY_LEGACY;
+    }
+    cuda_projection_dispatch_state *state = cuda_projection_dispatch();
+    if (g_projection_phase == DS4_GPU_PROJECTION_PHASE_TARGET) {
+        return state->policy[DS4_GPU_MODEL_TARGET];
+    }
+    if (g_projection_phase == DS4_GPU_PROJECTION_PHASE_DSPARK) {
+        return state->policy[DS4_GPU_MODEL_DSPARK];
+    }
+    if (g_projection_phase == DS4_GPU_PROJECTION_PHASE_MTP) {
+        return state->policy[DS4_GPU_MODEL_MTP];
+    }
+    return state->policy[cuda_projection_model_role(model_map)];
+}
+
+extern "C" int ds4_gpu_projection_candidate_enabled(
+        const void *model_map) {
+    return cuda_projection_policy_for_model(model_map) !=
+        CUDA_PROJECTION_POLICY_LEGACY;
+}
+
+static cuda_projection_path cuda_projection_select(
+        const void *model_map,
+        ds4_gpu_projection_kind kind,
+        uint64_t n_tok) {
+    const cuda_projection_policy_kind policy =
+        cuda_projection_policy_for_model(model_map);
+    if (policy == CUDA_PROJECTION_POLICY_LEGACY) return CUDA_PROJECTION_PATH_LEGACY;
+    if (policy == CUDA_PROJECTION_POLICY_AUTO && g_quality_mode) {
+        return CUDA_PROJECTION_PATH_LEGACY;
+    }
+    if (policy == CUDA_PROJECTION_POLICY_F16_REAL) return CUDA_PROJECTION_PATH_F16_REAL;
+    if (policy == CUDA_PROJECTION_POLICY_F16_PAD8) return CUDA_PROJECTION_PATH_F16_PAD8;
+    if (policy == CUDA_PROJECTION_POLICY_F16_OUT) return CUDA_PROJECTION_PATH_F16_REAL;
+    if (policy == CUDA_PROJECTION_POLICY_Q8_REUSE) return CUDA_PROJECTION_PATH_Q8_REUSE;
+    if (n_tok < 2u || n_tok > 6u) return CUDA_PROJECTION_PATH_LEGACY;
+    if (kind < 0 || kind >= DS4_GPU_PROJ_COUNT) {
+        return CUDA_PROJECTION_PATH_LEGACY;
+    }
+
+    /* Process-static table: graph construction never benchmarks or mutates
+     * dispatch.  Columns are N=2..6.  The candidate entries deliberately keep
+     * every N explicit so GB10 block microbench results can be promoted one
+     * cell at a time without changing the selection contract. */
+#define P5(path) { path, path, path, path, path }
+    static const cuda_projection_path auto_path[DS4_GPU_PROJ_COUNT][5] = {
+        P5(CUDA_PROJECTION_PATH_F16_PAD8), /* output */
+        P5(CUDA_PROJECTION_PATH_Q8_REUSE), /* attn Q-A */
+        P5(CUDA_PROJECTION_PATH_Q8_REUSE), /* attn KV */
+        P5(CUDA_PROJECTION_PATH_F16_REAL), /* attn Q-B */
+        P5(CUDA_PROJECTION_PATH_F16_REAL), /* attn output A */
+        P5(CUDA_PROJECTION_PATH_F16_REAL), /* attn output B */
+        P5(CUDA_PROJECTION_PATH_Q8_REUSE), /* shared gate */
+        P5(CUDA_PROJECTION_PATH_Q8_REUSE), /* shared up */
+        P5(CUDA_PROJECTION_PATH_F16_REAL), /* shared down */
+        P5(CUDA_PROJECTION_PATH_Q8_REUSE), /* indexer Q-B */
+        P5(CUDA_PROJECTION_PATH_LEGACY),   /* other */
+    };
+#undef P5
+    const cuda_projection_path path = auto_path[kind][n_tok - 2u];
+    const uint32_t components = cuda_projection_auto_components();
+    if (path == CUDA_PROJECTION_PATH_Q8_REUSE &&
+        (components & CUDA_PROJECTION_AUTO_Q8_REUSE) == 0u) {
+        return CUDA_PROJECTION_PATH_LEGACY;
+    }
+    if ((path == CUDA_PROJECTION_PATH_F16_REAL ||
+         path == CUDA_PROJECTION_PATH_F16_PAD8) &&
+        (components & CUDA_PROJECTION_AUTO_F16_GEMM) == 0u) {
+        return CUDA_PROJECTION_PATH_LEGACY;
+    }
+    return path;
+}
+
+static int cuda_projection_f16_out_enabled(
+        const void *model_map,
+        ds4_gpu_projection_kind kind,
+        uint64_t n_tok) {
+    if (n_tok < 2u || n_tok > 6u || g_quality_mode) return 0;
+    const cuda_projection_policy_kind policy =
+        cuda_projection_policy_for_model(model_map);
+    if (policy != CUDA_PROJECTION_POLICY_AUTO &&
+        policy != CUDA_PROJECTION_POLICY_F16_OUT) {
+        return 0;
+    }
+    if (policy == CUDA_PROJECTION_POLICY_AUTO &&
+        ((cuda_projection_auto_components() & CUDA_PROJECTION_AUTO_F16_GEMM) == 0u ||
+         (cuda_projection_auto_components() & CUDA_PROJECTION_AUTO_F16_OUT) == 0u)) {
+        return 0;
+    }
+    return kind == DS4_GPU_PROJ_ATTN_Q_B ||
+           kind == DS4_GPU_PROJ_ATTN_OUT_B ||
+           kind == DS4_GPU_PROJ_SHARED_DOWN;
+}
+
+typedef enum {
+    CUDA_NARROW_F16_HC_16384_24 = 0,
+    CUDA_NARROW_F16_EMBD_4096_64,
+    CUDA_NARROW_F16_EMBD_4096_256,
+    CUDA_NARROW_F16_SHAPE_COUNT
+} cuda_narrow_f16_shape;
+
+static int cuda_narrow_f16_shape_index(
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    if (in_dim == 16384u && out_dim == 24u) {
+        return CUDA_NARROW_F16_HC_16384_24;
+    }
+    if (in_dim == 4096u && out_dim == 64u) {
+        return CUDA_NARROW_F16_EMBD_4096_64;
+    }
+    if (in_dim == 4096u && out_dim == 256u) {
+        return CUDA_NARROW_F16_EMBD_4096_256;
+    }
+    return -1;
+}
+
+static int cuda_narrow_f16_candidate_enabled(
+        const void *model_map,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint64_t n_tok) {
+    if (n_tok < 2u || n_tok > 6u || g_quality_mode ||
+        cuda_projection_policy_for_model(model_map) !=
+            CUDA_PROJECTION_POLICY_AUTO) {
+        return 0;
+    }
+    if ((cuda_projection_auto_components() &
+         CUDA_PROJECTION_AUTO_NARROW_F16) == 0u) {
+        return 0;
+    }
+    static int disabled = -1;
+    static int notice = 0;
+    if (disabled < 0) {
+        disabled = getenv("DS4_CUDA_DISABLE_NARROW_F16") != NULL ? 1 : 0;
+    }
+    if (disabled) return 0;
+    const int shape = cuda_narrow_f16_shape_index(in_dim, out_dim);
+    if (shape < 0) return 0;
+
+    /* Candidate table is explicit per shape and N so GB10 measurements can
+     * disable an isolated cell without changing graph-time dispatch. */
+    static const uint8_t auto_enabled[CUDA_NARROW_F16_SHAPE_COUNT][5] = {
+        {1u, 1u, 1u, 1u, 1u}, /* HC 16384 -> 24 */
+        {1u, 1u, 1u, 1u, 1u}, /* indexer 4096 -> 64 */
+        {1u, 1u, 1u, 1u, 1u}, /* router/compressor 4096 -> 256 */
+    };
+    const int enabled = auto_enabled[shape][n_tok - 2u] != 0u;
+    if (enabled && !notice) {
+        notice = 1;
+        fprintf(stderr,
+                "ds4: CUDA narrow F16 verifier kernels enabled (N=2..6)\n");
+    }
+    return enabled;
+}
+
+static int cuda_narrow_f16_launch(
+        float *out,
+        const __half *w,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_tok) {
+    matmul_f16_narrow_batch4_kernel<<<(unsigned)((out_dim + 3u) / 4u), 128>>>(
+            out, w, x, in_dim, out_dim, n_tok);
+    return cuda_ok(cudaGetLastError(), "matmul_f16_narrow_batch4 launch");
+}
+
+static int cuda_narrow_f16_pair_launch(
+        float *out0,
+        float *out1,
+        const __half *w0,
+        const __half *w1,
+        const float *x,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        uint32_t n_tok) {
+    matmul_f16_narrow_pair_batch4_kernel<<<
+            (unsigned)((out_dim + 3u) / 4u), 128>>>(
+                    out0, out1, w0, w1, x,
+                    in_dim, out_dim, n_tok);
+    return cuda_ok(cudaGetLastError(),
+                   "matmul_f16_narrow_pair_batch4 launch");
+}
+
+static int cuda_projection_cache_allows(
+        const void *model_map,
+        ds4_gpu_projection_kind kind) {
+    const ds4_gpu_model_role role = cuda_projection_model_role(model_map);
+    /* The target cache serves wide prefill as well as tiny verification.
+     * Decode policy must never suppress or reorder that preload set. */
+    if (role == DS4_GPU_MODEL_TARGET || role == DS4_GPU_MODEL_OTHER) return 1;
+    const cuda_projection_policy_kind policy =
+        cuda_projection_policy_for_model(model_map);
+    if (policy == CUDA_PROJECTION_POLICY_Q8_REUSE) return 0;
+    if (kind < 0 || kind >= DS4_GPU_PROJ_COUNT || kind == DS4_GPU_PROJ_OTHER) {
+        return 1;
+    }
+    if (policy == CUDA_PROJECTION_POLICY_LEGACY ||
+        policy == CUDA_PROJECTION_POLICY_AUTO ||
+        policy == CUDA_PROJECTION_POLICY_F16_REAL ||
+        policy == CUDA_PROJECTION_POLICY_F16_PAD8 ||
+        policy == CUDA_PROJECTION_POLICY_F16_OUT) {
+        return 1;
+    }
+    return 0;
+}
+
+static uint32_t cuda_projection_n_bucket(uint64_t n_tok) {
+    return n_tok >= 1u && n_tok <= 6u ? (uint32_t)n_tok : 0u;
+}
+
+static void cuda_projection_cache_record(
+        ds4_gpu_projection_kind kind,
+        int cache_hit,
+        uint64_t resident_bytes) {
+    cuda_projection_dispatch_state *state = cuda_projection_dispatch();
+    if (!state->verbose || kind < 0 || kind >= DS4_GPU_PROJ_COUNT) return;
+    if (cache_hit) state->f16_cache_hits[kind][0]++;
+    else state->f16_cache_misses[kind][0]++;
+    state->f16_resident_bytes[kind] += resident_bytes;
+}
+
+static void cuda_projection_cache_reset_resident(void) {
+    cuda_projection_dispatch_state *state = cuda_projection_dispatch();
+    memset(state->f16_resident_bytes, 0, sizeof(state->f16_resident_bytes));
+}
+
+static void cuda_projection_cache_note(
+        ds4_gpu_projection_kind kind,
+        uint64_t n_tok,
+        int cache_hit,
+        uint64_t resident_bytes) {
+    cuda_projection_dispatch_state *state = cuda_projection_dispatch();
+    if (!state->verbose || kind < 0 || kind >= DS4_GPU_PROJ_COUNT) return;
+    const uint32_t n = cuda_projection_n_bucket(n_tok);
+    if (cache_hit) state->f16_cache_hits[kind][n]++;
+    else state->f16_cache_misses[kind][n]++;
+    state->f16_resident_bytes[kind] += resident_bytes;
+}
+
+static void cuda_projection_fallback_note(
+        ds4_gpu_projection_kind kind,
+        uint64_t n_tok) {
+    cuda_projection_dispatch_state *state = cuda_projection_dispatch();
+    state->total_fallbacks++;
+    if (g_projection_phase >= DS4_GPU_PROJECTION_PHASE_MODEL &&
+        g_projection_phase <= DS4_GPU_PROJECTION_PHASE_MTP) {
+        state->phase_fallbacks[g_projection_phase]++;
+    }
+    if (!state->verbose || kind < 0 || kind >= DS4_GPU_PROJ_COUNT) return;
+    state->fallbacks[kind][cuda_projection_n_bucket(n_tok)]++;
+}
+
+static void cuda_projection_fallback_pair_note(
+        ds4_gpu_projection_kind kind0,
+        ds4_gpu_projection_kind kind1,
+        uint64_t n_tok) {
+    cuda_projection_fallback_note(kind0, n_tok);
+    cuda_projection_fallback_note(kind1, n_tok);
+}
+
+extern "C" int ds4_gpu_runtime_stats_get(ds4_gpu_runtime_stats *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    out->token_graph_rebuilds = g_token_graph_rebuilds;
+    out->speculative_graph_rebuilds = g_mtp_graph_rebuilds;
+    out->dspark_graph_draft_launches = g_dspark_graph_draft_launches;
+    out->dspark_graph_verifier_launches = g_dspark_graph_verifier_launches;
+    out->projection_fallbacks = cuda_projection_dispatch()->total_fallbacks;
+    out->projection_target_fallbacks =
+        cuda_projection_dispatch()->phase_fallbacks[
+            DS4_GPU_PROJECTION_PHASE_TARGET];
+    out->projection_dspark_fallbacks =
+        cuda_projection_dispatch()->phase_fallbacks[
+            DS4_GPU_PROJECTION_PHASE_DSPARK];
+    out->projection_mtp_fallbacks =
+        cuda_projection_dispatch()->phase_fallbacks[
+            DS4_GPU_PROJECTION_PHASE_MTP];
+    out->projection_f16_resident_bytes = g_q8_f16_bytes;
+    for (uint32_t i = 0; i < DS4_CUDA_TOKEN_GRAPH_VARIANTS; ++i) {
+        out->token_graph_nodes += (uint64_t)g_token_graph_nodes[i];
+    }
+    for (uint32_t i = 0; i < DS4_CUDA_MTP_GRAPH_VARIANTS; ++i) {
+        out->speculative_graph_nodes += (uint64_t)g_mtp_graph_nodes[i];
+    }
+    return 1;
+}
+
+static void cuda_projection_prepare_scratch(void) {
+    cuda_projection_dispatch_state *state = cuda_projection_dispatch();
+    for (int role = 0; role < DS4_GPU_MODEL_ROLE_COUNT; ++role) {
+        if (state->policy[role] != CUDA_PROJECTION_POLICY_LEGACY) {
+            (void)cuda_mtp_tc_scratch_alloc(64ull * 1048576ull);
+            break;
+        }
+    }
+}
+
+static void cuda_projection_record(
+        ds4_gpu_projection_kind kind,
+        uint64_t n_tok,
+        cuda_projection_path path) {
+    cuda_projection_dispatch_state *state = cuda_projection_dispatch();
+    if (!state->verbose || kind < 0 || kind >= DS4_GPU_PROJ_COUNT ||
+        path < 0 || path >= CUDA_PROJECTION_PATH_COUNT) {
+        return;
+    }
+    const uint32_t n = cuda_projection_n_bucket(n_tok);
+    state->calls[kind][n][path]++;
+    state->total_calls++;
+    if (state->total_calls - state->last_report_calls < 1024u) return;
+    state->last_report_calls = state->total_calls;
+    fprintf(stderr, "ds4: CUDA projection dispatch after %llu calls\n",
+            (unsigned long long)state->total_calls);
+    for (int k = 0; k < DS4_GPU_PROJ_COUNT; ++k) {
+        uint64_t kind_calls = 0;
+        for (int n_i = 0; n_i <= 6; ++n_i) {
+            for (int p = 0; p < CUDA_PROJECTION_PATH_COUNT; ++p) {
+                kind_calls += state->calls[k][n_i][p];
+            }
+        }
+        if (!kind_calls) continue;
+        fprintf(stderr, "  %-12s resident=%.2fMiB\n",
+                cuda_projection_kind_name((ds4_gpu_projection_kind)k),
+                (double)state->f16_resident_bytes[k] / 1048576.0);
+        for (int n_i = 0; n_i <= 6; ++n_i) {
+            uint64_t n_calls = 0;
+            for (int p = 0; p < CUDA_PROJECTION_PATH_COUNT; ++p) {
+                n_calls += state->calls[k][n_i][p];
+            }
+            if (!n_calls && !state->f16_cache_hits[k][n_i] &&
+                !state->f16_cache_misses[k][n_i] && !state->fallbacks[k][n_i]) continue;
+            fprintf(stderr, "    N=%s", n_i ? "" : "other");
+            if (n_i) fprintf(stderr, "%d", n_i);
+            for (int p = 0; p < CUDA_PROJECTION_PATH_COUNT; ++p) {
+                if (!state->calls[k][n_i][p]) continue;
+                fprintf(stderr, " %s=%llu",
+                        cuda_projection_path_name((cuda_projection_path)p),
+                        (unsigned long long)state->calls[k][n_i][p]);
+            }
+            fprintf(stderr, " hit=%llu miss=%llu fallback=%llu\n",
+                    (unsigned long long)state->f16_cache_hits[k][n_i],
+                    (unsigned long long)state->f16_cache_misses[k][n_i],
+                    (unsigned long long)state->fallbacks[k][n_i]);
+        }
+    }
+}
+
+static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label, ds4_gpu_projection_kind kind) {
+    if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u || n_tok == 0u) return 0;
     uint64_t blocks = (in_dim + 31) / 32;
     if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34)) return 0;
     uint64_t weight_bytes = out_dim * blocks * 34;
@@ -13205,8 +14193,14 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         out->bytes < n_tok * out_dim * sizeof(float)) return 0;
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "q8_0");
     if (!wptr) return 0;
-    if (g_cublas_ready && n_tok > 1) {
-        const float *w_f32 = cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
+    const cuda_projection_path projection_path =
+        cuda_projection_select(model_map, kind, n_tok);
+    if (g_cublas_ready && n_tok > 1 &&
+        projection_path != CUDA_PROJECTION_PATH_Q8_REUSE) {
+        const float *w_f32 = projection_path == CUDA_PROJECTION_PATH_LEGACY
+                ? cuda_q8_f32_ptr(model_map, weight_offset, weight_bytes,
+                                  in_dim, out_dim, label)
+                : NULL;
         if (w_f32) {
             const float alpha = 1.0f;
             const float beta = 0.0f;
@@ -13224,11 +14218,30 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                             &beta,
                                             (float *)out->ptr,
                                             (int)out_dim);
-            return cublas_ok(st, "q8 fp32 matmul");
+            const int ok = cublas_ok(st, "q8 fp32 matmul");
+            if (ok) cuda_projection_record(kind, n_tok,
+                                           CUDA_PROJECTION_PATH_F32_CACHE);
+            return ok;
         }
+        cuda_projection_dispatch_state *dispatch = cuda_projection_dispatch();
+        const size_t ranges_before = dispatch->verbose ? g_q8_f16_ranges.size() : 0u;
+        const uint64_t bytes_before = dispatch->verbose ? g_q8_f16_bytes : 0u;
         const __half *w_f16 = cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
+        if (dispatch->verbose) {
+            cuda_projection_cache_note(
+                    kind, n_tok,
+                    w_f16 && g_q8_f16_ranges.size() == ranges_before,
+                    g_q8_f16_bytes >= bytes_before
+                        ? g_q8_f16_bytes - bytes_before
+                        : 0u);
+        }
         if (w_f16) {
-            if (cuda_q8_tiny_tc_enabled(n_tok)) {
+            const int use_padded_f16 =
+                    projection_path == CUDA_PROJECTION_PATH_F16_PAD8
+                        ? (!g_quality_mode && n_tok <= 16u)
+                        : (projection_path == CUDA_PROJECTION_PATH_LEGACY &&
+                           cuda_q8_tiny_tc_enabled(n_tok));
+            if (use_padded_f16) {
                 if (cuda_mtp_tc_f16_gemm((float *)out->ptr,
                                           w_f16,
                                           (const float *)x->ptr,
@@ -13236,13 +14249,19 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                           out_dim,
                                           n_tok,
                                           1)) {
+                    cuda_projection_record(kind, n_tok,
+                                           CUDA_PROJECTION_PATH_F16_PAD8);
                     return 1;
                 }
                 g_mtp_tc_counters.fallbacks++;
+                cuda_projection_fallback_note(kind, n_tok);
                 cuda_mtp_tc_maybe_report();
             }
             const uint64_t xh_count = n_tok * in_dim;
-            __half *xh = (__half *)cuda_tmp_alloc(xh_count * sizeof(__half), "q8 f16 gemm activations");
+            __half *xh = projection_path == CUDA_PROJECTION_PATH_LEGACY
+                    ? (__half *)cuda_tmp_alloc(xh_count * sizeof(__half),
+                                               "q8 f16 gemm activations")
+                    : (__half *)cuda_mtp_tc_scratch_alloc(xh_count * sizeof(__half));
             if (!xh) return 0;
             f32_to_f16_kernel<<<(xh_count + 255) / 256, 256>>>(xh, (const float *)x->ptr, xh_count);
             if (!cuda_ok(cudaGetLastError(), "q8 f16 activation convert launch")) return 0;
@@ -13267,15 +14286,27 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                              (int)out_dim,
                                              CUDA_R_32F,
                                              CUBLAS_GEMM_DEFAULT);
-            if (st == CUBLAS_STATUS_SUCCESS) return 1;
+            if (st == CUBLAS_STATUS_SUCCESS) {
+                cuda_projection_record(kind, n_tok,
+                                       CUDA_PROJECTION_PATH_F16_REAL);
+                return 1;
+            }
             fprintf(stderr, "ds4: cuBLAS q8 f16 matmul failed: status %d\n", (int)st);
-            cuda_q8_f16_cache_disable_after_failure("cuBLAS f16 matmul failure",
-                                                    in_dim * out_dim * sizeof(__half));
+            cuda_projection_fallback_note(kind, n_tok);
+            cuda_q8_f16_cache_disable_after_failure(
+                    model_map,
+                    "cuBLAS f16 matmul failure",
+                    in_dim * out_dim * sizeof(__half),
+                    1);
             /* The F16 expansion cache is only an optimization.  If cuBLAS
              * rejects the cached path under memory pressure, retry the same
              * operation through the native Q8 kernels below. */
-        } else if (cuda_q8_tiny_tc_enabled(n_tok)) {
+        } else if (projection_path == CUDA_PROJECTION_PATH_F16_REAL ||
+                   projection_path == CUDA_PROJECTION_PATH_F16_PAD8 ||
+                   (projection_path == CUDA_PROJECTION_PATH_LEGACY &&
+                    cuda_q8_tiny_tc_enabled(n_tok))) {
             g_mtp_tc_counters.fallbacks++;
+            cuda_projection_fallback_note(kind, n_tok);
             cuda_mtp_tc_maybe_report();
         }
     }
@@ -13304,7 +14335,10 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 out_dim,
                 blocks,
                 use_dp4a);
-        return cuda_ok(cudaGetLastError(), "matmul_q8_0 warp launch");
+        const int ok = cuda_ok(cudaGetLastError(), "matmul_q8_0 warp launch");
+        if (ok) cuda_projection_record(kind, n_tok,
+                                       CUDA_PROJECTION_PATH_Q8_NATIVE);
+        return ok;
     }
     if (getenv("DS4_CUDA_NO_Q8_BATCH_WARP") == NULL && blocks <= 32u) {
         dim3 bgrid(((unsigned)out_dim + 7u) / 8u, (unsigned)n_tok, 1);
@@ -13318,9 +14352,14 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 n_tok,
                 blocks,
                 use_dp4a);
-        return cuda_ok(cudaGetLastError(), "matmul_q8_0 batch warp launch");
+        const int ok = cuda_ok(cudaGetLastError(), "matmul_q8_0 batch warp launch");
+        if (ok) cuda_projection_record(kind, n_tok,
+                                       CUDA_PROJECTION_PATH_Q8_NATIVE);
+        return ok;
     }
-    if (n_tok <= 6u && blocks > 32u && cuda_q8_batch_reuse_enabled()) {
+    if (n_tok <= 6u && blocks > 32u &&
+        (projection_path == CUDA_PROJECTION_PATH_Q8_REUSE ||
+         cuda_q8_batch_reuse_enabled())) {
         matmul_q8_0_preq_batch_reuse_kernel<<<(unsigned)out_dim, 256>>>(
                 (float *)out->ptr,
                 reinterpret_cast<const unsigned char *>(wptr),
@@ -13331,8 +14370,11 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 (uint32_t)n_tok,
                 blocks,
                 use_dp4a);
-        return cuda_ok(cudaGetLastError(),
-                       "matmul_q8_0 tiny-batch reuse launch");
+        const int ok = cuda_ok(cudaGetLastError(),
+                               "matmul_q8_0 tiny-batch reuse launch");
+        if (ok) cuda_projection_record(kind, n_tok,
+                                       CUDA_PROJECTION_PATH_Q8_REUSE);
+        return ok;
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
     matmul_q8_0_preq_kernel<<<grid, 256>>>((float *)out->ptr,
@@ -13341,12 +14383,30 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                                            xscale,
                                            in_dim, out_dim, n_tok, blocks,
                                            use_dp4a);
-    return cuda_ok(cudaGetLastError(), "matmul_q8_0 launch");
+    const int ok = cuda_ok(cudaGetLastError(), "matmul_q8_0 launch");
+    if (ok) cuda_projection_record(kind, n_tok,
+                                   CUDA_PROJECTION_PATH_Q8_NATIVE);
+    return ok;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return ds4_gpu_matmul_q8_0_projection_tensor(out, model_map, model_size,
+                                                 weight_offset, in_dim, out_dim,
+                                                 x, n_tok, DS4_GPU_PROJ_OTHER);
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_projection_tensor(
+        ds4_gpu_tensor *out,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok,
+        ds4_gpu_projection_kind kind) {
     return cuda_matmul_q8_0_tensor_labeled(out, model_map, model_size, weight_offset,
-                                           in_dim, out_dim, x, n_tok, "q8_0");
+                                           in_dim, out_dim, x, n_tok, "q8_0", kind);
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
@@ -13361,6 +14421,26 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
         uint64_t out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t n_tok) {
+    return ds4_gpu_matmul_q8_0_projection_pair_tensor(
+            out0, out1, model_map, model_size,
+            weight0_offset, weight1_offset, in_dim, out0_dim, out1_dim,
+            x, n_tok, DS4_GPU_PROJ_OTHER, DS4_GPU_PROJ_OTHER);
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_projection_pair_tensor(
+        ds4_gpu_tensor *out0,
+        ds4_gpu_tensor *out1,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight0_offset,
+        uint64_t weight1_offset,
+        uint64_t in_dim,
+        uint64_t out0_dim,
+        uint64_t out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok,
+        ds4_gpu_projection_kind kind0,
+        ds4_gpu_projection_kind kind1) {
     if (!out0 || !out1 || !x || !model_map || in_dim == 0 || out0_dim == 0 || out1_dim == 0 || n_tok == 0) {
         return 0;
     }
@@ -13384,13 +14464,44 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
     }
 
     if (n_tok != 1) {
-        if (cuda_q8_tiny_tc_enabled(n_tok)) {
+        const cuda_projection_path path0 =
+            cuda_projection_select(model_map, kind0, n_tok);
+        const cuda_projection_path path1 =
+            cuda_projection_select(model_map, kind1, n_tok);
+        const int use_padded_pair =
+                path0 == path1 &&
+                ((path0 == CUDA_PROJECTION_PATH_LEGACY &&
+                  cuda_q8_tiny_tc_enabled(n_tok)) ||
+                 (path0 == CUDA_PROJECTION_PATH_F16_PAD8 &&
+                  !g_quality_mode && n_tok <= 16u));
+        if (use_padded_pair) {
+            cuda_projection_dispatch_state *dispatch = cuda_projection_dispatch();
+            size_t ranges_before = dispatch->verbose ? g_q8_f16_ranges.size() : 0u;
+            uint64_t bytes_before = dispatch->verbose ? g_q8_f16_bytes : 0u;
             const __half *w0_f16 = cuda_q8_f16_ptr(
                     model_map, weight0_offset, weight0_bytes,
                     in_dim, out0_dim, "q8_0_pair0");
+            if (dispatch->verbose) {
+                cuda_projection_cache_note(
+                        kind0, n_tok,
+                        w0_f16 && g_q8_f16_ranges.size() == ranges_before,
+                        g_q8_f16_bytes >= bytes_before
+                            ? g_q8_f16_bytes - bytes_before
+                            : 0u);
+                ranges_before = g_q8_f16_ranges.size();
+                bytes_before = g_q8_f16_bytes;
+            }
             const __half *w1_f16 = cuda_q8_f16_ptr(
                     model_map, weight1_offset, weight1_bytes,
                     in_dim, out1_dim, "q8_0_pair1");
+            if (dispatch->verbose) {
+                cuda_projection_cache_note(
+                        kind1, n_tok,
+                        w1_f16 && g_q8_f16_ranges.size() == ranges_before,
+                        g_q8_f16_bytes >= bytes_before
+                            ? g_q8_f16_bytes - bytes_before
+                            : 0u);
+            }
             if (w0_f16 && w1_f16 &&
                 cuda_mtp_tc_f16_gemm_pair((float *)out0->ptr,
                                            (float *)out1->ptr,
@@ -13402,19 +14513,66 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                                            out1_dim,
                                            n_tok,
                                            1)) {
+                cuda_projection_record(kind0, n_tok,
+                                       CUDA_PROJECTION_PATH_F16_PAD8);
+                cuda_projection_record(kind1, n_tok,
+                                       CUDA_PROJECTION_PATH_F16_PAD8);
                 return 1;
             }
             g_mtp_tc_counters.fallbacks++;
+            cuda_projection_fallback_note(kind0, n_tok);
+            cuda_projection_fallback_note(kind1, n_tok);
             cuda_mtp_tc_maybe_report();
+        }
+        if (path0 == CUDA_PROJECTION_PATH_Q8_REUSE &&
+            path1 == CUDA_PROJECTION_PATH_Q8_REUSE &&
+            n_tok <= 6u && blocks > 32u) {
+            const char *w0 = cuda_model_range_ptr(model_map, weight0_offset,
+                                                   weight0_bytes, "q8_0_pair0");
+            const char *w1 = cuda_model_range_ptr(model_map, weight1_offset,
+                                                   weight1_bytes, "q8_0_pair1");
+            const uint64_t xq_bytes = n_tok * blocks * 32u;
+            const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
+            const uint64_t tmp_bytes = scale_offset + n_tok * blocks * sizeof(float);
+            void *tmp = cuda_tmp_alloc(tmp_bytes, "q8_0 projection pair prequant");
+            if (!w0 || !w1 || !tmp) return 0;
+            int8_t *xq = (int8_t *)tmp;
+            float *xscale = (float *)((char *)tmp + scale_offset);
+            const int use_dp4a = cuda_q8_use_dp4a();
+            if (!launch_quantize_q8_0_f32_rows(
+                        xq, xscale, (const float *)x->ptr,
+                        n_tok, in_dim, blocks,
+                        "matmul_q8_0 projection pair quantize launch")) {
+                return 0;
+            }
+            matmul_q8_0_preq_batch_reuse_kernel<<<(unsigned)out0_dim, 256>>>(
+                    (float *)out0->ptr,
+                    reinterpret_cast<const unsigned char *>(w0),
+                    xq, xscale, in_dim, out0_dim, (uint32_t)n_tok,
+                    blocks, use_dp4a);
+            if (!cuda_ok(cudaGetLastError(),
+                         "matmul_q8_0 projection pair0 reuse launch")) return 0;
+            matmul_q8_0_preq_batch_reuse_kernel<<<(unsigned)out1_dim, 256>>>(
+                    (float *)out1->ptr,
+                    reinterpret_cast<const unsigned char *>(w1),
+                    xq, xscale, in_dim, out1_dim, (uint32_t)n_tok,
+                    blocks, use_dp4a);
+            if (!cuda_ok(cudaGetLastError(),
+                         "matmul_q8_0 projection pair1 reuse launch")) return 0;
+            cuda_projection_record(kind0, n_tok,
+                                   CUDA_PROJECTION_PATH_Q8_REUSE);
+            cuda_projection_record(kind1, n_tok,
+                                   CUDA_PROJECTION_PATH_Q8_REUSE);
+            return 1;
         }
         return cuda_matmul_q8_0_tensor_labeled(out0, model_map, model_size,
                                                weight0_offset, in_dim,
                                                out0_dim, x, n_tok,
-                                               "q8_0_pair0") &&
+                                               "q8_0_pair0", kind0) &&
                cuda_matmul_q8_0_tensor_labeled(out1, model_map, model_size,
                                                weight1_offset, in_dim,
                                                out1_dim, x, n_tok,
-                                               "q8_0_pair1");
+                                               "q8_0_pair1", kind1);
     }
     const char *w0 = cuda_model_range_ptr(model_map, weight0_offset, weight0_bytes, "q8_0_pair0");
     const char *w1 = cuda_model_range_ptr(model_map, weight1_offset, weight1_bytes, "q8_0_pair1");
@@ -13448,7 +14606,108 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
             out1_dim,
             blocks,
             use_dp4a);
-    return cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp launch");
+    const int ok = cuda_ok(cudaGetLastError(), "matmul_q8_0 pair warp launch");
+    if (ok) {
+        cuda_projection_record(kind0, n_tok, CUDA_PROJECTION_PATH_Q8_NATIVE);
+        cuda_projection_record(kind1, n_tok, CUDA_PROJECTION_PATH_Q8_NATIVE);
+    }
+    return ok;
+}
+
+static int cuda_matmul_q8_0_f16_out(
+        ds4_gpu_tensor *out_h,
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t weight_offset,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t n_tok,
+        const char *label,
+        ds4_gpu_projection_kind kind) {
+    if (!g_cublas_ready || !out_h || !x || !model_map ||
+        in_dim == 0u || out_dim == 0u || n_tok == 0u ||
+        in_dim > INT_MAX || out_dim > INT_MAX || n_tok > INT_MAX) {
+        cuda_projection_fallback_note(kind, n_tok);
+        return 0;
+    }
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    if (blocks > UINT64_MAX / 34u ||
+        weight_offset > model_size ||
+        out_dim > UINT64_MAX / (blocks * 34u) ||
+        n_tok > UINT64_MAX / in_dim / sizeof(float) ||
+        n_tok > UINT64_MAX / out_dim / sizeof(__half)) {
+        cuda_projection_fallback_note(kind, n_tok);
+        return 0;
+    }
+    const uint64_t weight_bytes = out_dim * blocks * 34u;
+    if (weight_bytes > model_size - weight_offset ||
+        x->bytes < n_tok * in_dim * sizeof(float) ||
+        out_h->bytes < n_tok * out_dim * sizeof(__half)) {
+        cuda_projection_fallback_note(kind, n_tok);
+        return 0;
+    }
+    cuda_projection_dispatch_state *dispatch = cuda_projection_dispatch();
+    const size_t ranges_before = dispatch->verbose ? g_q8_f16_ranges.size() : 0u;
+    const uint64_t bytes_before = dispatch->verbose ? g_q8_f16_bytes : 0u;
+    const __half *w_f16 = cuda_q8_f16_ptr(model_map, weight_offset,
+                                           weight_bytes, in_dim, out_dim,
+                                           label);
+    if (dispatch->verbose) {
+        cuda_projection_cache_note(
+                kind, n_tok,
+                w_f16 && g_q8_f16_ranges.size() == ranges_before,
+                g_q8_f16_bytes >= bytes_before
+                    ? g_q8_f16_bytes - bytes_before
+                    : 0u);
+    }
+    if (!w_f16) {
+        cuda_projection_fallback_note(kind, n_tok);
+        return 0;
+    }
+    const uint64_t xh_count = n_tok * in_dim;
+    __half *xh = (__half *)cuda_mtp_tc_scratch_alloc(
+            xh_count * sizeof(__half));
+    if (!xh) {
+        cuda_projection_fallback_note(kind, n_tok);
+        return 0;
+    }
+    f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(
+            xh, (const float *)x->ptr, xh_count);
+    if (!cuda_ok(cudaGetLastError(), "q8 f16-out activation convert launch")) {
+        cuda_projection_fallback_note(kind, n_tok);
+        return 0;
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmEx(g_cublas,
+                                     CUBLAS_OP_T,
+                                     CUBLAS_OP_N,
+                                     (int)out_dim,
+                                     (int)n_tok,
+                                     (int)in_dim,
+                                     &alpha,
+                                     w_f16,
+                                     CUDA_R_16F,
+                                     (int)in_dim,
+                                     xh,
+                                     CUDA_R_16F,
+                                     (int)in_dim,
+                                     &beta,
+                                     out_h->ptr,
+                                     CUDA_R_16F,
+                                     (int)out_dim,
+                                     CUDA_R_32F,
+                                     CUBLAS_GEMM_DEFAULT);
+    if (st == CUBLAS_STATUS_SUCCESS) return 1;
+    fprintf(stderr, "ds4: cuBLAS q8 f16-out matmul failed: status %d\n", (int)st);
+    cuda_projection_fallback_note(kind, n_tok);
+    cuda_q8_f16_cache_disable_after_failure(
+            model_map,
+            "cuBLAS f16-out matmul failure",
+            in_dim * out_dim * sizeof(__half),
+            1);
+    return 0;
 }
 
 extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
@@ -13460,9 +14719,15 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
         uint64_t out_dim,
         const ds4_gpu_tensor *x,
         uint64_t n_tok) {
-    (void)out_h; (void)model_map; (void)model_size; (void)weight_offset;
-    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
-    return 0;
+    if (!cuda_projection_f16_out_enabled(
+                model_map, DS4_GPU_PROJ_SHARED_DOWN, n_tok)) return 0;
+    const int ok = cuda_matmul_q8_0_f16_out(out_h, model_map, model_size,
+                                            weight_offset, in_dim, out_dim,
+                                            x, n_tok, "shared_down_f16_out",
+                                            DS4_GPU_PROJ_SHARED_DOWN);
+    if (ok) cuda_projection_record(DS4_GPU_PROJ_SHARED_DOWN, n_tok,
+                                   CUDA_PROJECTION_PATH_F16_REAL);
+    return ok;
 }
 
 static int cuda_matmul_q8_0_hc_expand_tensor_labeled(
@@ -13558,6 +14823,16 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, weight_bytes, "f16");
     if (!wptr) return 0;
     const __half *w = (const __half *)wptr;
+    if (cuda_narrow_f16_candidate_enabled(
+                model_map, in_dim, out_dim, n_tok) &&
+        cuda_narrow_f16_launch((float *)out->ptr,
+                               w,
+                               (const float *)x->ptr,
+                               in_dim,
+                               out_dim,
+                               (uint32_t)n_tok)) {
+        return 1;
+    }
     const int serial_f16 = getenv("DS4_CUDA_SERIAL_F16_MATMUL") != NULL;
     const int router_shape = in_dim == 4096u && out_dim == 256u && n_tok == 1u;
     const int serial_router =
@@ -13708,8 +14983,35 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         return 0;
     }
 
+    if (!pair_disabled &&
+        cuda_narrow_f16_candidate_enabled(
+                model_map, in_dim, out_dim, n_tok)) {
+        const __half *w0 = (const __half *)cuda_model_range_ptr(
+                model_map, weight0_offset, weight_bytes, "f16_narrow_pair0");
+        const __half *w1 = (const __half *)cuda_model_range_ptr(
+                model_map, weight1_offset, weight_bytes, "f16_narrow_pair1");
+        if (w0 && w1 &&
+            cuda_narrow_f16_pair_launch((float *)out0->ptr,
+                                         (float *)out1->ptr,
+                                         w0,
+                                         w1,
+                                         (const float *)x->ptr,
+                                         in_dim,
+                                         out_dim,
+                                         (uint32_t)n_tok)) {
+            return 1;
+        }
+    }
+
     if (n_tok != 1) {
-        if (!pair_disabled && cuda_mtp_tc_enabled(n_tok)) {
+        const cuda_projection_policy_kind projection_policy =
+                cuda_projection_policy_for_model(model_map);
+        const int projection_pair_enabled =
+                !g_quality_mode && g_cublas_ready && n_tok >= 2u && n_tok <= 6u &&
+                (projection_policy == CUDA_PROJECTION_POLICY_AUTO ||
+                 projection_policy == CUDA_PROJECTION_POLICY_F16_PAD8);
+        if (!pair_disabled &&
+            (cuda_mtp_tc_enabled(n_tok) || projection_pair_enabled)) {
             const __half *w0 = (const __half *)cuda_model_range_ptr(
                     model_map, weight0_offset, weight_bytes, "f16_pair0");
             const __half *w1 = (const __half *)cuda_model_range_ptr(
@@ -13954,13 +15256,44 @@ extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
         float beta_fast,
         float beta_slow,
         float eps) {
-    (void)out; (void)q_half; (void)model_map; (void)model_size;
-    (void)weight_offset; (void)in_dim; (void)out_dim; (void)x;
-    (void)n_tok; (void)n_head; (void)head_dim; (void)n_rot; (void)pos0;
-    (void)n_ctx_orig; (void)inverse; (void)freq_base; (void)freq_scale;
-    (void)ext_factor; (void)attn_factor; (void)beta_fast; (void)beta_slow;
-    (void)eps;
-    return 0;
+    if (!cuda_projection_f16_out_enabled(
+            model_map, DS4_GPU_PROJ_ATTN_Q_B, n_tok) ||
+        !out || !q_half || !x || !model_map || n_tok == 0u ||
+        n_rot > head_dim || (n_rot & 1u) ||
+        out_dim != (uint64_t)n_head * head_dim ||
+        out->bytes < (uint64_t)n_tok * out_dim * sizeof(float) ||
+        q_half->bytes < (uint64_t)n_tok * out_dim * sizeof(__half)) {
+        return 0;
+    }
+    if (!cuda_matmul_q8_0_f16_out(q_half, model_map, model_size,
+                                   weight_offset, in_dim, out_dim,
+                                   x, n_tok, "attn_q_b_f16_out",
+                                   DS4_GPU_PROJ_ATTN_Q_B)) {
+        return 0;
+    }
+    head_rms_norm_rope_tail_from_half_kernel<<<n_tok * n_head, 256>>>(
+            (float *)out->ptr,
+            (const __half *)q_half->ptr,
+            n_tok,
+            n_head,
+            head_dim,
+            n_rot,
+            pos0,
+            n_ctx_orig,
+            inverse ? 1 : 0,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow,
+            eps);
+    const int ok = cuda_ok(cudaGetLastError(),
+                            "attn q_b f16-out norm rope launch");
+    if (ok) cuda_projection_record(DS4_GPU_PROJ_ATTN_Q_B, n_tok,
+                                   CUDA_PROJECTION_PATH_F16_REAL);
+    else cuda_projection_fallback_note(DS4_GPU_PROJ_ATTN_Q_B, n_tok);
+    return ok;
 }
 
 extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t head_dim, uint32_t n_rot) {
@@ -16158,7 +17491,8 @@ static int cuda_attention_output_q8_batch_tensor(
                                            out_dim,
                                            low,
                                            n_tokens,
-                                           "attn_output_b");
+                                           "attn_output_b",
+                                           DS4_GPU_PROJ_ATTN_OUT_B);
 }
 
 extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
@@ -16232,10 +17566,156 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
         uint64_t out_dim,
         const ds4_gpu_tensor *heads,
         uint32_t n_tokens) {
-    (void)out_h; (void)low; (void)model_map; (void)model_size;
-    (void)out_a_offset; (void)out_b_offset; (void)group_dim; (void)rank;
-    (void)n_groups; (void)out_dim; (void)heads; (void)n_tokens;
-    return 0;
+    if (!cuda_projection_f16_out_enabled(
+            model_map, DS4_GPU_PROJ_ATTN_OUT_B, n_tokens)) {
+        return 0;
+    }
+    if (!out_h || !low || !heads || !model_map || !g_cublas_ready ||
+        group_dim == 0u || rank == 0u || n_groups == 0u || out_dim == 0u ||
+        (group_dim & 1u) || group_dim > INT_MAX || rank > INT_MAX ||
+        out_dim > INT_MAX || n_tokens > INT_MAX) {
+        cuda_projection_fallback_pair_note(
+                DS4_GPU_PROJ_ATTN_OUT_A, DS4_GPU_PROJ_ATTN_OUT_B, n_tokens);
+        return 0;
+    }
+    if (g_ssd_streaming_mode && n_tokens > 1u) {
+        cuda_projection_fallback_pair_note(
+                DS4_GPU_PROJ_ATTN_OUT_A, DS4_GPU_PROJ_ATTN_OUT_B, n_tokens);
+        return 0;
+    }
+    const uint64_t low_dim = (uint64_t)n_groups * rank;
+    const uint64_t blocks_a = (group_dim + 31u) / 32u;
+    const uint64_t blocks_b = (low_dim + 31u) / 32u;
+    if (low_dim > INT_MAX || blocks_a > UINT64_MAX / 34u ||
+        blocks_b > UINT64_MAX / 34u ||
+        low_dim > UINT64_MAX / (blocks_a * 34u) ||
+        out_dim > UINT64_MAX / (blocks_b * 34u)) {
+        cuda_projection_fallback_pair_note(
+                DS4_GPU_PROJ_ATTN_OUT_A, DS4_GPU_PROJ_ATTN_OUT_B, n_tokens);
+        return 0;
+    }
+    const uint64_t out_a_bytes = low_dim * blocks_a * 34u;
+    const uint64_t out_b_bytes = out_dim * blocks_b * 34u;
+    if (out_a_offset > model_size || out_b_offset > model_size ||
+        out_a_bytes > model_size - out_a_offset ||
+        out_b_bytes > model_size - out_b_offset ||
+        heads->bytes < (uint64_t)n_tokens * n_groups * group_dim * sizeof(float) ||
+        low->bytes < (uint64_t)n_tokens * low_dim * sizeof(__half) ||
+        out_h->bytes < (uint64_t)n_tokens * out_dim * sizeof(__half)) {
+        cuda_projection_fallback_pair_note(
+                DS4_GPU_PROJ_ATTN_OUT_A, DS4_GPU_PROJ_ATTN_OUT_B, n_tokens);
+        return 0;
+    }
+    cuda_projection_dispatch_state *dispatch = cuda_projection_dispatch();
+    size_t ranges_before = dispatch->verbose ? g_q8_f16_ranges.size() : 0u;
+    uint64_t bytes_before = dispatch->verbose ? g_q8_f16_bytes : 0u;
+    const __half *out_a_f16 = cuda_q8_f16_ptr(
+            model_map, out_a_offset, out_a_bytes,
+            group_dim, low_dim, "attn_output_a_f16_out");
+    if (dispatch->verbose) {
+        cuda_projection_cache_note(
+                DS4_GPU_PROJ_ATTN_OUT_A, n_tokens,
+                out_a_f16 && g_q8_f16_ranges.size() == ranges_before,
+                g_q8_f16_bytes >= bytes_before
+                    ? g_q8_f16_bytes - bytes_before
+                    : 0u);
+        ranges_before = g_q8_f16_ranges.size();
+        bytes_before = g_q8_f16_bytes;
+    }
+    const __half *out_b_f16 = cuda_q8_f16_ptr(
+            model_map, out_b_offset, out_b_bytes,
+            low_dim, out_dim, "attn_output_b_f16_out");
+    if (dispatch->verbose) {
+        cuda_projection_cache_note(
+                DS4_GPU_PROJ_ATTN_OUT_B, n_tokens,
+                out_b_f16 && g_q8_f16_ranges.size() == ranges_before,
+                g_q8_f16_bytes >= bytes_before
+                    ? g_q8_f16_bytes - bytes_before
+                    : 0u);
+    }
+    if (!out_a_f16 || !out_b_f16) {
+        cuda_projection_fallback_pair_note(
+                DS4_GPU_PROJ_ATTN_OUT_A, DS4_GPU_PROJ_ATTN_OUT_B, n_tokens);
+        return 0;
+    }
+
+    const uint64_t heads_h_count = (uint64_t)n_groups * n_tokens * group_dim;
+    __half *heads_h = (__half *)cuda_mtp_tc_scratch_alloc(
+            heads_h_count * sizeof(__half));
+    if (!heads_h) {
+        cuda_projection_fallback_pair_note(
+                DS4_GPU_PROJ_ATTN_OUT_A, DS4_GPU_PROJ_ATTN_OUT_B, n_tokens);
+        return 0;
+    }
+    __half *low_h = (__half *)low->ptr;
+    attention_pack_group_heads_f16_kernel<<<
+            (heads_h_count / 2u + 255u) / 256u, 256>>>(
+            heads_h, (const float *)heads->ptr,
+            n_tokens, n_groups, (uint32_t)group_dim);
+    if (!cuda_ok(cudaGetLastError(), "attention output f16 heads pack launch")) {
+        cuda_projection_fallback_pair_note(
+                DS4_GPU_PROJ_ATTN_OUT_A, DS4_GPU_PROJ_ATTN_OUT_B, n_tokens);
+        return 0;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasGemmStridedBatchedEx(
+            g_cublas,
+            CUBLAS_OP_T,
+            CUBLAS_OP_N,
+            (int)rank,
+            (int)n_tokens,
+            (int)group_dim,
+            &alpha,
+            out_a_f16,
+            CUDA_R_16F,
+            (int)group_dim,
+            (long long)rank * group_dim,
+            heads_h,
+            CUDA_R_16F,
+            (int)group_dim,
+            (long long)n_tokens * group_dim,
+            &beta,
+            low_h,
+            CUDA_R_16F,
+            (int)low_dim,
+            (long long)rank,
+            (int)n_groups,
+            CUDA_R_32F,
+            CUBLAS_GEMM_DEFAULT);
+    if (!cublas_ok(st, "attention output a f16-out gemm")) {
+        cuda_projection_fallback_note(DS4_GPU_PROJ_ATTN_OUT_A, n_tokens);
+        return 0;
+    }
+    st = cublasGemmEx(g_cublas,
+                      CUBLAS_OP_T,
+                      CUBLAS_OP_N,
+                      (int)out_dim,
+                      (int)n_tokens,
+                      (int)low_dim,
+                      &alpha,
+                      out_b_f16,
+                      CUDA_R_16F,
+                      (int)low_dim,
+                      low_h,
+                      CUDA_R_16F,
+                      (int)low_dim,
+                      &beta,
+                      out_h->ptr,
+                      CUDA_R_16F,
+                      (int)out_dim,
+                      CUDA_R_32F,
+                      CUBLAS_GEMM_DEFAULT);
+    if (!cublas_ok(st, "attention output b f16-out gemm")) {
+        cuda_projection_fallback_note(DS4_GPU_PROJ_ATTN_OUT_B, n_tokens);
+        return 0;
+    }
+    cuda_projection_record(DS4_GPU_PROJ_ATTN_OUT_A, n_tokens,
+                           CUDA_PROJECTION_PATH_F16_REAL);
+    cuda_projection_record(DS4_GPU_PROJ_ATTN_OUT_B, n_tokens,
+                           CUDA_PROJECTION_PATH_F16_REAL);
+    return 1;
 }
 
 extern "C" int ds4_gpu_attention_output_low_q8_tensor(
@@ -21664,9 +23144,46 @@ extern "C" int ds4_gpu_hc_expand_split_half_tensor(
         const ds4_gpu_tensor *split,
         uint32_t n_embd,
         uint32_t n_hc) {
-    (void)out_hc; (void)block_out_h; (void)residual_hc; (void)split;
-    (void)n_embd; (void)n_hc;
-    return 0;
+    if (!out_hc || !block_out_h || !residual_hc || !split ||
+        n_embd == 0u || n_hc == 0u) return 0;
+    const uint64_t hc_row = (uint64_t)n_hc * n_embd;
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    if (hc_row > UINT64_MAX / sizeof(float) ||
+        out_hc->bytes < hc_row * sizeof(float) ||
+        out_hc->bytes % (hc_row * sizeof(float)) != 0u) return 0;
+    const uint64_t n_tokens64 = out_hc->bytes / (hc_row * sizeof(float));
+    if (n_tokens64 == 0u || n_tokens64 > UINT32_MAX ||
+        n_tokens64 > UINT64_MAX / n_embd / sizeof(__half) ||
+        n_tokens64 > UINT64_MAX / mix_hc / sizeof(float) ||
+        block_out_h->bytes < n_tokens64 * n_embd * sizeof(__half) ||
+        residual_hc->bytes < n_tokens64 * hc_row * sizeof(float) ||
+        split->bytes < n_tokens64 * mix_hc * sizeof(float)) return 0;
+    const uint32_t n_tokens = (uint32_t)n_tokens64;
+    if (n_hc == 4u) {
+        const uint64_t n = n_tokens64 * n_embd;
+        hc_expand4_half_kernel<<<(n + 255u) / 256u, 256>>>(
+                (float *)out_hc->ptr,
+                (const __half *)block_out_h->ptr,
+                (const float *)residual_hc->ptr,
+                (const float *)split->ptr,
+                n_embd,
+                n_tokens);
+        return cuda_ok(cudaGetLastError(), "hc_expand_split_half4 launch");
+    }
+    const uint64_t n_elem = n_tokens64 * hc_row;
+    const float *base = (const float *)split->ptr;
+    hc_expand_half_kernel<<<(n_elem + 255u) / 256u, 256>>>(
+            (float *)out_hc->ptr,
+            (const __half *)block_out_h->ptr,
+            (const float *)residual_hc->ptr,
+            base + n_hc,
+            base + 2u * n_hc,
+            n_embd,
+            n_hc,
+            n_tokens,
+            (uint32_t)mix_hc,
+            (uint32_t)mix_hc);
+    return cuda_ok(cudaGetLastError(), "hc_expand_split_half launch");
 }
 
 extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
@@ -21684,6 +23201,347 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const 
                                                     n_embd, n_hc, n_tokens,
                                                     mix_hc, mix_hc, 1);
     return cuda_ok(cudaGetLastError(), "hc_expand_add_split launch");
+}
+
+static uint32_t cuda_f16_ordered_ulp(uint16_t a, uint16_t b) {
+    const int32_t ao = (a & 0x8000u)
+        ? 0x8000 - (int32_t)(a & 0x7fffu)
+        : 0x8000 + (int32_t)a;
+    const int32_t bo = (b & 0x8000u)
+        ? 0x8000 - (int32_t)(b & 0x7fffu)
+        : 0x8000 + (int32_t)b;
+    return (uint32_t)abs(ao - bo);
+}
+
+static int cuda_narrow_f16_self_test(void) {
+    enum {
+        max_tokens = 6,
+        max_in = 16384,
+        max_out = 256,
+    };
+    struct narrow_shape {
+        uint32_t in_dim;
+        uint32_t out_dim;
+        const char *name;
+    };
+    const narrow_shape shapes[] = {
+        {16384u, 24u, "hc"},
+        {4096u, 64u, "indexer"},
+        {4096u, 256u, "router"},
+    };
+    const uint64_t max_weight_count = (uint64_t)4096u * 256u;
+    const uint64_t max_input_count = (uint64_t)max_tokens * max_in;
+    const uint64_t max_output_count = (uint64_t)max_tokens * max_out;
+    std::vector<float> weight_host(max_weight_count);
+    std::vector<float> input_host(max_input_count);
+    for (uint64_t i = 0; i < max_weight_count; ++i) {
+        weight_host[i] = ((int32_t)((i * 17u + 5u) % 31u) - 15) / 64.0f;
+    }
+    for (uint64_t i = 0; i < max_input_count; ++i) {
+        input_host[i] = ((int32_t)((i * 29u + 11u) % 29u) - 14) / 128.0f;
+    }
+
+    float *weight_f = NULL;
+    float *input_f = NULL;
+    float *reference = NULL;
+    float *candidate = NULL;
+    float *pair0 = NULL;
+    float *pair1 = NULL;
+    __half *weight_h = NULL;
+    int ok = cuda_ok(cudaMalloc(&weight_f,
+                                max_weight_count * sizeof(float)),
+                     "narrow F16 weight f32 alloc") &&
+             cuda_ok(cudaMalloc(&weight_h,
+                                max_weight_count * sizeof(__half)),
+                     "narrow F16 weight f16 alloc") &&
+             cuda_ok(cudaMalloc(&input_f,
+                                max_input_count * sizeof(float)),
+                     "narrow F16 input alloc") &&
+             cuda_ok(cudaMalloc(&reference,
+                                max_output_count * sizeof(float)),
+                     "narrow F16 reference alloc") &&
+             cuda_ok(cudaMalloc(&candidate,
+                                max_output_count * sizeof(float)),
+                     "narrow F16 candidate alloc") &&
+             cuda_ok(cudaMalloc(&pair0,
+                                max_output_count * sizeof(float)),
+                     "narrow F16 pair0 alloc") &&
+             cuda_ok(cudaMalloc(&pair1,
+                                max_output_count * sizeof(float)),
+                     "narrow F16 pair1 alloc");
+    if (ok) {
+        ok = cuda_ok(cudaMemcpy(weight_f, weight_host.data(),
+                                max_weight_count * sizeof(float),
+                                cudaMemcpyHostToDevice),
+                     "narrow F16 weight upload") &&
+             cuda_ok(cudaMemcpy(input_f, input_host.data(),
+                                max_input_count * sizeof(float),
+                                cudaMemcpyHostToDevice),
+                     "narrow F16 input upload");
+    }
+    if (ok) {
+        f32_to_f16_kernel<<<
+                (max_weight_count + 255u) / 256u, 256>>>(
+                        weight_h, weight_f, max_weight_count);
+        ok = cuda_ok(cudaGetLastError(), "narrow F16 weight convert");
+    }
+    for (const narrow_shape &shape : shapes) {
+        for (uint32_t n_tokens = 2u; ok && n_tokens <= max_tokens;
+             ++n_tokens) {
+            dim3 reference_grid(shape.out_dim, n_tokens, 1u);
+            matmul_f16_kernel<<<reference_grid, 256>>>(
+                    reference, weight_h, input_f,
+                    shape.in_dim, shape.out_dim, n_tokens);
+            matmul_f16_narrow_batch4_kernel<<<
+                    (shape.out_dim + 3u) / 4u, 128>>>(
+                            candidate, weight_h, input_f,
+                            shape.in_dim, shape.out_dim, n_tokens);
+            matmul_f16_narrow_pair_batch4_kernel<<<
+                    (shape.out_dim + 3u) / 4u, 128>>>(
+                            pair0, pair1, weight_h, weight_h, input_f,
+                            shape.in_dim, shape.out_dim, n_tokens);
+            ok = cuda_ok(cudaGetLastError(), "narrow F16 test launch");
+            const uint64_t active = (uint64_t)n_tokens * shape.out_dim;
+            std::vector<float> reference_host(active);
+            std::vector<float> candidate_host(active);
+            std::vector<float> pair0_host(active);
+            std::vector<float> pair1_host(active);
+            if (ok) {
+                ok = cuda_ok(cudaDeviceSynchronize(),
+                             "narrow F16 test synchronize") &&
+                     cuda_ok(cudaMemcpy(reference_host.data(), reference,
+                                        active * sizeof(float),
+                                        cudaMemcpyDeviceToHost),
+                             "narrow F16 reference read") &&
+                     cuda_ok(cudaMemcpy(candidate_host.data(), candidate,
+                                        active * sizeof(float),
+                                        cudaMemcpyDeviceToHost),
+                             "narrow F16 candidate read") &&
+                     cuda_ok(cudaMemcpy(pair0_host.data(), pair0,
+                                        active * sizeof(float),
+                                        cudaMemcpyDeviceToHost),
+                             "narrow F16 pair0 read") &&
+                     cuda_ok(cudaMemcpy(pair1_host.data(), pair1,
+                                        active * sizeof(float),
+                                        cudaMemcpyDeviceToHost),
+                             "narrow F16 pair1 read");
+            }
+            double max_abs = 0.0;
+            uint64_t bad = 0u;
+            uint64_t pair_bad = 0u;
+            for (uint64_t i = 0; ok && i < active; ++i) {
+                const double error = fabs(
+                        (double)candidate_host[i] - reference_host[i]);
+                max_abs = fmax(max_abs, error);
+                const double limit = 2.0e-4 *
+                    fmax(1.0, fabs((double)reference_host[i]));
+                if (!isfinite(candidate_host[i]) || error > limit) ++bad;
+                if (pair0_host[i] != candidate_host[i] ||
+                    pair1_host[i] != candidate_host[i]) {
+                    ++pair_bad;
+                }
+            }
+            fprintf(stderr,
+                    "cuda-regression: narrow F16 %s N%u max_abs=%.3g "
+                    "bad=%llu pair_bad=%llu\n",
+                    shape.name, n_tokens, max_abs,
+                    (unsigned long long)bad,
+                    (unsigned long long)pair_bad);
+            ok = ok && bad == 0u && pair_bad == 0u;
+        }
+    }
+    if (pair1) (void)cudaFree(pair1);
+    if (pair0) (void)cudaFree(pair0);
+    if (candidate) (void)cudaFree(candidate);
+    if (reference) (void)cudaFree(reference);
+    if (input_f) (void)cudaFree(input_f);
+    if (weight_h) (void)cudaFree(weight_h);
+    if (weight_f) (void)cudaFree(weight_f);
+    return ok;
+}
+
+static int cuda_projection_f16_out_self_test(void) {
+    enum {
+        max_tokens = 6,
+        in_dim = 128,
+        out_dim = 256,
+        q_heads = 4,
+        q_head_dim = 32,
+        q_n_rot = 16,
+    };
+    const uint64_t weight_count = (uint64_t)in_dim * out_dim;
+    const uint64_t input_count = (uint64_t)max_tokens * in_dim;
+    const uint64_t output_count = (uint64_t)max_tokens * out_dim;
+    std::vector<float> weight_host(weight_count);
+    std::vector<float> input_host(input_count);
+    uint32_t rng = 0xa341316cu;
+    auto random_value = [&rng]() -> float {
+        rng = rng * 1664525u + 1013904223u;
+        return ((float)(rng >> 8u) * (1.0f / 16777216.0f) - 0.5f) * 0.25f;
+    };
+    for (float &value : weight_host) value = random_value();
+    for (float &value : input_host) value = random_value();
+
+    float *weight_f = NULL;
+    float *input_f = NULL;
+    float *reference_f = NULL;
+    float *q_reference = NULL;
+    float *q_candidate = NULL;
+    __half *weight_h = NULL;
+    __half *input_h = NULL;
+    __half *reference_h = NULL;
+    __half *candidate_h = NULL;
+    int ok = cuda_ok(cudaMalloc(&weight_f, weight_count * sizeof(float)),
+                     "f16-out self-test weight f32 alloc") &&
+             cuda_ok(cudaMalloc(&input_f, input_count * sizeof(float)),
+                     "f16-out self-test input f32 alloc") &&
+             cuda_ok(cudaMalloc(&reference_f, output_count * sizeof(float)),
+                     "f16-out self-test reference f32 alloc") &&
+             cuda_ok(cudaMalloc(&weight_h, weight_count * sizeof(__half)),
+                     "f16-out self-test weight f16 alloc") &&
+             cuda_ok(cudaMalloc(&input_h, input_count * sizeof(__half)),
+                     "f16-out self-test input f16 alloc") &&
+             cuda_ok(cudaMalloc(&reference_h, output_count * sizeof(__half)),
+                     "f16-out self-test reference f16 alloc") &&
+             cuda_ok(cudaMalloc(&candidate_h, output_count * sizeof(__half)),
+                     "f16-out self-test candidate f16 alloc");
+    if (ok) {
+        ok = cuda_ok(cudaMemcpy(weight_f, weight_host.data(),
+                                weight_count * sizeof(float),
+                                cudaMemcpyHostToDevice),
+                     "f16-out self-test weight upload") &&
+             cuda_ok(cudaMemcpy(input_f, input_host.data(),
+                                input_count * sizeof(float),
+                                cudaMemcpyHostToDevice),
+                     "f16-out self-test input upload");
+    }
+#ifdef DS4_CUDA_TOKEN_GRAPH_BUILD
+    const cudaStream_t stream = cudaStreamPerThread;
+#else
+    const cudaStream_t stream = 0;
+#endif
+    if (ok) {
+        f32_to_f16_kernel<<<(weight_count + 255u) / 256u, 256, 0, stream>>>(
+                weight_h, weight_f, weight_count);
+        f32_to_f16_kernel<<<(input_count + 255u) / 256u, 256, 0, stream>>>(
+                input_h, input_f, input_count);
+        ok = cuda_ok(cudaGetLastError(), "f16-out self-test input convert");
+    }
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    for (uint32_t n_tokens = 2u; ok && n_tokens <= max_tokens; ++n_tokens) {
+        cublasStatus_t status = cublasGemmEx(
+                g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                out_dim, (int)n_tokens, in_dim,
+                &alpha, weight_h, CUDA_R_16F, in_dim,
+                input_h, CUDA_R_16F, in_dim,
+                &beta, reference_f, CUDA_R_32F, out_dim,
+                CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        if (status == CUBLAS_STATUS_SUCCESS) {
+            status = cublasGemmEx(
+                    g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                    out_dim, (int)n_tokens, in_dim,
+                    &alpha, weight_h, CUDA_R_16F, in_dim,
+                    input_h, CUDA_R_16F, in_dim,
+                    &beta, candidate_h, CUDA_R_16F, out_dim,
+                    CUDA_R_32F, CUBLAS_GEMM_DEFAULT);
+        }
+        ok = status == CUBLAS_STATUS_SUCCESS;
+        const uint64_t active = (uint64_t)n_tokens * out_dim;
+        if (ok) {
+            f32_to_f16_kernel<<<(active + 255u) / 256u, 256, 0, stream>>>(
+                    reference_h, reference_f, active);
+            ok = cuda_ok(cudaGetLastError(),
+                         "f16-out self-test reference round");
+        }
+        std::vector<uint16_t> reference_host(active);
+        std::vector<uint16_t> candidate_host(active);
+        if (ok) {
+            ok = cuda_ok(cudaStreamSynchronize(stream),
+                         "f16-out self-test synchronize") &&
+                 cuda_ok(cudaMemcpy(reference_host.data(), reference_h,
+                                    active * sizeof(uint16_t),
+                                    cudaMemcpyDeviceToHost),
+                         "f16-out self-test reference read") &&
+                 cuda_ok(cudaMemcpy(candidate_host.data(), candidate_h,
+                                    active * sizeof(uint16_t),
+                                    cudaMemcpyDeviceToHost),
+                         "f16-out self-test candidate read");
+        }
+        uint32_t max_ulp = 0u;
+        uint64_t bad = 0u;
+        for (uint64_t i = 0; ok && i < active; ++i) {
+            const uint32_t ulp = cuda_f16_ordered_ulp(
+                    reference_host[i], candidate_host[i]);
+            if (ulp > max_ulp) max_ulp = ulp;
+            if (ulp > 1u) ++bad;
+        }
+        fprintf(stderr,
+                "cuda-regression: projection f16-out GEMM N%u max_ulp=%u "
+                "bad=%llu\n",
+                n_tokens, max_ulp, (unsigned long long)bad);
+        ok = ok && bad == 0u;
+    }
+
+    const uint64_t q_count =
+        (uint64_t)max_tokens * q_heads * q_head_dim;
+    if (ok) {
+        ok = cuda_ok(cudaMalloc(&q_reference, q_count * sizeof(float)),
+                     "f16-out Q-B reference alloc") &&
+             cuda_ok(cudaMalloc(&q_candidate, q_count * sizeof(float)),
+                     "f16-out Q-B candidate alloc");
+    }
+    if (ok) {
+        /* Reuse the first q_count half inputs: input_h has exactly the same
+         * number of elements for these test dimensions. */
+        f16_to_f32_kernel<<<(q_count + 255u) / 256u, 256, 0, stream>>>(
+                q_reference, input_h, q_count);
+        head_rms_norm_rope_tail_kernel<<<max_tokens * q_heads, 256, 0, stream>>>(
+                q_reference, max_tokens, q_heads, q_head_dim, q_n_rot,
+                8192u, 4096u, 0, 10000.0f, 0.25f,
+                1.0f, 0.8f, 32.0f, 1.0f, 1.0e-6f);
+        head_rms_norm_rope_tail_from_half_kernel<<<
+                max_tokens * q_heads, 256, 0, stream>>>(
+                q_candidate, input_h, max_tokens, q_heads, q_head_dim,
+                q_n_rot, 8192u, 4096u, 0, 10000.0f, 0.25f,
+                1.0f, 0.8f, 32.0f, 1.0f, 1.0e-6f);
+        ok = cuda_ok(cudaGetLastError(), "f16-out Q-B epilogue launch");
+    }
+    if (ok) {
+        std::vector<float> reference_host(q_count);
+        std::vector<float> candidate_host(q_count);
+        ok = cuda_ok(cudaStreamSynchronize(stream),
+                     "f16-out Q-B epilogue synchronize") &&
+             cuda_ok(cudaMemcpy(reference_host.data(), q_reference,
+                                q_count * sizeof(float), cudaMemcpyDeviceToHost),
+                     "f16-out Q-B reference read") &&
+             cuda_ok(cudaMemcpy(candidate_host.data(), q_candidate,
+                                q_count * sizeof(float), cudaMemcpyDeviceToHost),
+                     "f16-out Q-B candidate read");
+        double max_abs = 0.0;
+        uint64_t bad = 0u;
+        for (uint64_t i = 0; ok && i < q_count; ++i) {
+            const double error = fabs(
+                    (double)reference_host[i] - candidate_host[i]);
+            if (error > max_abs) max_abs = error;
+            if (!isfinite(candidate_host[i]) || error > 2.0e-6) ++bad;
+        }
+        fprintf(stderr,
+                "cuda-regression: projection Q-B half epilogue max_abs=%.3g "
+                "bad=%llu\n",
+                max_abs, (unsigned long long)bad);
+        ok = ok && bad == 0u;
+    }
+    if (q_candidate) (void)cudaFree(q_candidate);
+    if (q_reference) (void)cudaFree(q_reference);
+    if (candidate_h) (void)cudaFree(candidate_h);
+    if (reference_h) (void)cudaFree(reference_h);
+    if (input_h) (void)cudaFree(input_h);
+    if (weight_h) (void)cudaFree(weight_h);
+    if (reference_f) (void)cudaFree(reference_f);
+    if (input_f) (void)cudaFree(input_f);
+    if (weight_f) (void)cudaFree(weight_f);
+    return ok;
 }
 
 extern "C" int ds4_gpu_prefill_epilogue_self_test(void) {
@@ -21739,12 +23597,30 @@ extern "C" int ds4_gpu_prefill_epilogue_self_test(void) {
     ds4_gpu_tensor *ref_norm = alloc(hc_values * sizeof(float));
     ds4_gpu_tensor *ref_half = alloc(hc_values * sizeof(__half));
     ds4_gpu_tensor *fused_half = alloc(hc_values * sizeof(__half));
-    int ok = allocations.size() == 11u;
+    const uint32_t tiny_tokens = 6u;
+    const uint64_t tiny_block_values = (uint64_t)tiny_tokens * n_embd;
+    const uint64_t tiny_hc_values = tiny_block_values * n_hc;
+    const uint64_t tiny_split_values = (uint64_t)tiny_tokens * split_width;
+    ds4_gpu_tensor *tiny_block = alloc(tiny_block_values * sizeof(float));
+    ds4_gpu_tensor *tiny_add = alloc(tiny_block_values * sizeof(float));
+    ds4_gpu_tensor *tiny_residual = alloc(tiny_hc_values * sizeof(float));
+    ds4_gpu_tensor *tiny_split = alloc(tiny_split_values * sizeof(float));
+    ds4_gpu_tensor *tiny_ref = alloc(tiny_hc_values * sizeof(float));
+    ds4_gpu_tensor *tiny_fused = alloc(tiny_hc_values * sizeof(float));
+    ds4_gpu_tensor *tiny_half = alloc(tiny_block_values * sizeof(__half));
+    ds4_gpu_tensor *tiny_rounded = alloc(tiny_block_values * sizeof(float));
+    int ok = allocations.size() == 19u &&
+             cuda_narrow_f16_self_test() &&
+             cuda_projection_f16_out_self_test();
     if (ok) ok = ds4_gpu_tensor_write(block, 0, block_host.data(), block->bytes);
     if (ok) ok = ds4_gpu_tensor_write(add, 0, add_host.data(), add->bytes);
     if (ok) ok = ds4_gpu_tensor_write(residual, 0, residual_host.data(), residual->bytes);
     if (ok) ok = ds4_gpu_tensor_write(split, 0, split_host.data(), split->bytes);
     if (ok) ok = ds4_gpu_tensor_write(down, 0, down_host.data(), down->bytes);
+    if (ok) ok = ds4_gpu_tensor_write(tiny_block, 0, block_host.data(), tiny_block->bytes);
+    if (ok) ok = ds4_gpu_tensor_write(tiny_add, 0, add_host.data(), tiny_add->bytes);
+    if (ok) ok = ds4_gpu_tensor_write(tiny_residual, 0, residual_host.data(), tiny_residual->bytes);
+    if (ok) ok = ds4_gpu_tensor_write(tiny_split, 0, split_host.data(), tiny_split->bytes);
 
 #ifdef DS4_CUDA_TOKEN_GRAPH_BUILD
     const cudaStream_t stream = cudaStreamPerThread;
@@ -21806,6 +23682,89 @@ extern "C" int ds4_gpu_prefill_epilogue_self_test(void) {
                 (unsigned long long)bad_f16);
         return bad_f32 == 0u && bad_f16 == 0u;
     };
+
+    auto compare_tiny_half = [&](const char *label,
+                                 uint32_t active_tokens,
+                                 const ds4_gpu_tensor *ref_tensor,
+                                 const ds4_gpu_tensor *fused_tensor) -> int {
+        const uint64_t active_values = (uint64_t)active_tokens * n_hc * n_embd;
+        std::vector<float> ref(active_values);
+        std::vector<float> fused(active_values);
+        if (cudaStreamSynchronize(stream) != cudaSuccess ||
+            !ds4_gpu_tensor_read(ref_tensor, 0, ref.data(), ref_tensor->bytes) ||
+            !ds4_gpu_tensor_read(fused_tensor, 0, fused.data(), fused_tensor->bytes)) {
+            return 0;
+        }
+        double max_abs = 0.0;
+        uint64_t bad = 0;
+        for (uint64_t i = 0; i < active_values; ++i) {
+            const double ae = fabs((double)fused[i] - ref[i]);
+            max_abs = fmax(max_abs, ae);
+            if (!isfinite(fused[i]) || ae > 2.0e-6) ++bad;
+        }
+        fprintf(stderr,
+                "cuda-regression: tiny N%u half HC %s max_abs=%.3g bad=%llu\n",
+                active_tokens, label, max_abs, (unsigned long long)bad);
+        return bad == 0u;
+    };
+
+    for (uint32_t active_tokens = 2u; ok && active_tokens <= tiny_tokens;
+         ++active_tokens) {
+        const uint64_t active_block_values = (uint64_t)active_tokens * n_embd;
+        const uint64_t active_hc_values = active_block_values * n_hc;
+        const uint64_t active_split_values = (uint64_t)active_tokens * split_width;
+        ds4_gpu_tensor block_view = *tiny_block;
+        ds4_gpu_tensor add_view = *tiny_add;
+        ds4_gpu_tensor residual_view = *tiny_residual;
+        ds4_gpu_tensor split_view = *tiny_split;
+        ds4_gpu_tensor ref_view = *tiny_ref;
+        ds4_gpu_tensor fused_view = *tiny_fused;
+        ds4_gpu_tensor half_view = *tiny_half;
+        ds4_gpu_tensor rounded_view = *tiny_rounded;
+        block_view.bytes = active_block_values * sizeof(float);
+        add_view.bytes = active_block_values * sizeof(float);
+        residual_view.bytes = active_hc_values * sizeof(float);
+        split_view.bytes = active_split_values * sizeof(float);
+        ref_view.bytes = active_hc_values * sizeof(float);
+        fused_view.bytes = active_hc_values * sizeof(float);
+        half_view.bytes = active_block_values * sizeof(__half);
+        rounded_view.bytes = active_block_values * sizeof(float);
+
+        f32_to_f16_kernel<<<(active_block_values + 255u) / 256u, 256, 0, stream>>>(
+                (__half *)half_view.ptr,
+                (const float *)block_view.ptr,
+                active_block_values);
+        f16_to_f32_kernel<<<(active_block_values + 255u) / 256u, 256, 0, stream>>>(
+                (float *)rounded_view.ptr,
+                (const __half *)half_view.ptr,
+                active_block_values);
+        ok = cudaGetLastError() == cudaSuccess &&
+             ds4_gpu_hc_expand_split_tensor(
+                     &ref_view, &rounded_view, &residual_view, &split_view,
+                     n_embd, n_hc) &&
+             ds4_gpu_hc_expand_split_half_tensor(
+                     &fused_view, &half_view, &residual_view, &split_view,
+                     n_embd, n_hc) &&
+             compare_tiny_half("block", active_tokens, &ref_view, &fused_view);
+        if (!ok) break;
+
+        f32_to_f16_kernel<<<(active_block_values + 255u) / 256u, 256, 0, stream>>>(
+                (__half *)half_view.ptr,
+                (const float *)add_view.ptr,
+                active_block_values);
+        f16_to_f32_kernel<<<(active_block_values + 255u) / 256u, 256, 0, stream>>>(
+                (float *)rounded_view.ptr,
+                (const __half *)half_view.ptr,
+                active_block_values);
+        ok = cudaGetLastError() == cudaSuccess &&
+             ds4_gpu_hc_expand_add_split_tensor(
+                     &ref_view, &block_view, &rounded_view,
+                     &residual_view, &split_view, n_embd, n_hc) &&
+             ds4_gpu_hc_expand_add_split_half_add_tensor(
+                     &fused_view, &block_view, &half_view,
+                     &residual_view, &split_view, n_embd, n_hc) &&
+             compare_tiny_half("add", active_tokens, &ref_view, &fused_view);
+    }
 
     if (ok) {
         ok = ds4_gpu_hc_expand_add_split_tensor(
@@ -21935,9 +23894,50 @@ extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(
         const ds4_gpu_tensor *split,
         uint32_t n_embd,
         uint32_t n_hc) {
-    (void)out_hc; (void)block_out; (void)block_add_h; (void)residual_hc;
-    (void)split; (void)n_embd; (void)n_hc;
-    return 0;
+    if (!out_hc || !block_out || !block_add_h || !residual_hc || !split ||
+        n_embd == 0u || n_hc == 0u) return 0;
+    const uint64_t hc_row = (uint64_t)n_hc * n_embd;
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    if (hc_row > UINT64_MAX / sizeof(float) ||
+        out_hc->bytes < hc_row * sizeof(float) ||
+        out_hc->bytes % (hc_row * sizeof(float)) != 0u) return 0;
+    const uint64_t n_tokens64 = out_hc->bytes / (hc_row * sizeof(float));
+    if (n_tokens64 == 0u || n_tokens64 > UINT32_MAX ||
+        n_tokens64 > UINT64_MAX / n_embd / sizeof(float) ||
+        n_tokens64 > UINT64_MAX / n_embd / sizeof(__half) ||
+        n_tokens64 > UINT64_MAX / mix_hc / sizeof(float) ||
+        block_out->bytes < n_tokens64 * n_embd * sizeof(float) ||
+        block_add_h->bytes < n_tokens64 * n_embd * sizeof(__half) ||
+        residual_hc->bytes < n_tokens64 * hc_row * sizeof(float) ||
+        split->bytes < n_tokens64 * mix_hc * sizeof(float)) return 0;
+    const uint32_t n_tokens = (uint32_t)n_tokens64;
+    if (n_hc == 4u) {
+        const uint64_t n = n_tokens64 * n_embd;
+        hc_expand4_add_half_kernel<<<(n + 255u) / 256u, 256>>>(
+                (float *)out_hc->ptr,
+                (const float *)block_out->ptr,
+                (const __half *)block_add_h->ptr,
+                (const float *)residual_hc->ptr,
+                (const float *)split->ptr,
+                n_embd,
+                n_tokens);
+        return cuda_ok(cudaGetLastError(), "hc_expand_add_split_half4 launch");
+    }
+    const uint64_t n_elem = n_tokens64 * hc_row;
+    const float *base = (const float *)split->ptr;
+    hc_expand_add_half_kernel<<<(n_elem + 255u) / 256u, 256>>>(
+            (float *)out_hc->ptr,
+            (const float *)block_out->ptr,
+            (const __half *)block_add_h->ptr,
+            (const float *)residual_hc->ptr,
+            base + n_hc,
+            base + 2u * n_hc,
+            n_embd,
+            n_hc,
+            n_tokens,
+            (uint32_t)mix_hc,
+            (uint32_t)mix_hc);
+    return cuda_ok(cudaGetLastError(), "hc_expand_add_split_half_add launch");
 }
 
 extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(

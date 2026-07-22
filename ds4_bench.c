@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_gpu.h"
 #include "ds4_help.h"
 
 /* Purpose-built throughput benchmark.
@@ -54,6 +55,8 @@ typedef struct {
     bool cold_sweep;
     bool ssd_streaming;
     bool ssd_streaming_cold;
+    bool projection_microbench;
+    int projection_microbench_iterations;
 } bench_config;
 
 typedef struct {
@@ -161,6 +164,18 @@ static bench_process_memory bench_process_memory_read(void) {
     return out;
 }
 
+static ds4_gpu_runtime_stats bench_gpu_runtime_stats_read(void) {
+    ds4_gpu_runtime_stats out = {0};
+#ifndef DS4_NO_GPU
+    (void)ds4_gpu_runtime_stats_get(&out);
+#endif
+    return out;
+}
+
+static uint64_t bench_counter_delta(uint64_t after, uint64_t before) {
+    return after >= before ? after - before : 0u;
+}
+
 static uint64_t bench_token_hash_update(uint64_t hash, int token) {
     const uint32_t value = (uint32_t)token;
     for (uint32_t shift = 0; shift < 32u; shift += 8u) {
@@ -254,6 +269,7 @@ static bench_config parse_options(int argc, char **argv) {
         .step_incr = 2048,
         .gen_tokens = 128,
         .step_mul = 1.0,
+        .projection_microbench_iterations = 50,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -375,6 +391,11 @@ static bench_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--projection-microbench")) {
+            c.projection_microbench = true;
+        } else if (!strcmp(arg, "--projection-microbench-iters")) {
+            c.projection_microbench_iterations = parse_int(
+                need_arg(&i, argc, argv, arg), arg);
         } else {
             fprintf(stderr, "ds4-bench: unknown option: %s\n", arg);
             usage(stderr, NULL);
@@ -382,8 +403,15 @@ static bench_config parse_options(int argc, char **argv) {
         }
     }
 
-    if (!!c.prompt_path == !!c.chat_prompt_path) {
+    if (!c.projection_microbench &&
+        !!c.prompt_path == !!c.chat_prompt_path) {
         fprintf(stderr, "ds4-bench: specify exactly one of --prompt-file or --chat-prompt-file\n");
+        exit(2);
+    }
+    if (c.projection_microbench &&
+        (c.prompt_path || c.chat_prompt_path)) {
+        fprintf(stderr,
+                "ds4-bench: --projection-microbench does not accept a prompt\n");
         exit(2);
     }
     if (c.ctx_start > c.ctx_max) {
@@ -637,6 +665,28 @@ int main(int argc, char **argv) {
     const bench_process_memory startup_memory = bench_process_memory_read();
     log_context_memory(cfg.backend, cfg.ctx_alloc, cfg.prefill_chunk);
 
+    if (cfg.projection_microbench) {
+        FILE *microbench_out = stdout;
+        if (cfg.csv_path) {
+            microbench_out = fopen(cfg.csv_path, "wb");
+            if (!microbench_out) {
+                fprintf(stderr,
+                        "ds4-bench: failed to open %s: %s\n",
+                        cfg.csv_path, strerror(errno));
+                ds4_engine_close(engine);
+                free(cfg.frontiers);
+                return 1;
+            }
+        }
+        const int microbench_rc = ds4_engine_projection_microbench(
+                engine, microbench_out,
+                (uint32_t)cfg.projection_microbench_iterations);
+        if (microbench_out != stdout) fclose(microbench_out);
+        ds4_engine_close(engine);
+        free(cfg.frontiers);
+        return microbench_rc;
+    }
+
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     ds4_tokens prompt = {0};
     if (cfg.chat_prompt_path) {
@@ -685,7 +735,7 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
-    fprintf(out, "mode,ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes,decode_cycles,tokens_per_cycle,greedy_token_hash,startup_sec,startup_rss_bytes,startup_hwm_bytes,ready_rss_bytes,ready_hwm_bytes,prefill_rss_bytes,prefill_hwm_bytes,decode_rss_bytes,decode_hwm_bytes\n");
+    fprintf(out, "mode,ctx_tokens,prefill_tokens,prefill_tps,gen_tokens,gen_tps,kvcache_bytes,decode_cycles,tokens_per_cycle,spec_cycles,drafted_tokens,target_rows,committed_tokens,emitted_tokens,draft_ms,target_ms,total_ms,drafts_per_cycle,target_rows_per_cycle,emitted_per_cycle,acceptance,greedy_token_hash,startup_sec,startup_rss_bytes,startup_hwm_bytes,ready_rss_bytes,ready_hwm_bytes,prefill_rss_bytes,prefill_hwm_bytes,decode_rss_bytes,decode_hwm_bytes,token_graph_rebuilds,speculative_graph_rebuilds,dspark_draft_graph_launches,dspark_verifier_graph_launches,projection_fallbacks,projection_f16_resident_bytes,token_graph_nodes,speculative_graph_nodes,projection_target_fallbacks,projection_dspark_fallbacks,projection_mtp_fallbacks\n");
     fflush(out);
 
     const int eos = ds4_token_eos(engine);
@@ -736,6 +786,9 @@ int main(int argc, char **argv) {
             }
         }
 
+        ds4_session_speculative_stats_reset(session);
+        const ds4_gpu_runtime_stats gpu_stats_before =
+            bench_gpu_runtime_stats_read();
         const double gen_t0 = bench_now_sec();
         int gen_done = 0;
         int decode_cycles = 0;
@@ -788,6 +841,10 @@ int main(int argc, char **argv) {
             decode_cycles++;
         }
         const double gen_t1 = bench_now_sec();
+        const ds4_speculative_stats spec_stats =
+            ds4_session_speculative_stats_get(session);
+        const ds4_gpu_runtime_stats gpu_stats_after =
+            bench_gpu_runtime_stats_read();
         const bench_process_memory decode_memory = bench_process_memory_read();
         if (rc != 0) break;
 
@@ -811,7 +868,7 @@ int main(int argc, char **argv) {
 
         const double gen_sec = gen_t1 - gen_t0;
         fprintf(out,
-                "%s,%d,%d,%.2f,%d,%.2f,%llu,%d,%.4f,%016llx,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                "%s,%d,%d,%.2f,%d,%.2f,%llu,%d,%.4f,%llu,%llu,%llu,%llu,%llu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.6f,%016llx,%.6f,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
                 cfg.cold_sweep ? "cold" : "append",
                 frontier,
                 prefill_tokens,
@@ -821,6 +878,26 @@ int main(int argc, char **argv) {
                 (unsigned long long)(distributed || cfg.cold_sweep ? 0 : snap.len),
                 decode_cycles,
                 decode_cycles > 0 ? (double)gen_done / (double)decode_cycles : 0.0,
+                (unsigned long long)spec_stats.cycles,
+                (unsigned long long)spec_stats.drafted_tokens,
+                (unsigned long long)spec_stats.target_rows,
+                (unsigned long long)spec_stats.committed_tokens,
+                (unsigned long long)spec_stats.emitted_tokens,
+                spec_stats.cycles > 0
+                    ? spec_stats.draft_seconds * 1000.0 / (double)spec_stats.cycles : 0.0,
+                spec_stats.cycles > 0
+                    ? spec_stats.target_seconds * 1000.0 / (double)spec_stats.cycles : 0.0,
+                spec_stats.cycles > 0
+                    ? spec_stats.total_seconds * 1000.0 / (double)spec_stats.cycles : 0.0,
+                spec_stats.cycles > 0
+                    ? (double)spec_stats.drafted_tokens / (double)spec_stats.cycles : 0.0,
+                spec_stats.cycles > 0
+                    ? (double)spec_stats.target_rows / (double)spec_stats.cycles : 0.0,
+                spec_stats.cycles > 0
+                    ? (double)spec_stats.emitted_tokens / (double)spec_stats.cycles : 0.0,
+                spec_stats.drafted_tokens > 0
+                    ? (double)spec_stats.committed_tokens /
+                      (double)spec_stats.drafted_tokens : 0.0,
                 (unsigned long long)greedy_token_hash,
                 startup_sec,
                 (unsigned long long)startup_memory.rss_bytes,
@@ -830,7 +907,34 @@ int main(int argc, char **argv) {
                 (unsigned long long)prefill_memory.rss_bytes,
                 (unsigned long long)prefill_memory.hwm_bytes,
                 (unsigned long long)decode_memory.rss_bytes,
-                (unsigned long long)decode_memory.hwm_bytes);
+                (unsigned long long)decode_memory.hwm_bytes,
+                (unsigned long long)bench_counter_delta(
+                    gpu_stats_after.token_graph_rebuilds,
+                    gpu_stats_before.token_graph_rebuilds),
+                (unsigned long long)bench_counter_delta(
+                    gpu_stats_after.speculative_graph_rebuilds,
+                    gpu_stats_before.speculative_graph_rebuilds),
+                (unsigned long long)bench_counter_delta(
+                    gpu_stats_after.dspark_graph_draft_launches,
+                    gpu_stats_before.dspark_graph_draft_launches),
+                (unsigned long long)bench_counter_delta(
+                    gpu_stats_after.dspark_graph_verifier_launches,
+                    gpu_stats_before.dspark_graph_verifier_launches),
+                (unsigned long long)bench_counter_delta(
+                    gpu_stats_after.projection_fallbacks,
+                    gpu_stats_before.projection_fallbacks),
+                (unsigned long long)gpu_stats_after.projection_f16_resident_bytes,
+                (unsigned long long)gpu_stats_after.token_graph_nodes,
+                (unsigned long long)gpu_stats_after.speculative_graph_nodes,
+                (unsigned long long)bench_counter_delta(
+                    gpu_stats_after.projection_target_fallbacks,
+                    gpu_stats_before.projection_target_fallbacks),
+                (unsigned long long)bench_counter_delta(
+                    gpu_stats_after.projection_dspark_fallbacks,
+                    gpu_stats_before.projection_dspark_fallbacks),
+                (unsigned long long)bench_counter_delta(
+                    gpu_stats_after.projection_mtp_fallbacks,
+                    gpu_stats_before.projection_mtp_fallbacks));
         fflush(out);
 
         previous = cfg.cold_sweep ? 0 : frontier;

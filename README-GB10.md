@@ -10,7 +10,7 @@ successive conservano la cronologia tecnica, comprese prove scartate e rollback.
 
 ## Stato corrente
 
-Stato al 18 luglio 2026:
+Stato al 22 luglio 2026:
 
 - contesto fisico: 131072 token;
 - contesto pubblicizzato ai client: 85%;
@@ -31,6 +31,34 @@ Il riferimento validato prima dell'ultimo intervento attention è circa
 `399,92 t/s` medi su 58,5K token di append prefill. Sul tratto confrontabile
 24,5K–57,3K sono stati misurati circa `425,9 t/s`; il decode DSpark a 83K ha
 prodotto 401 token a `23,00 t/s`.
+
+### Tentativo Cryptex Decoder scartato
+
+E' stato provato un decoder target-guided che, dopo un rifiuto speculativo,
+riutilizzava i base logits non causali di DSpark e rigenerava soltanto il
+correttore Markov dal token residuo del target. Il primo prototipo copriva le
+posizioni 3..5; il secondo copriva tutti i rifiuti K1..K5, con bias sparso fuso
+nel sampler `q`, verifica p/q lossless, rollback transazionale di frontier,
+ring e RNG, memoria GPU persistente limitata a 1 KiB e ammissione adattiva per
+coppia `(K, slot)`.
+
+Il test Athena finale ha raccolto 898 cicli, 3513 draft e 2091 token
+committati, con acceptance grezza del `59,52%`. I rami Cryptex hanno prodotto
+74 token in 6,600 secondi, cioe' soltanto `11,21 t/s` marginali. Il percorso
+completo ha ottenuto `18,27 t/s`; eliminando tempo e token dei rami dagli stessi
+cicli la stima interna e' `18,56 t/s`, circa `-1,6%` per l'esperimento. Il
+watchdog ha inoltre registrato nove cooldown del bias e venti cooldown dei
+rami. Codice, API CUDA, tensor persistente e test Cryptex sono stati quindi
+rimossi integralmente.
+
+Sul pensiero lungo da 1590 token a circa 70K di contesto, Cryptex ha generato
+18 token in 2,352 secondi (`7,65 t/s`) e ha ridotto la stima da `16,00` a
+`15,80 t/s`. Il run ha pero' evidenziato anche un collo di bottiglia separato:
+lo scheduler ha scelto K4 nel `99,4%` dei cicli mentre l'acceptance scendeva al
+`48,05%` e l'accettazione completa K4 al `22,3%`. Un futuro intervento deve
+quindi rendere la selezione K sensibile alla fase recente, con isteresi e probe
+periodici, senza reintrodurre il traversal Cryptex. Il prefill non ha mostrato
+regressioni attribuibili al tentativo.
 
 ### Fast path MoE aligned del verifier DSpark validato
 

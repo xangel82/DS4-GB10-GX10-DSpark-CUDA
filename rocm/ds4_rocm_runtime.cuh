@@ -4401,6 +4401,13 @@ extern "C" int ds4_gpu_init(void) {
     return 1;
 }
 
+extern "C" int ds4_gpu_runtime_stats_get(ds4_gpu_runtime_stats *out) {
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    out->projection_f16_resident_bytes = g_q8_f16_bytes;
+    return 1;
+}
+
 extern "C" void ds4_gpu_cleanup(void) {
     (void)cudaDeviceSynchronize();
     cuda_stream_cache_stats_print("cleanup");
@@ -4777,6 +4784,20 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
     }
     optional_q8_preload_disabled = 1;
     return 1;
+}
+
+extern "C" int ds4_gpu_cache_q8_f16_projection_range(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        uint64_t in_dim,
+        uint64_t out_dim,
+        const char *label,
+        ds4_gpu_projection_kind kind) {
+    (void)kind;
+    return ds4_gpu_cache_q8_f16_range(model_map, model_size, offset, bytes,
+                                       in_dim, out_dim, label);
 }
 
 extern "C" void ds4_gpu_release_q8_f16_cache(void) {

@@ -24,8 +24,68 @@ extern "C" {
  */
 typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 
+/* Stable projection identities are shared by graph construction, cache
+ * preparation, and backend dispatch. Backends that do not specialize tiny
+ * verifier batches may ignore the hint. */
+typedef enum {
+    DS4_GPU_PROJ_OUTPUT = 0,
+    DS4_GPU_PROJ_ATTN_Q_A,
+    DS4_GPU_PROJ_ATTN_KV,
+    DS4_GPU_PROJ_ATTN_Q_B,
+    DS4_GPU_PROJ_ATTN_OUT_A,
+    DS4_GPU_PROJ_ATTN_OUT_B,
+    DS4_GPU_PROJ_SHARED_GATE,
+    DS4_GPU_PROJ_SHARED_UP,
+    DS4_GPU_PROJ_SHARED_DOWN,
+    DS4_GPU_PROJ_INDEXER_Q_B,
+    DS4_GPU_PROJ_OTHER,
+    DS4_GPU_PROJ_COUNT
+} ds4_gpu_projection_kind;
+
+/* Model identity is explicit so target prefill/verifier and support-model
+ * decode never inherit one another's projection policy or cache decisions. */
+typedef enum {
+    DS4_GPU_MODEL_TARGET = 0,
+    DS4_GPU_MODEL_DSPARK,
+    DS4_GPU_MODEL_MTP,
+    DS4_GPU_MODEL_OTHER,
+    DS4_GPU_MODEL_ROLE_COUNT
+} ds4_gpu_model_role;
+
+typedef enum {
+    /* Select by the mmap that owns the weight.  This is the safe default for
+     * ordinary one-model calls and projection microbenchmarks. */
+    DS4_GPU_PROJECTION_PHASE_MODEL = 0,
+    /* Prefill is deliberately pinned to the established kernels, including
+     * the final short chunk where n_tokens happens to be in [2, 6]. */
+    DS4_GPU_PROJECTION_PHASE_PREFILL,
+    /* Operation scopes override weight ownership.  DSpark draft, for
+     * example, uses the target output head but it still belongs to draft_ms. */
+    DS4_GPU_PROJECTION_PHASE_TARGET,
+    DS4_GPU_PROJECTION_PHASE_DSPARK,
+    DS4_GPU_PROJECTION_PHASE_MTP
+} ds4_gpu_projection_phase;
+
+/* Process-wide counters used by repeatable performance gates.  Rebuild,
+ * launch, and fallback fields are monotonic between ds4_gpu_init/cleanup;
+ * node and resident-byte fields describe the current live GPU state. */
+typedef struct {
+    uint64_t token_graph_rebuilds;
+    uint64_t speculative_graph_rebuilds;
+    uint64_t dspark_graph_draft_launches;
+    uint64_t dspark_graph_verifier_launches;
+    uint64_t projection_fallbacks;
+    uint64_t projection_target_fallbacks;
+    uint64_t projection_dspark_fallbacks;
+    uint64_t projection_mtp_fallbacks;
+    uint64_t projection_f16_resident_bytes;
+    uint64_t token_graph_nodes;
+    uint64_t speculative_graph_nodes;
+} ds4_gpu_runtime_stats;
+
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
+int ds4_gpu_runtime_stats_get(ds4_gpu_runtime_stats *out);
 /* CUDA regression hook: compare the prefill-only MMQ routed-MoE path with
  * DS4's established IQ2_XXS/Q2_K kernels on deterministic packed weights. */
 int ds4_gpu_mmq_prefill_self_test(void);
@@ -125,12 +185,17 @@ void ds4_gpu_prefill_trace_begin(uint32_t pos0, uint32_t n_tokens);
 void ds4_gpu_prefill_trace_end(uint32_t pos0, uint32_t n_tokens, bool success);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
+int ds4_gpu_set_projection_model_role(const void *model_map,
+                                      ds4_gpu_model_role role);
+int ds4_gpu_projection_candidate_enabled(const void *model_map);
+int ds4_gpu_set_projection_phase(ds4_gpu_projection_phase phase);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
+int ds4_gpu_cache_q8_f16_projection_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label, ds4_gpu_projection_kind kind);
 #ifdef DS4_ROCM_BUILD
 void ds4_gpu_release_q8_f16_cache(void);
 #endif
@@ -369,6 +434,17 @@ int ds4_gpu_matmul_q8_0_tensor(
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
 
+int ds4_gpu_matmul_q8_0_projection_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        ds4_gpu_projection_kind kind);
+
 /* Optional fused GPU operations.
  *
  * These are acceleration hooks, not required backend primitives.  A backend
@@ -389,6 +465,21 @@ int ds4_gpu_matmul_q8_0_pair_tensor(
         uint64_t                out1_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
+
+int ds4_gpu_matmul_q8_0_projection_pair_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight0_offset,
+        uint64_t                weight1_offset,
+        uint64_t                in_dim,
+        uint64_t                out0_dim,
+        uint64_t                out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        ds4_gpu_projection_kind kind0,
+        ds4_gpu_projection_kind kind1);
 
 int ds4_gpu_matmul_q8_0_f16_out_tensor(
         ds4_gpu_tensor       *out_h,

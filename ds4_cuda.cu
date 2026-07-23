@@ -14977,6 +14977,19 @@ static int cuda_attention_tokentile_arch_ok(void) {
     return supported;
 }
 
+static bool cuda_attention_tokentile_comp_rows_fit(
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              comp_kv_f16,
+        uint32_t              n_comp,
+        uint32_t              head_dim) {
+    if (!comp_kv || head_dim == 0u) return false;
+    const uint64_t element_bytes =
+        comp_kv_f16 ? sizeof(half) : sizeof(float);
+    const uint64_t row_bytes = (uint64_t)head_dim * element_bytes;
+    return row_bytes != 0u &&
+           (uint64_t)n_comp <= comp_kv->bytes / row_bytes;
+}
+
 /* Returns 1 after a successful token-tile launch, 0 when the existing path
  * should be used, and -1 for a CUDA launch/configuration failure. */
 static int cuda_attention_tokentile_indexed_launch(
@@ -15000,7 +15013,11 @@ static int cuda_attention_tokentile_indexed_launch(
         uint32_t              head_dim) {
     if (!topk || n_tokens < 128u || head_dim != kTTHeadDim || n_head != 64u ||
         top_k != 512u || window != kTTRawWindow || ratio == 0u ||
-        n_comp == 0u || n_comp > 32768u || n_raw < n_tokens ||
+        n_comp == 0u ||
+        !cuda_attention_tokentile_comp_rows_fit(
+            comp_kv, comp_kv_f16, n_comp, head_dim) ||
+        (!comp_kv_f16 && n_comp > 32768u) ||
+        n_raw < n_tokens ||
         (uint64_t)n_raw > (uint64_t)pos0 + n_tokens ||
         g_token_graph_capturing || g_mtp_graph_capturing ||
         !cuda_attention_tokentile_arch_ok()) {
@@ -15068,6 +15085,20 @@ static int cuda_attention_tokentile_indexed_launch(
         attention_tokentile_comp_mirror_kernel<<<n_comp, 256>>>(
                 comp_mirror, (const float *)comp_kv->ptr, n_comp, head_dim);
         if (!cuda_ok(cudaGetLastError(), "attention token-tile comp mirror launch")) return -1;
+    }
+
+    if (comp_kv_f16 && n_comp > 32768u) {
+        static int extended_direct_f16_notice_printed;
+        if (!extended_direct_f16_notice_printed) {
+            extended_direct_f16_notice_printed = 1;
+            fprintf(stderr,
+                    "ds4: CUDA FlashMLA direct-F16 dynamic compressed capacity "
+                    "enabled (rows=%u tensor-cap=%llu)\n",
+                    n_comp,
+                    (unsigned long long)(
+                        comp_kv->bytes /
+                        ((uint64_t)head_dim * sizeof(half))));
+        }
     }
 
     /* x is the fast launch dimension: place both head groups for one token
@@ -15436,6 +15467,102 @@ extern "C" int ds4_gpu_attention_tokentile_self_test(void) {
     if (ok) ok = cuda_attention_tokentile_compare(
             heads_ref, heads_tt, reference, candidate, out_count,
             "raw/mixed direct-F16 attention");
+
+    if (ok) {
+        const uint32_t long_n_comp = 32769u;
+        const uint32_t long_pos0 = long_n_comp * 4u - n_tokens;
+        const uint64_t long_comp_count =
+            (uint64_t)long_n_comp * head_dim;
+        std::vector<uint16_t> long_comp_host(long_comp_count, 0u);
+        for (uint32_t row = long_n_comp - 1024u;
+             row < long_n_comp;
+             ++row) {
+            for (uint32_t col = 0; col < head_dim; ++col) {
+                const uint32_t pattern = (row + col) & 3u;
+                long_comp_host[(uint64_t)row * head_dim + col] =
+                    pattern == 0u ? 0x3800u :
+                    pattern == 1u ? 0x3400u :
+                    pattern == 2u ? 0x3000u : 0u;
+            }
+        }
+        for (uint32_t t = 0; t < n_tokens; ++t) {
+            const uint32_t visible = (long_pos0 + t + 1u) / 4u;
+            const uint32_t first = visible - top_k;
+            for (uint32_t i = 0; i < top_k; ++i) {
+                topk_host[(uint64_t)t * top_k + i] =
+                    (int32_t)(first + i);
+            }
+        }
+        ds4_gpu_tensor *long_comp_f16 =
+            ds4_gpu_tensor_alloc(long_comp_count * sizeof(uint16_t));
+        ok = long_comp_f16 != NULL &&
+             ds4_gpu_tensor_write(
+                 long_comp_f16,
+                 0,
+                 long_comp_host.data(),
+                 long_comp_count * sizeof(uint16_t)) &&
+             ds4_gpu_tensor_write(
+                 topk,
+                 0,
+                 topk_host.data(),
+                 topk_count * sizeof(int32_t));
+        if (ok) {
+            dim3 reference_grid(n_tokens, (n_head + 15u) / 16u, 1);
+            attention_indexed_mixed_heads8_online_kernel<8, 16, true>
+                <<<reference_grid, 512>>>(
+                    (float *)heads_ref->ptr,
+                    (const float *)sinks_dev->ptr,
+                    (const float *)q->ptr,
+                    (const float *)raw->ptr,
+                    long_comp_f16->ptr,
+                    (const int32_t *)topk->ptr,
+                    n_tokens,
+                    long_pos0,
+                    n_raw,
+                    n_raw,
+                    0,
+                    long_n_comp,
+                    top_k,
+                    kTTRawWindow,
+                    4u,
+                    n_head,
+                    head_dim);
+            ok = cuda_ok(
+                cudaGetLastError(),
+                "attention token-tile extended F16 reference launch");
+        }
+        if (ok) {
+            ok = cuda_attention_tokentile_indexed_launch(
+                    heads_tt,
+                    (const float *)sinks_dev->ptr,
+                    q,
+                    raw,
+                    long_comp_f16,
+                    1u,
+                    (const int32_t *)topk->ptr,
+                    n_tokens,
+                    long_pos0,
+                    n_raw,
+                    n_raw,
+                    0,
+                    long_n_comp,
+                    top_k,
+                    kTTRawWindow,
+                    4u,
+                    n_head,
+                    head_dim) == 1;
+        }
+        if (ok) {
+            ok = cuda_attention_tokentile_compare(
+                    heads_ref,
+                    heads_tt,
+                    reference,
+                    candidate,
+                    out_count,
+                    "indexed direct-F16 attention above 32K rows");
+        }
+        ds4_gpu_tensor_free(long_comp_f16);
+    }
 
     ds4_gpu_tensor_free(topk);
     ds4_gpu_tensor_free(comp_f16);

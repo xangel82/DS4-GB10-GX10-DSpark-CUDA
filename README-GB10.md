@@ -8,6 +8,211 @@ conservare il throughput DSpark sui contesti lunghi.
 La sezione **Avvio rapido** è la procedura operativa aggiornata. Le sezioni
 successive conservano la cronologia tecnica, comprese prove scartate e rollback.
 
+## FlashMLA direct-F16 dinamico oltre 131K - 23 luglio 2026
+
+Portando il context fisico da 131072 a 262144 e' emersa una soglia artificiale:
+il token-tile indexed attention rifiutava `n_comp > 32768`. Con ratio-4 questa
+soglia coincide esattamente con 131072 token e causava il passaggio dal fast
+path FlashMLA/HMMA al precedente kernel indexed. Nel run 256K il chunk che
+terminava a 131072 misurava circa 860 t/s, mentre il successivo scendeva a
+circa 648 t/s.
+
+Il limite da 32768 righe e' necessario soltanto quando la compressed KV F32
+deve essere convertita nella mirror F16 preallocata. Il percorso operativo
+direct-F16 non crea tale mirror e legge soltanto le 512 righe selezionate.
+L'eleggibilita' direct-F16 usa ora dinamicamente la capacita' effettiva del
+tensore compressed KV; il limite F32 e quello del percorso dense restano
+invariati. Non vengono aggiunti buffer o scratch.
+
+La regressione CUDA esegue realmente il kernel a 32769 righe compresse e lo
+confronta con il riferimento indexed:
+
+```text
+ds4: CUDA FlashMLA direct-F16 dynamic compressed capacity enabled (rows=32769 tensor-cap=32769)
+cuda-regression: token-tile indexed direct-F16 attention above 32K rows rel-rmse=0.000091 max-abs=0.000040
+cuda long-context regression: OK
+```
+
+La parita' numerica e il dispatch sono quindi validati. Il successivo run
+end-to-end con lo stesso carico operativo ha confermato il recupero oltre la
+soglia:
+
+| Intervallo | Prima | Direct-F16 dinamico | Variazione |
+| --- | ---: | ---: | ---: |
+| primo chunk oltre 131K | 648,39 t/s | 858,48 t/s | +32,40% |
+| append profondo | 624,92 t/s (147208 -> 207064) | 836,16 t/s (127827 -> 180844) | +33,80% |
+
+Nel run aggiornato i sei chunk completi oltre la vecchia soglia hanno misurato
+858,48, 849,68, 846,14, 842,61, 833,60 e 828,20 t/s. Il decadimento residuo e'
+progressivo con la crescita del contesto, non piu' un salto netto a 131072.
+L'append da 53017 token e' terminato in 63,406 secondi; il decode DSpark
+immediatamente successivo ha generato 290 token a 19,892 t/s. Non sono apparsi
+errori CUDA, OOM o fallback.
+
+I due intervalli profondi hanno estremi diversi e il decode dipende dal
+contenuto, quindi il confronto non va letto come un microbenchmark
+position-matched. Dimostra pero' che il limite artificiale e' stato rimosso e
+che il percorso ottimizzato rimane attivo nel regime per cui il context 256K
+era stato introdotto.
+
+## Arena condivisa indexer/MoE - 23 luglio 2026
+
+Il prefill allocava contemporaneamente due workspace con vite disgiunte:
+
+- `indexer_scores`, circa 1024 MiB con context 131072 e chunk 8192;
+- gate, up, mid e down del routed MoE, usati soltanto dopo Top-K e attention.
+
+`indexer_scores` occupa ora la regione gate/up/mid dell'arena routed-MoE.
+La query indexer F32/MXFP4 rimane nella regione down, quindi scorer e query non
+si sovrappongono. Dopo Top-K e attention gli score non sono piu' necessari e
+il routed MoE puo' sovrascrivere la stessa memoria. Kernel, Top-512, precisioni
+e ordine delle operazioni non cambiano.
+
+La regressione CUDA completa e' passata, incluse parita' MoE N=2..6, scorer
+MXFP4, Top-512 esatto e attention long-context. Il conteggio dei buffer
+dichiara:
+
+| Configurazione | Context buffer |
+| --- | ---: |
+| allocazioni separate | 2453,90 MiB |
+| arena condivisa | 1429,84 MiB |
+
+Il risparmio allocato e' esattamente 1024,06 MiB. La prima misura di
+`MemAvailable` non viene usata come prova: il percorso diagnostico senza alias
+allocava per errore sia l'arena completa sia i quattro buffer separati,
+sovrastimando il delta fisico. Il fallback e' stato corretto e il dato UMA
+andra' rimisurato. L'A/B prestazionale sullo stesso binario non ha mostrato
+una regressione sistematica a 82K/98K:
+
+| Frontiera | Arena | Allocazioni separate |
+| --- | ---: | ---: |
+| 65536 | 930,97 t/s | 949,49 t/s |
+| 81920 | 904,61 t/s | 904,95 t/s |
+| 98304 | 870,87 t/s | 867,56 t/s |
+
+Il 65K resta rumoroso; le due frontiere profonde sono equivalenti entro circa
+lo 0,4%. Gli hash greedy a 82K e 98K coincidono. La modifica non va confusa con
+un'accelerazione del decode: il riferimento operativo DSpark rimane 22-25 t/s,
+mentre i 9-11 t/s di `ds4-bench` derivano da prompt sintetici con acceptance
+molto piu' bassa e valgono soltanto per confronti A/B identici.
+
+### Reinvestimento del GiB e tuning time-boxed
+
+Il margine recuperato e' stato provato anche come budget prestazionale, senza
+promuovere risultati che violassero i gate:
+
+- lo staging di otto indexer head ha mantenuto gli hash ma ha perso circa
+  5,4-5,8% di prefill ed e' stato rimosso;
+- spostare in shared il puntatore uniforme del token-tile attention ha ridotto
+  lo stack SASS dense da 16 a 8 byte, ma il prefill pesato e' peggiorato di
+  circa il 6,9%; anche questa patch e' stata rimossa;
+- chunk 12288 con raw ring 8192 non e' valido e viene rifiutato durante
+  l'attention; dimensionare il raw ring e usare chunk 10240 resta entro il
+  vecchio budget, ma passa da 966,08 a 924,29 t/s pesati (-4,33%);
+- padding Tensor Core del verifier da 8 a 4 ha migliorato il decode sintetico
+  da 11,58 a 12,41 t/s (+7,17%), ma solo 3/5 risposte greedy della fixture
+  coincidevano, con 82 contro 90 cicli. E' stato respinto per il requisito
+  qualita' ASIS.
+
+Il default resta quindi chunk 8192 e padding verifier 8. Nessuno dei quattro
+esperimenti sopra rimane nel codice.
+
+Il tentativo di reinvestire il margine in una cache Q8->F16 da 15 GiB non ha
+dato un vantaggio ripetibile: rispetto a 12 GiB ha aggiunto solo circa 0,5 GiB
+di cache effettiva e variazioni entro il rumore. Il chunk 16384 ha invece
+superato il limite pratico UMA ed e' stato scartato; il chunk stabile resta
+8192.
+
+## Tentativo dedup esperti verifier scartato - 23 luglio 2026
+
+E' stato adattato al kernel GB10 Q8_K il first-owner expert dedup del verifier:
+per le righe con lo stesso esperto, una CTA avrebbe caricato il peso una volta
+e prodotto piu' righe. Parita' N=2..6 e regressione CUDA erano corrette, ma
+l'A/B K=3 controllato ha dimostrato che la pressione aggiuntiva su registri e
+shared memory annullava il riuso:
+
+| Variante | Cicli | Acceptance | Target | Ciclo fuso | Throughput |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| stabile | 264 | 31,43% | 144,792 ms | 167,345 ms | 11,611 t/s |
+| dedup | 264 | 31,43% | 145,372 ms | 167,933 ms | 11,570 t/s |
+
+Prompt, hash e scheduler erano identici. La variante dedup, circa 0,4% piu'
+lenta, e' stata rimossa integralmente.
+
+## Tentativi di tuning aggiuntivi scartati - 23 luglio 2026
+
+- Cache Q8->F16 ridotta a 11 GiB: prefill peggiore del 34-38%.
+- `launch_bounds(512,2)` sul token-tile attention: 64 registri ma spill in
+  local memory e prefill peggiore del 14-17%.
+- Gate/up D2R N32 a una CTA senza spill: prefill peggiore del 2,5-3%.
+- Chunk 4096: riduce i context buffer di circa 837 MiB e puo' migliorare il
+  decode sintetico, ma perde circa 1,4-2,3% di prefill; rimane una possibile
+  configurazione memory-first, non il default prestazionale.
+
+## Tentativo sparse attention M16/R16 scartato - 23 luglio 2026
+
+E' stata valutata una specializzazione del token-tile indexed attention con
+un token e 16 head per CTA, stage KV da 16 righe, 384 thread divisi in quattro
+warp score e otto warp PV. Lo scopo era passare dal kernel M32/R32 limitato a
+una CTA per SM a due CTA residenti, senza cambiare Top-512, maschere o KV.
+
+L'implementazione ha raggiunto tutti i gate architetturali previsti:
+
+- shared memory dinamica ridotta da 88576 a 39168 byte per CTA;
+- due blocchi residenti per SM verificati dalla CUDA occupancy API;
+- 80 registri per thread e zero local memory/spill;
+- regressione long-context completata con successo;
+- confronto M16/R16 contro M32/R32: `rel-rmse=0.000218` e
+  `max-abs=0.000000`, sia con cache F32 sia con compressed KV F16.
+
+Il benchmark append-only standard ha pero' mostrato che la maggiore occupancy
+non compensa la perdita di riuso delle righe KV sui contesti lunghi:
+
+| Frontiera | M32/R32 stabile | M16/R16 | Variazione |
+| --- | ---: | ---: | ---: |
+| 65536 | 913,61 t/s | 945,24 t/s | +3,46% |
+| 81920 | 937,77 t/s | 917,71 t/s | -2,14% |
+| 98304 | 913,54 t/s | 877,52 t/s | -3,94% |
+
+Il throughput pesato sui 98304 token passa da circa 917,54 a 928,65 t/s,
+soltanto **+1,21%**, con un decadimento contrario all'obiettivo principale.
+M16 richiede quattro CTA per coprire i 64 head invece delle due di M32 e R16
+raddoppia iterazioni, sincronizzazioni e aggiornamenti dell'online softmax.
+Il latency hiding ai contesti iniziali migliora, ma con la crescita della
+compressed KV prevalgono le richieste L2 aggiuntive e il minore riuso
+head-major per caricamento.
+
+La variante e' stata quindi rimossa integralmente. Il percorso stabile resta
+M32/R32; futuri interventi sulla sparse attention devono conservarne il riuso
+di 32 head per riga KV e ridurre il costo interno senza aumentare il numero di
+CTA che rileggono lo stesso Top-K. Il decode DSpark non era coinvolto nel
+dispatch M16/R16 e non ha richiesto rollback separati.
+
+## Tentativo overlap routed/shared verifier scartato - 23 luglio 2026
+
+E' stato provato un fork/join CUDA Graph fra i due rami indipendenti della FFN
+target: routed MoE su uno stream ausiliario e shared expert sullo stream
+principale. Kernel, precisione e somma finale erano invariati e non venivano
+allocati nuovi buffer di modello o scratch.
+
+Il confronto per singola dimensione del verifier mostrava un segnale locale:
+`K=4` passava da 170,918 a 160,871 ms di target e da 194,278 a 181,720 ms per
+il ciclo completo. Il test end-to-end eseguito con lo stesso prompt ha pero'
+violato i gate prioritari:
+
+- verifier acceptance: 85,02% -> 65,05%;
+- weighted request decode: 22,234 -> 19,751 t/s;
+- il scheduler si e' spostato da quasi tutto `K=3` a 1420/1478 cicli `K=4`;
+- mean fused cycle: 163,169 -> 180,487 ms.
+
+Il diverso mix di K spiega una parte del ciclo medio, ma non giustifica
+l'approvazione di una variante con throughput e acceptance peggiori sul test
+operativo stabile. Non e' stato dimostrato se la causa fosse una dipendenza
+CUDA Graph nascosta o l'interazione fra costo misurato e scelta adattiva di K.
+L'overlap e le relative API stream/event sono stati rimossi integralmente.
+Futuri interventi sul verifier devono essere serialmente deterministici oppure
+superare un A/B greedy con hash identico prima della misura prestazionale.
+
 ## Resoconto rollback proiezioni — 22 luglio 2026
 
 Il branch `main` è stato riallineato alla versione pubblicata su `origin/main`,
@@ -590,7 +795,7 @@ produce `.target sm_121`, che non abilita le istruzioni MMA block-scaled MXFP4.
 cd ~/DS4-GB10-GX10-DSpark-CUDA && ./run-dspark-server.sh 2>&1 | tee /tmp/ds4-dspark-server.log
 ```
 
-Il launcher usa per default `balanced`, chunk 8192, context 131072, advertise
+Il launcher usa per default `balanced`, chunk 8192, context 262144, advertise
 85%, cache Q8→F16 da 12 GiB, porta 30007 e KV cache in
 `/tmp/ds4-gb10-dspark-kv`.
 
@@ -665,7 +870,7 @@ consumare la RAM unificata di Athena. Con il server gia' avviato, il comando
 fissa casi, seed, temperatura e budget di reasoning:
 
 ```bash
-OPENAI_API_KEY=dummy "$HOME/.venvs/ds4-lm-eval/bin/lm-eval" run --model local-chat-completions --model_args "model=deepseek-v4-flash,base_url=http://192.168.254.62:30007/v1/chat/completions,num_concurrent=1,max_retries=1,tokenized_requests=False,max_length=111411,eos_string=<|endoftext|>" --tasks gsm8k_cot_zeroshot,ifeval --apply_chat_template --samples '{"gsm8k_cot_zeroshot":[0,1,2,3,4,5,6,7,8,9,10,11],"ifeval":[0,1,2,3,4,5,6,7,8,9,10,11]}' --batch_size 1 --seed 1234 --gen_kwargs "max_gen_toks=2200,temperature=0.0" --output_path /tmp/ds4-lm-eval-quick-2200 --log_samples
+OPENAI_API_KEY=dummy "$HOME/.venvs/ds4-lm-eval/bin/lm-eval" run --model local-chat-completions --model_args "model=deepseek-v4-flash,base_url=http://192.168.254.62:30007/v1/chat/completions,num_concurrent=1,max_retries=1,tokenized_requests=False,max_length=222822,eos_string=<|endoftext|>" --tasks gsm8k_cot_zeroshot,ifeval --apply_chat_template --samples '{"gsm8k_cot_zeroshot":[0,1,2,3,4,5,6,7,8,9,10,11],"ifeval":[0,1,2,3,4,5,6,7,8,9,10,11]}' --batch_size 1 --seed 1234 --gen_kwargs "max_gen_toks=2200,temperature=0.0" --output_path /tmp/ds4-lm-eval-quick-2200 --log_samples
 ```
 
 Per questo gate va confrontata la metrica GSM8K `flexible-extract`; il filtro
@@ -678,7 +883,7 @@ del risultato `\\boxed{...}` emesso da DS4.
 `balanced` imposta:
 
 ```text
-DS4_CTX=131072
+DS4_CTX=262144
 DS4_ADVERTISE_CONTEXT_PCT=85
 DS4_MEMORY_PROFILE=balanced
 DS4_PREFILL_CHUNK=8192
@@ -694,14 +899,48 @@ DS4_DSPARK_ALWAYS_DRAFT=1
 DS4_DSPARK_NO_CIRCUIT_BREAKER=1
 DS4_PREFILL_FINAL_LOGITS_ONLY=1
 DS4_KV_PREFILL_CHECKPOINT_POLICY=canonical-only
-DS4_KV_CACHE_COLD_MAX_TOKENS=131072
-DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS=65536
-DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS=8192
+DS4_KV_CACHE_COLD_MAX_TOKENS=262144
+DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS=131072
+DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS=16384
 ```
 
-Il context guard pubblica circa 111411 token e sottrae anche il budget di
+Il context guard pubblica circa 222822 token e sottrae anche il budget di
 output, 2200 token per default. Questo lascia margine per la compaction del
 client prima del limite fisico.
+
+### Profilo sperimentale da 1M token
+
+Il server puo' allocare un context fisico da 1048576 token mantenendo
+l'advertise all'85%. Sul GB10 questo profilo deve usare chunk 4096: chunk 8192
+porta i context buffer da circa 10,36 a 14,78 GiB e ha prodotto OOM durante
+l'avvio con cache Q8->F16 da 12 GiB.
+
+Fermare prima il server corrente e avviare il launcher dedicato:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && ./run-dspark-server-1m.sh 2>&1 | tee /tmp/ds4-1m.log
+```
+
+`run-dspark-server-1m.sh` fissa context 1048576, chunk 4096, advertise 85%,
+anchor 524288 e trim 65536. Usa per default la KV cache isolata
+`/tmp/ds4-gb10-dspark-1m-kv` e abilita la telemetria; il percorso puo' essere
+cambiato con `DS4_EXPERIMENT_KV_DIR` e la telemetria disabilitata con
+`DS4_TELEMETRY=0`. Il server pubblica 891289 token e, con il budget di output
+predefinito, accetta al massimo circa 889089 token di input.
+
+Il profilo e' una modalita' capacity-first: il chunk dimezzato e la crescita
+dell'attenzione riducono il prefill rispetto al default 256K/8192. Non
+impostare manualmente chunk 8192 sul context 1M: nella configurazione GB10
+misurata ha prodotto OOM. Durante una prima prova il server ha superato 163K
+token reali senza errori CUDA o fallback; la validazione completa a profondita'
+maggiori resta separata dal profilo operativo consigliato.
+
+Per tornare al profilo predefinito 256K non impostare le tre variabili
+precedenti:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && ./run-dspark-server.sh 2>&1 | tee /tmp/ds4-dspark-server.log
+```
 
 ## Criteri di accettazione
 

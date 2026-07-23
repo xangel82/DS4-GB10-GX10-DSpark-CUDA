@@ -6,7 +6,7 @@ set -euo pipefail
 MODEL="${DS4_MODEL:-/home/athena/ds4/ds4flash.gguf}"
 DSPARK="${DS4_DSPARK_MODEL:-/home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf}"
 KV_DIR="${DS4_EXPERIMENT_KV_DIR:-/tmp/ds4-gb10-dspark-kv}"
-CTX="${DS4_CTX:-131072}"
+CTX="${DS4_CTX:-262144}"
 MAX_TOKENS="${DS4_MAX_TOKENS:-2200}"
 THREADS="${DS4_THREADS:-10}"
 PORT="${DS4_PORT:-30007}"

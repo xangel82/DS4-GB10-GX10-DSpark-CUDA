@@ -53,9 +53,12 @@ on a single GB10/GX10 machine without changing the target model distribution.
   and D2R/MMQ tiers for large prefill batches.
 - Stored FP8-rounded compressed attention KV directly as F16 and consumed it
   from the stage-32 token-tile path without a persistent F32 duplicate.
+- Extended the direct-F16 FlashMLA-style indexed attention path to the actual
+  compressed-KV tensor capacity, removing the artificial 131k fast-path cliff
+  without adding a score matrix, mirror or persistent scratch.
 - Added reproducible cold/append GB10 sweeps with DSpark decode, process-memory
   high-water marks and deterministic token hashes. The complete path has been
-  validated end to end on Athena through 93.5k context.
+  validated end to end on Athena through 180.8k context.
 - Added pipelined direct-I/O model upload and release of copied GGUF source
   pages to reduce startup time and host page residency.
 - Added long-prefix KV reuse so repeated tool turns can prefill only the
@@ -82,7 +85,7 @@ on a single GB10/GX10 machine without changing the target model distribution.
   - DSpark Tensor Core tiny-batch path enabled by default;
   - always-on DSpark drafting for a single active GB10 decode stream;
   - `balanced` memory profile, 8192-token prefill chunks and copied sidecar;
-  - 131k physical context with an 85% advertised context guard;
+  - 256k physical context with an 85% advertised context guard;
   - 16 GiB default disk budget for persisted KV checkpoints.
 - Append-prefill optimization for long chats: canonical KV checkpoints are
   retained near long stable prompt boundaries, so subsequent requests with the
@@ -94,15 +97,16 @@ on a single GB10/GX10 machine without changing the target model distribution.
   `max_input_tokens` reserves the configured completion budget so clients can
   compact before generation runs into the physical context ceiling.
 
-The latest measured profile reached 902.67 prefill token/s for a cold
-25,352-token prompt and 952.97 token/s for a cold 13,376-token prompt. Full
-central 8192-token chunks reached 991.09, 977.94 and 1009.78 token/s. Long
-append-prefill remained at 760.77 token/s from 77k to 90.5k context, while
-DSpark decode measured 24.00 token/s at 90.5k and 23.46 token/s at 93.5k.
-At 93.5k the host reported about 2.9 GiB available; only 141 MiB of the 1.6
-GiB total swap belonged to `ds4-server`, with no sustained paging in the live
-`vmstat` samples. Exact numbers vary with prompt, seed, sampling and
-chunk-boundary tails.
+The current default allocates a 256k physical context and advertises 85% of it.
+A real long-chat run sustained 913.15 prefill token/s from 27.7k to 95.1k,
+859.77 token/s from 95.1k to 125.3k, and 836.16 token/s from 127.8k to 180.8k.
+Before the dynamic direct-F16 capacity fix, the first chunk beyond 131k fell
+from about 860 to 648 token/s and the 147.2k to 207.1k append averaged 624.92
+token/s. The updated path kept its six complete post-threshold chunks between
+858.48 and 828.20 token/s, removing that artificial cliff without allocating
+additional buffers. DSpark decode after the 180.8k prefill measured 19.89
+token/s over 290 generated tokens. Exact decode numbers vary with prompt,
+sampling, draft acceptance and chunk-boundary tails.
 
 ## Measured GB10 results
 
@@ -126,6 +130,10 @@ They are useful as a sanity check, not as a guaranteed benchmark.
 | Fused epilogue pipeline, append 57.8k -> 78.2k | 730.56 t/s prefill | 20,397 appended tokens; the central 8192-token chunk reached 898.45 t/s. |
 | Fused epilogue pipeline, append 77.2k -> 90.5k | 760.77 t/s prefill | 13,348 appended tokens; the complete central chunk reached 891.13 t/s. |
 | Current DSpark decode at 90.5k / 93.5k | 24.00 / 23.46 t/s | Measured over 284 and 222 generated tokens respectively; tool-call generation and canonical KV reuse remained active. |
+| 256k profile, append 27.7k -> 95.1k | 913.15 t/s prefill | 67,316 appended tokens; complete chunks declined gradually from 940.58 to 896.36 t/s. |
+| 256k profile, old path beyond 131k | 624.92 t/s prefill | 59,856 appended tokens from 147.2k to 207.1k; complete chunks measured about 641 to 618 t/s after the fast-path cutoff. |
+| 256k profile, dynamic direct-F16 beyond 131k | 836.16 t/s prefill | 53,017 appended tokens from 127.8k to 180.8k, **+33.80%** versus the earlier deep append; complete post-threshold chunks measured 858.48 to 828.20 t/s. |
+| DSpark decode after 180.8k prefill | 19.89 t/s | 290 generated tokens in the same operational run; no CUDA error, OOM or attention fallback. |
 
 Representative earlier DSpark analyzer output (kept as scheduler history):
 
@@ -315,7 +323,7 @@ curl http://127.0.0.1:30007/v1/models
 Current GB10 release defaults in `run-dspark-server.sh`:
 
 ```text
-DS4_CTX=131072
+DS4_CTX=262144
 DS4_ADVERTISE_CONTEXT_PCT=85
 DS4_MAX_TOKENS=2200
 DS4_KV_DISK_SPACE_MB=16384
@@ -329,15 +337,28 @@ DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS=$((DS4_CTX / 2))
 DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS=$((DS4_CTX / 16))
 ```
 
-With the default completion budget, the server advertises about 111k total
-context and about 109k input tokens.  The remaining physical context is kept as
+With the default completion budget, the server advertises about 222k total
+context and about 220k input tokens.  The remaining physical context is kept as
 a safety margin for generation and for clients such as Claude Code to trigger
-their own compaction before DS4 reaches the hard 131k limit.
+their own compaction before DS4 reaches the hard 256k limit.
 
-The long-anchor values intentionally scale from `DS4_CTX`: at 131k context they
-resolve to 65536 and 8192 tokens.  This preserves the append-prefill behavior
+The long-anchor values intentionally scale from `DS4_CTX`: at 256k context they
+resolve to 131072 and 16384 tokens.  This preserves the append-prefill behavior
 when the physical context is changed for A/B tests, instead of hardcoding one
 specific checkpoint boundary.
+
+An experimental capacity-first launcher is also included for a 1M physical
+context. It uses a 4096-token chunk, an isolated disk-KV directory and the same
+85% advertised guard:
+
+```bash
+cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && ./run-dspark-server-1m.sh 2>&1 | tee /tmp/ds4-1m.log
+```
+
+The 1M profile is not the default throughput configuration. Do not raise its
+chunk to 8192 on the measured GB10 setup: that combination exceeded the
+available unified-memory budget. See `README-GB10.md` for the measured memory
+limits and rollback procedure.
 
 To test a different guard or disk budget:
 

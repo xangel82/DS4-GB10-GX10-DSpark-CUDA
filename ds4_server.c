@@ -609,6 +609,12 @@ typedef struct {
     float temperature;
     float top_p;
     float min_p;
+    /* Explicit client sampling wins even in thinking mode; the fixed
+     * DeepSeek-style thinking defaults apply only to omitted knobs. */
+    bool temperature_set;
+    bool top_p_set;
+    bool min_p_set;
+    bool top_k_set;
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
@@ -790,6 +796,32 @@ static void request_free(request *r) {
 static ds4_think_mode think_mode_from_enabled(bool enabled, ds4_think_mode effort) {
     if (!enabled || effort == DS4_THINK_NONE) return DS4_THINK_NONE;
     return effort == DS4_THINK_MAX ? DS4_THINK_MAX : DS4_THINK_HIGH;
+}
+
+static void request_apply_thinking_sampling(const request *r,
+                                            bool allow_spec_greedy,
+                                            float *temperature,
+                                            int *top_k,
+                                            float *top_p,
+                                            float *min_p) {
+    if (!r || !ds4_think_mode_enabled(r->think_mode)) return;
+    const bool spec_greedy =
+        allow_spec_greedy &&
+        !r->temperature_set &&
+        !r->top_k_set &&
+        !r->top_p_set &&
+        !r->min_p_set;
+    if (spec_greedy) {
+        *temperature = 0.0f;
+        *top_k = 0;
+        *top_p = 1.0f;
+        *min_p = 0.0f;
+        return;
+    }
+    if (!r->temperature_set) *temperature = DS4_DEFAULT_TEMPERATURE;
+    if (!r->top_k_set) *top_k = 0;
+    if (!r->top_p_set) *top_p = DS4_DEFAULT_TOP_P;
+    if (!r->min_p_set) *min_p = DS4_DEFAULT_MIN_P;
 }
 
 static bool parse_reasoning_effort_name(const char *s, ds4_think_mode *out) {
@@ -2704,6 +2736,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
             r->temperature = (float)v;
+            r->temperature_set = true;
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -2711,6 +2744,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
             r->top_p = (float)v;
+            r->top_p_set = true;
         } else if (!strcmp(key, "min_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -2718,11 +2752,13 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 goto bad;
             }
             r->min_p = (float)v;
+            r->min_p_set = true;
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
                 goto bad;
             }
+            r->top_k_set = true;
         } else if (!strcmp(key, "seed")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -2915,6 +2951,7 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
             r->temperature = (float)v;
+            r->temperature_set = true;
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -2922,11 +2959,13 @@ static bool parse_anthropic_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
             r->top_p = (float)v;
+            r->top_p_set = true;
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
                 goto bad;
             }
+            r->top_k_set = true;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -3817,6 +3856,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
             r->temperature = (float)v;
+            r->temperature_set = true;
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -3824,6 +3864,7 @@ static bool parse_responses_request(ds4_engine *e, server *s, const char *body, 
                 goto bad;
             }
             r->top_p = (float)v;
+            r->top_p_set = true;
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -4035,6 +4076,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 goto bad;
             }
             r->temperature = (float)v;
+            r->temperature_set = true;
         } else if (!strcmp(key, "top_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -4042,6 +4084,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 goto bad;
             }
             r->top_p = (float)v;
+            r->top_p_set = true;
         } else if (!strcmp(key, "min_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -4049,11 +4092,13 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
                 goto bad;
             }
             r->min_p = (float)v;
+            r->min_p_set = true;
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
                 goto bad;
             }
+            r->top_k_set = true;
         } else if (!strcmp(key, "seed")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -4237,6 +4282,46 @@ static const char *find_any_tool_start(const char *s) {
         if (candidates[i] && (!best || candidates[i] < best)) best = candidates[i];
     }
     return best;
+}
+
+static size_t tool_start_len_at(const char *p) {
+    if (!p) return 0;
+    if (!strncmp(p, DS4_TOOL_CALLS_START, strlen(DS4_TOOL_CALLS_START)))
+        return strlen(DS4_TOOL_CALLS_START);
+    if (!strncmp(p, DS4_TOOL_CALLS_START_SHORT,
+                 strlen(DS4_TOOL_CALLS_START_SHORT)))
+        return strlen(DS4_TOOL_CALLS_START_SHORT);
+    if (!strncmp(p, "<tool_calls>", strlen("<tool_calls>")))
+        return strlen("<tool_calls>");
+    return 0;
+}
+
+/* The live recovery path appends </think> immediately after a tool-call
+ * opening sampled inside reasoning.  Keep those bytes in the model transcript
+ * and KV, but identify the exact opening span so wire projections can omit the
+ * orphan protocol marker. */
+static bool find_recovered_think_tool_marker(const char *raw, size_t start,
+                                             size_t raw_len,
+                                             size_t *marker_start,
+                                             size_t *marker_end) {
+    if (!raw || start >= raw_len) return false;
+    const char *scan = raw + start;
+    const char *end = raw + raw_len;
+    while (scan < end) {
+        const char *marker = find_any_tool_start(scan);
+        if (!marker || marker >= end) return false;
+        const size_t marker_len = tool_start_len_at(marker);
+        const size_t pos = (size_t)(marker - raw);
+        const size_t after = pos + marker_len;
+        if (marker_len && after + strlen("</think>") <= raw_len &&
+            !memcmp(raw + after, "</think>", strlen("</think>"))) {
+            if (marker_start) *marker_start = pos;
+            if (marker_end) *marker_end = after;
+            return true;
+        }
+        scan = marker + 1;
+    }
+    return false;
 }
 
 static const char *find_any_tool_end(const char *s) {
@@ -4434,7 +4519,19 @@ static void split_reasoning_content(const char *text, size_t n, char **content_o
 
     char *think_end = strstr(body, "</think>");
     if (think_end) {
-        *think_end = '\0';
+        char *reason_end = think_end;
+        size_t marker_start = 0;
+        size_t marker_end = 0;
+        const size_t close_pos = (size_t)(think_end - s);
+        if (find_recovered_think_tool_marker(
+                s, (size_t)(body - s), close_pos + strlen("</think>"),
+                &marker_start, &marker_end) &&
+            marker_end == close_pos) {
+            reason_end = s + marker_start;
+            while (reason_end > body &&
+                   isspace((unsigned char)reason_end[-1])) reason_end--;
+        }
+        *reason_end = '\0';
         *reasoning_out = xstrdup(body);
         *content_out = xstrdup(think_end + 8);
     } else {
@@ -5912,14 +6009,30 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        size_t marker_start = 0;
+        size_t marker_end = 0;
+        const size_t close_pos = close ? (size_t)(close - raw) : SIZE_MAX;
+        const bool suppress_recovered_marker =
+            r->has_tools && close &&
+            find_recovered_think_tool_marker(raw, st->emit_pos,
+                                             close_pos + strlen("</think>"),
+                                             &marker_start, &marker_end) &&
+            marker_end == close_pos;
         size_t limit;
-        if (close) {
+        if (suppress_recovered_marker) {
+            limit = marker_start;
+        } else if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
-            limit = raw_len;
+            limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
+                                            r->has_tools, true);
         } else {
             const size_t hold = strlen("</think>") - 1;
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
+            const size_t tool_limit =
+                text_stream_safe_limit(raw, st->emit_pos, raw_len,
+                                       r->has_tools, false);
+            if (tool_limit < limit) limit = tool_limit;
             limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
 
@@ -5930,6 +6043,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
             st->sent_reasoning = true;
             st->emit_pos = limit;
         }
+        if (suppress_recovered_marker) st->emit_pos = marker_end;
 
         if (close) {
             st->emit_pos = (size_t)(close - raw) + strlen("</think>");
@@ -6609,14 +6723,30 @@ static bool responses_sse_stream_update(int fd, const request *r,
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        size_t marker_start = 0;
+        size_t marker_end = 0;
+        const size_t close_pos = close ? (size_t)(close - raw) : SIZE_MAX;
+        const bool suppress_recovered_marker =
+            r->has_tools && close &&
+            find_recovered_think_tool_marker(raw, st->emit_pos,
+                                             close_pos + strlen("</think>"),
+                                             &marker_start, &marker_end) &&
+            marker_end == close_pos;
         size_t limit;
-        if (close) {
+        if (suppress_recovered_marker) {
+            limit = marker_start;
+        } else if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
-            limit = raw_len;
+            limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
+                                            r->has_tools, true);
         } else {
             const size_t hold = strlen("</think>") - 1;
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
+            const size_t tool_limit =
+                text_stream_safe_limit(raw, st->emit_pos, raw_len,
+                                       r->has_tools, false);
+            if (tool_limit < limit) limit = tool_limit;
             limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
 
@@ -6639,6 +6769,7 @@ static bool responses_sse_stream_update(int fd, const request *r,
             }
             st->emit_pos = limit;
         }
+        if (suppress_recovered_marker) st->emit_pos = marker_end;
 
         if (close) {
             st->emit_pos = (size_t)(close - raw) + strlen("</think>");
@@ -7486,14 +7617,30 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
         }
 
         const char *close = strstr(raw + st->emit_pos, "</think>");
+        size_t marker_start = 0;
+        size_t marker_end = 0;
+        const size_t close_pos = close ? (size_t)(close - raw) : SIZE_MAX;
+        const bool suppress_recovered_marker =
+            r->has_tools && close &&
+            find_recovered_think_tool_marker(raw, st->emit_pos,
+                                             close_pos + strlen("</think>"),
+                                             &marker_start, &marker_end) &&
+            marker_end == close_pos;
         size_t limit;
-        if (close) {
+        if (suppress_recovered_marker) {
+            limit = marker_start;
+        } else if (close) {
             limit = (size_t)(close - raw);
         } else if (final) {
-            limit = raw_len;
+            limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
+                                            r->has_tools, true);
         } else {
             const size_t hold = strlen("</think>") - 1;
             limit = raw_len > hold ? raw_len - hold : st->emit_pos;
+            const size_t tool_limit =
+                text_stream_safe_limit(raw, st->emit_pos, raw_len,
+                                       r->has_tools, false);
+            if (tool_limit < limit) limit = tool_limit;
             limit = utf8_stream_safe_len(raw, st->emit_pos, limit, false);
         }
 
@@ -7505,6 +7652,7 @@ static bool anthropic_sse_stream_update(int fd, server *s, const request *r, con
             st->sent_thinking = true;
             st->emit_pos = limit;
         }
+        if (suppress_recovered_marker) st->emit_pos = marker_end;
 
         if (close || final) {
             if (!anthropic_sse_close_block_live(fd, id, st)) return false;
@@ -10693,26 +10841,15 @@ decode_again:
         float top_p = j->req.top_p;
         float min_p = j->req.min_p;
         if (ds4_think_mode_enabled(j->req.think_mode)) {
-            const bool spec_greedy_think =
+            const bool allow_spec_greedy =
                 (getenv("DS4_SPEC_GREEDY_THINK") != NULL ||
                  getenv("DS4_MTP_GREEDY_THINK") != NULL) &&
                 ds4_engine_spec_draft_tokens(s->engine) > 1;
-            if (spec_greedy_think) {
-                /* The current MTP verifier is correctness-gated for greedy
-                 * decoding.  Thinking mode normally forces the model default
-                 * temperature even when the request asks for zero, which
-                 * silently disables MTP.  Keep deterministic thinking an
-                 * explicit benchmark/production choice. */
-                temperature = 0.0f;
-                top_k = 0;
-                top_p = 1.0f;
-                min_p = 0.0f;
-            } else {
-                temperature = DS4_DEFAULT_TEMPERATURE;
-                top_k = 0;
-                top_p = DS4_DEFAULT_TOP_P;
-                min_p = DS4_DEFAULT_MIN_P;
-            }
+            /* The optional greedy profile applies only when the client omitted
+             * every sampling knob.  Explicit values remain authoritative. */
+            request_apply_thinking_sampling(&j->req, allow_spec_greedy,
+                                            &temperature, &top_k,
+                                            &top_p, &min_p);
         }
         if (in_tool_call && !dsml_decode_state_uses_payload_sampling(dsml_state)) {
             temperature = 0.0f;
@@ -13073,6 +13210,121 @@ static void test_openai_chat_stream_splits_reasoning_without_tools(void) {
     close(sv[1]);
 }
 
+static void test_recovered_thinking_tool_marker_is_not_projected(void) {
+    const char *partial =
+        "need a tool\n\n"
+        DS4_TOOL_CALLS_START;
+    const char *recovered =
+        "need a tool\n\n"
+        DS4_TOOL_CALLS_START "</think>Done.";
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex(recovered, true, &content,
+                                           &reasoning, &calls));
+    TEST_ASSERT(content != NULL && !strcmp(content, "Done."));
+    TEST_ASSERT(reasoning != NULL && !strcmp(reasoning, "need a tool"));
+    TEST_ASSERT(strstr(reasoning, DS4_TOOL_CALLS_START) == NULL);
+    TEST_ASSERT(calls.len == 0);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_OPENAI;
+        r.stream = true;
+        r.think_mode = DS4_THINK_HIGH;
+        r.has_tools = true;
+
+        TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_recovered", NULL, NULL));
+        openai_stream st;
+        openai_stream_start(&r, &st);
+        TEST_ASSERT(openai_sse_stream_update(
+            sv[0], NULL, &r, "chatcmpl_recovered", &st,
+            partial, strlen(partial), false));
+        TEST_ASSERT(openai_sse_stream_update(
+            sv[0], NULL, &r, "chatcmpl_recovered", &st,
+            recovered, strlen(recovered), false));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "\"reasoning_content\":\"need a tool\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"content\":\"Done.\"") != NULL);
+        TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) == NULL);
+
+        free(out);
+        openai_stream_free(&st);
+        request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_RESPONSES;
+        r.stream = true;
+        r.think_mode = DS4_THINK_HIGH;
+        r.has_tools = true;
+        r.reasoning_summary_emit = true;
+
+        responses_stream st;
+        responses_stream_init(&r, &st);
+        st.active = true;
+        TEST_ASSERT(responses_sse_stream_update(
+            sv[0], &r, &st, partial, strlen(partial), false));
+        TEST_ASSERT(responses_sse_stream_update(
+            sv[0], &r, &st, recovered, strlen(recovered), false));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "\"delta\":\"need a tool\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"delta\":\"Done.\"") != NULL);
+        TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) == NULL);
+
+        free(out);
+        responses_stream_free(&st);
+        request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_ANTHROPIC;
+        r.stream = true;
+        r.think_mode = DS4_THINK_HIGH;
+        r.has_tools = true;
+
+        anthropic_stream st;
+        TEST_ASSERT(anthropic_sse_start_live(
+            sv[0], &r, "msg_recovered", 10, &st));
+        TEST_ASSERT(anthropic_sse_stream_update(
+            sv[0], NULL, &r, "msg_recovered", &st,
+            partial, strlen(partial), false));
+        TEST_ASSERT(anthropic_sse_stream_update(
+            sv[0], NULL, &r, "msg_recovered", &st,
+            recovered, strlen(recovered), false));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "\"thinking\":\"need a tool\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"text\":\"Done.\"") != NULL);
+        TEST_ASSERT(strstr(out, DS4_TOOL_CALLS_START) == NULL);
+
+        free(out);
+        anthropic_stream_free(&st);
+        request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
 static void test_openai_tool_stream_sends_partial_arguments(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -13422,6 +13674,56 @@ static void test_request_defaults_use_min_p_filtering(void) {
     TEST_ASSERT(r.top_p == DS4_DEFAULT_TOP_P);
     TEST_ASSERT(r.top_k == 0);
     TEST_ASSERT(r.min_p == DS4_DEFAULT_MIN_P);
+    request_free(&r);
+}
+
+static void test_thinking_sampling_respects_explicit_client_values(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+
+    float temperature = r.temperature;
+    int top_k = r.top_k;
+    float top_p = r.top_p;
+    float min_p = r.min_p;
+    request_apply_thinking_sampling(&r, true, &temperature, &top_k,
+                                    &top_p, &min_p);
+    TEST_ASSERT(temperature == 0.0f);
+    TEST_ASSERT(top_k == 0);
+    TEST_ASSERT(top_p == 1.0f);
+    TEST_ASSERT(min_p == 0.0f);
+
+    r.temperature = 0.2f;
+    r.temperature_set = true;
+    r.top_k = 17;
+    r.top_k_set = true;
+    r.top_p = 0.8f;
+    r.top_p_set = true;
+    r.min_p = 0.03f;
+    r.min_p_set = true;
+    temperature = r.temperature;
+    top_k = r.top_k;
+    top_p = r.top_p;
+    min_p = r.min_p;
+    request_apply_thinking_sampling(&r, true, &temperature, &top_k,
+                                    &top_p, &min_p);
+    TEST_ASSERT(temperature == 0.2f);
+    TEST_ASSERT(top_k == 17);
+    TEST_ASSERT(top_p == 0.8f);
+    TEST_ASSERT(min_p == 0.03f);
+
+    r.top_k_set = false;
+    r.top_p_set = false;
+    r.min_p_set = false;
+    top_k = 99;
+    top_p = 0.1f;
+    min_p = 0.9f;
+    request_apply_thinking_sampling(&r, true, &temperature, &top_k,
+                                    &top_p, &min_p);
+    TEST_ASSERT(temperature == 0.2f);
+    TEST_ASSERT(top_k == 0);
+    TEST_ASSERT(top_p == DS4_DEFAULT_TOP_P);
+    TEST_ASSERT(min_p == DS4_DEFAULT_MIN_P);
+
     request_free(&r);
 }
 
@@ -16269,6 +16571,7 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
 
 static void ds4_server_unit_tests_run(void) {
     test_request_defaults_use_min_p_filtering();
+    test_thinking_sampling_respects_explicit_client_values();
     test_reasoning_effort_mapping();
     test_api_thinking_controls_parse();
     test_render_think_max_prompt_prefix();
@@ -16299,6 +16602,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
+    test_recovered_thinking_tool_marker_is_not_projected();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();

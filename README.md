@@ -275,6 +275,19 @@ The output should be:
 /home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf
 ```
 
+An optional memory-first sidecar quantizes routed gate/up to IQ2_XXS and routed
+down to Q2_K while retaining the dense Q8 tensors:
+
+```bash
+cd /home/athena/DS4-GB10-GX10-DSpark-CUDA
+DS4_DSPARK_VARIANT=q2 ./build-dspark-sidecar.sh
+```
+
+This produces
+`/home/athena/ds4/DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf` (about
+5.6 GiB instead of 10.7 GiB). Q4 remains the conservative default because Q2
+acceptance, and therefore decode throughput, varies with the generated text.
+
 After conversion, the temporary Hugging Face shard directory can be kept for
 future rebuilds or removed to save disk space:
 
@@ -298,6 +311,12 @@ Default release profile, port `30007`:
 ```bash
 cd /home/athena/DS4-GB10-GX10-DSpark-CUDA
 ./run-dspark-server.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-release.log
+```
+
+Select the compact sidecar without changing the Q4 installation:
+
+```bash
+DS4_DSPARK_VARIANT=q2 ./run-dspark-server.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-q2.log
 ```
 
 Telemetry profile for benchmarking:

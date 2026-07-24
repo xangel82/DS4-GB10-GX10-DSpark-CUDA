@@ -4,7 +4,26 @@
 set -euo pipefail
 
 MODEL="${DS4_MODEL:-/home/athena/ds4/ds4flash.gguf}"
-DSPARK="${DS4_DSPARK_MODEL:-/home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf}"
+DSPARK_VARIANT="${DS4_DSPARK_VARIANT:-q4}"
+case "$DSPARK_VARIANT" in
+  q4)
+    DSPARK_DEFAULT="/home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf"
+    ;;
+  q2)
+    DSPARK_DEFAULT="/home/athena/ds4/DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf"
+    ;;
+  *)
+    echo "Invalid DS4_DSPARK_VARIANT: $DSPARK_VARIANT (expected q4 or q2)" >&2
+    exit 2
+    ;;
+esac
+if [[ "${DS4_DSPARK_MODEL:-}" != "" ]]; then
+  DSPARK="$DS4_DSPARK_MODEL"
+  DSPARK_SELECTION="custom"
+else
+  DSPARK="$DSPARK_DEFAULT"
+  DSPARK_SELECTION="$DSPARK_VARIANT"
+fi
 KV_DIR="${DS4_EXPERIMENT_KV_DIR:-/tmp/ds4-gb10-dspark-kv}"
 CTX="${DS4_CTX:-262144}"
 MAX_TOKENS="${DS4_MAX_TOKENS:-2200}"
@@ -202,7 +221,7 @@ else
 fi
 
 echo "Target: $MODEL"
-echo "DSpark: $DSPARK (draft=$DRAFT)"
+echo "DSpark: $DSPARK (selection=$DSPARK_SELECTION draft=$DRAFT)"
 echo "Cache:  profile=$MEMORY_PROFILE Q8->F16=${DS4_CUDA_Q8_F16_CACHE_MB} MiB compact-priority=${DS4_CUDA_DSPARK_CACHE_COMPACT:-0}, weight limit=${DS4_CUDA_WEIGHT_CACHE_LIMIT_GB} GiB"
 echo "Memory: secondary-copy=${DS4_CUDA_COPY_SECONDARY_MODEL:-1}, secondary-pipelined=$DS4_CUDA_SECONDARY_COPY_PIPELINED, drop-copied-source-pages=${DS4_CUDA_DROP_COPIED_MODEL_PAGES:-0}"
 echo "Prefill: chunk=$PREFILL_CHUNK final-logits-only=${DS4_PREFILL_FINAL_LOGITS_ONLY:-0}"

@@ -8,6 +8,111 @@ conservare il throughput DSpark sui contesti lunghi.
 La sezione **Avvio rapido** è la procedura operativa aggiornata. Le sezioni
 successive conservano la cronologia tecnica, comprese prove scartate e rollback.
 
+## Sidecar DSpark Q2 compatto promosso - 24 luglio 2026
+
+Il launcher e il builder supportano ora due sidecar DSpark. Il Q4 rimane il
+default conservativo; il Q2 e' un profilo `memory-first` selezionabile:
+
+| Variante | Routed gate/up | Routed down | Dimensione | Uso consigliato |
+| --- | --- | --- | ---: | --- |
+| `q4` | Q4_K | Q4_K | circa 10,70 GiB | default, acceptance piu' prevedibile |
+| `q2` | IQ2_XXS | Q2_K | circa 5,64 GiB | recupero di circa 5,06 GiB UMA |
+
+Il Q2 conserva Q8 per attention, shared expert e proiezioni dense. Se non viene
+fornita una imatrix DSpark, il quantizer usa la sua importance sintetica
+deterministica basata sull'energia delle colonne. Il target verifier non cambia
+e continua a decidere i token finali con rejection sampling lossless.
+
+Nel test pulito su Athena, senza subagent, il Q2 ha completato 15 richieste e
+generato 7866 token a 20,88 t/s ponderati. Le tool call hanno misurato
+24-26 t/s; la risposta finale di 3311 token ha misurato 17,40 t/s. Il prefill
+append e' rimasto fra circa 800 e 900 t/s, il draft DSpark medio a 15,28 ms e
+l'acceptance cumulativa al 63,98%. La risposta lunga e' risultata coerente e
+completa nel controllo manuale. Il vantaggio di decode non e' universale:
+l'acceptance dipende dal testo e puo' assorbire il drafter piu' veloce. Il
+beneficio ripetibile della variante e' il margine di memoria.
+
+Costruzione:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q4 ./build-dspark-sidecar.sh
+cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q2 ./build-dspark-sidecar.sh
+```
+
+Avvio:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q4 ./run-dspark-server.sh
+cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q2 ./run-dspark-server.sh
+```
+
+`DS4_DSPARK_MODEL=/percorso/custom.gguf` continua ad avere priorita' sul
+percorso derivato dalla variante.
+
+## Riuso MQA completo nella sparse attention scartato - 24 luglio 2026
+
+Il principio DSA descritto nel paper DeepSeek-V3.2 e' stato applicato al kernel
+indexed: una sola CTA per token avrebbe condiviso ogni riga Top-512/KV fra tutti
+i 64 head, invece delle due CTA da 32 head del percorso stabile M32/R32. Sono
+state implementate e misurate tre organizzazioni complete:
+
+| Variante | Registri | Stack/thread | Tempo kernel | Velocita' vs M32/R32 |
+| --- | ---: | ---: | ---: | ---: |
+| M32/R32 stabile | 128 | 16 B | 6,58-6,96 ms | 1,000x |
+| M64/R16, 768 thread | 80 | 112 B | 11,60 ms | 0,600x |
+| M64/R32, 512 thread | 128 | 0 B | 7,01 ms | 0,939x |
+| M64/R16, 1024 thread | 64 | 232 B | 13,01 ms | 0,532x |
+
+Tutte le varianti mantenevano Top-512, maschere, online softmax e KV accessibili.
+La regressione numerica e' rimasta allo stesso livello del percorso stabile
+(`rel-rmse` circa 0,00067 e `max-abs` circa 0,000002).
+
+Il riuso M64 elimina la seconda lettura globale delle KV, ma sul GB10 quella
+lettura trova gia' circa il 90% dei dati in L2. M32/R32 compensa meglio la
+duplicazione sovrapponendo QK del tile corrente e PV del precedente. M64/R32
+deve serializzare le due fasi; M64/R16 raddoppia stage e barriere e, con 768 o
+1024 thread, forza frammenti nello stack. Il traffico risparmiato non compensa
+questi costi. Tutto il codice M64 e il microbenchmark sono stati rimossi; resta
+il kernel M32/R32 validato.
+
+## Fusioni compressor/KV e overlap verifier scartati - 24 luglio 2026
+
+Sono state integrate e misurate tre tecniche ispirate alla pipeline prefill di
+vLLM:
+
+- compressor ratio-4 fuso `pool + RMS + RoPE + FP8`, con scrittura diretta
+  nella compressed KV F16;
+- fusione `KV RoPE + FP8 + raw-cache insertion`;
+- overlap multi-stream della trasformazione KV con la proiezione Q nei batch
+  piccoli del verifier DSpark.
+
+La regressione `sm_121a` confrontava sia il cold prefill sia il replay
+append-prefill. Compressor F32, bit F16, KV trasformata e raw cache coincidevano
+esattamente con il percorso precedente:
+
+```text
+cuda-regression: fused prefill pipeline compressor-max=0 f16-changed=0 replay-max=0 replay-f16-changed=0 kv-max=0 raw-max=0
+cuda long-context regression: OK
+```
+
+L'overlap multi-stream ha ridotto il decode ed e' stato rimosso per primo. La
+variante sequenziale specializzata ha eliminato un kernel per ciascuno dei 43
+layer compressi del verifier (`4513 -> 4470` nodi CUDA Graph), ma il beneficio
+end-to-end e' rimasto troppo piccolo:
+
+| Gate 65K, 256 token | `e4ec80f` | Fusioni sequenziali | Variazione |
+| --- | ---: | ---: | ---: |
+| Prefill | 928,41 t/s | 931,35 t/s | +0,32% |
+| Decode sintetico DSpark | 11,47 t/s | 11,58 t/s | +0,96% |
+| Cicli / token per ciclo | 134 / 1,9104 | 134 / 1,9104 | invariati |
+| RSS massima osservata | 1945,7 MiB | 2089,8 MiB | +144,1 MiB |
+
+Hash greedy e acceptance erano invariati. Anche lo sweep 32K/65K/98K e'
+risultato sostanzialmente neutro, con una coda lunga non stabile. L'intervento
+non raggiunge quindi il gate prestazionale e peggiora il margine UMA: il codice
+e' stato rimosso integralmente. La patch sperimentale resta archiviata fuori
+dal repository in `ds4-experiments/vllm-prefill-kv-fusions-2026-07-24.patch`.
+
 ## FlashMLA direct-F16 dinamico oltre 131K - 23 luglio 2026
 
 Portando il context fisico da 131072 a 262144 e' emersa una soglia artificiale:
@@ -741,6 +846,12 @@ Il launcher predefinito richiede:
 /home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf
 ```
 
+La variante compatta opzionale usa:
+
+```text
+/home/athena/ds4/DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf
+```
+
 Il target Q2/imatrix può essere scaricato con:
 
 ```bash
@@ -762,7 +873,9 @@ cd ~/DS4-GB10-GX10-DSpark-CUDA && ./build-dspark-sidecar.sh 2>&1 | tee /tmp/ds4-
 ```
 
 Percorsi differenti possono essere passati con `DS4_MODEL`,
-`DS4_DSPARK_MODEL`, `DS4_DSPARK_HF_DIR` e `DS4_DSPARK_GGUF`.
+`DS4_DSPARK_MODEL`, `DS4_DSPARK_HF_DIR` e `DS4_DSPARK_GGUF`. Per costruire e
+usare il sidecar compatto impostare `DS4_DSPARK_VARIANT=q2`; il valore
+predefinito e' `q4`.
 
 ### 3. Regressione CUDA obbligatoria
 
@@ -793,6 +906,12 @@ produce `.target sm_121`, che non abilita le istruzioni MMA block-scaled MXFP4.
 
 ```bash
 cd ~/DS4-GB10-GX10-DSpark-CUDA && ./run-dspark-server.sh 2>&1 | tee /tmp/ds4-dspark-server.log
+```
+
+Avvio con il sidecar Q2 compatto:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q2 ./run-dspark-server.sh 2>&1 | tee /tmp/ds4-dspark-q2-server.log
 ```
 
 Il launcher usa per default `balanced`, chunk 8192, context 262144, advertise

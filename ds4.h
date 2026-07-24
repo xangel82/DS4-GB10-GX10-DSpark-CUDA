@@ -253,6 +253,14 @@ bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int c
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,
         char *err, size_t errlen);
+/* Keep one bounded accelerator-resident prompt frontier for tool-call
+ * canonicalization.  Restore returns 1 when the saved frontier matched and was
+ * restored, 0 when no matching frontier exists, and -1 on a backend error.
+ * A NULL prompt lets a caller that already proved the rendered-text prefix
+ * restore the saved exact tokenization. */
+int ds4_session_frontier_capture(ds4_session *s, char *err, size_t errlen);
+int ds4_session_frontier_restore(ds4_session *s, const ds4_tokens *prompt,
+                                 char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);
 int ds4_session_argmax_excluding(ds4_session *s, int excluded_id);

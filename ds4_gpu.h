@@ -50,6 +50,11 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes);
+/* Enqueue an ordered D2D copy on the per-thread stream.  Callers batch several
+ * small state copies and finish with ds4_gpu_end_commands(). */
+int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, uint64_t dst_offset,
+                              const ds4_gpu_tensor *src, uint64_t src_offset,
+                              uint64_t bytes);
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);

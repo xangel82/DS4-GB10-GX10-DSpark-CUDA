@@ -25929,6 +25929,28 @@ static void ds4_acquire_instance_lock(void) {
     atexit(ds4_release_instance_lock);
 }
 
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+typedef struct {
+    bool valid;
+    bool announced;
+    token_vec checkpoint;
+    float *logits;
+    ds4_gpu_tensor *arena;
+    ds4_gpu_tensor *layer_raw[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_attn_state_kv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_attn_state_score[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_index_state_kv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_index_state_score[DS4_MAX_LAYER];
+    ds4_gpu_tensor *dspark_raw[DS4_DSPARK_N_BLOCK];
+    uint32_t n_comp[DS4_MAX_LAYER];
+    uint32_t n_index_comp[DS4_MAX_LAYER];
+    uint32_t raw_capacity;
+    uint32_t raw_live;
+    uint32_t dspark_rows;
+    uint64_t device_bytes;
+} ds4_frontier_snapshot;
+#endif
+
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
@@ -25981,6 +26003,9 @@ struct ds4_session {
     bool checkpoint_valid;
     bool mtp_draft_valid;
     bool logits_host_valid;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    ds4_frontier_snapshot frontier;
+#endif
 };
 
 static int ds4_session_materialize_logits_internal(
@@ -26125,6 +26150,106 @@ static uint32_t session_raw_live_rows(const ds4_gpu_graph *g, uint32_t checkpoin
     if (rows > checkpoint_len) rows = checkpoint_len;
     return rows;
 }
+
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+#define DS4_FRONTIER_SNAPSHOT_MAX_BYTES (UINT64_C(2) * 1024u * 1024u * 1024u)
+
+static void frontier_snapshot_free(ds4_frontier_snapshot *f) {
+    if (!f) return;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        ds4_gpu_tensor_free(f->layer_raw[il]);
+        ds4_gpu_tensor_free(f->layer_attn_state_kv[il]);
+        ds4_gpu_tensor_free(f->layer_attn_state_score[il]);
+        ds4_gpu_tensor_free(f->layer_index_state_kv[il]);
+        ds4_gpu_tensor_free(f->layer_index_state_score[il]);
+    }
+    for (uint32_t b = 0; b < DS4_DSPARK_N_BLOCK; b++) {
+        ds4_gpu_tensor_free(f->dspark_raw[b]);
+    }
+    ds4_gpu_tensor_free(f->arena);
+    token_vec_free(&f->checkpoint);
+    free(f->logits);
+    memset(f, 0, sizeof(*f));
+}
+
+static bool frontier_snapshot_alloc(ds4_frontier_snapshot *f,
+                                    const ds4_gpu_graph *g) {
+    if (f->raw_capacity == g->raw_window && f->logits) return true;
+    frontier_snapshot_free(f);
+
+    f->raw_capacity = g->raw_window;
+    const uint64_t raw_bytes =
+        (uint64_t)f->raw_capacity * DS4_N_HEAD_DIM * sizeof(float);
+    uint64_t arena_bytes = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        arena_bytes = (arena_bytes + 255u) & ~UINT64_C(255);
+        arena_bytes += raw_bytes;
+
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t ab = layer_attn_state_bytes(ratio);
+        arena_bytes = (arena_bytes + 255u) & ~UINT64_C(255);
+        arena_bytes += ab * 2u;
+
+        if (ratio == 4) {
+            const uint64_t ib = layer_index_state_bytes(ratio);
+            arena_bytes = (arena_bytes + 255u) & ~UINT64_C(255);
+            arena_bytes += ib * 2u;
+        }
+    }
+
+    const uint64_t dspark_bytes =
+        (uint64_t)DS4_DSPARK_WINDOW * DS4_N_HEAD_DIM * sizeof(float);
+    arena_bytes = (arena_bytes + 255u) & ~UINT64_C(255);
+    arena_bytes += dspark_bytes * DS4_DSPARK_N_BLOCK;
+    if (arena_bytes > DS4_FRONTIER_SNAPSHOT_MAX_BYTES) goto fail;
+
+    f->arena = ds4_gpu_tensor_alloc(arena_bytes);
+    if (!f->arena) goto fail;
+    f->device_bytes = arena_bytes;
+    uint64_t off = 0;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        off = (off + 255u) & ~UINT64_C(255);
+        f->layer_raw[il] = ds4_gpu_tensor_view(f->arena, off, raw_bytes);
+        off += raw_bytes;
+        if (!f->layer_raw[il]) goto fail;
+
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (ratio == 0) continue;
+        const uint64_t ab = layer_attn_state_bytes(ratio);
+        off = (off + 255u) & ~UINT64_C(255);
+        f->layer_attn_state_kv[il] = ds4_gpu_tensor_view(f->arena, off, ab);
+        off += ab;
+        f->layer_attn_state_score[il] = ds4_gpu_tensor_view(f->arena, off, ab);
+        off += ab;
+        if (!f->layer_attn_state_kv[il] ||
+            !f->layer_attn_state_score[il]) goto fail;
+
+        if (ratio == 4) {
+            const uint64_t ib = layer_index_state_bytes(ratio);
+            off = (off + 255u) & ~UINT64_C(255);
+            f->layer_index_state_kv[il] = ds4_gpu_tensor_view(f->arena, off, ib);
+            off += ib;
+            f->layer_index_state_score[il] = ds4_gpu_tensor_view(f->arena, off, ib);
+            off += ib;
+            if (!f->layer_index_state_kv[il] ||
+                !f->layer_index_state_score[il]) goto fail;
+        }
+    }
+    off = (off + 255u) & ~UINT64_C(255);
+    for (uint32_t b = 0; b < DS4_DSPARK_N_BLOCK; b++) {
+        f->dspark_raw[b] = ds4_gpu_tensor_view(f->arena, off, dspark_bytes);
+        off += dspark_bytes;
+        if (!f->dspark_raw[b]) goto fail;
+    }
+    f->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(f->logits[0]));
+    return true;
+
+fail:
+    frontier_snapshot_free(f);
+    return false;
+}
+#endif
 
 /* Return the exact engine-owned payload size, excluding the server's KVC file
  * header and observability text.  This is deliberately based on live row counts
@@ -26597,6 +26722,9 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
         return 1;
     }
     s->dspark_pending_valid = false;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    s->frontier.valid = false;
+#endif
     if (ds4_engine_has_dspark(s->engine)) {
         payload_set_err(err, errlen,
                         "DSpark main-KV state is not present in legacy layer payloads");
@@ -27374,6 +27502,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         return 1;
     }
     s->dspark_pending_valid = false;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    s->frontier.valid = false;
+#endif
     if (s->distributed) {
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
     }
@@ -29194,6 +29325,9 @@ void ds4_session_free(ds4_session *s) {
     }
 #ifndef DS4_NO_GPU
     else {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        frontier_snapshot_free(&s->frontier);
+#endif
         metal_graph_free(&s->graph);
     }
 #endif
@@ -29940,6 +30074,9 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    s->frontier.valid = false;
+#endif
     if (!metal_graph_reset_prefill_state(&s->graph)) {
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
         return 1;
@@ -30058,6 +30195,192 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
 
     snprintf(err, errlen, "unexpected canonical rewrite state");
     return DS4_SESSION_REWRITE_ERROR;
+}
+
+int ds4_session_frontier_capture(ds4_session *s, char *err, size_t errlen) {
+#if defined(DS4_NO_GPU) || defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+    (void)s;
+    if (errlen) snprintf(err, errlen, "GPU frontier snapshots require CUDA");
+    return 1;
+#else
+    if (!s || s->distributed || ds4_session_is_cpu(s) ||
+        !ds4_engine_has_dspark(s->engine) || !s->checkpoint_valid) {
+        if (errlen) snprintf(err, errlen, "session has no capturable CUDA DSpark frontier");
+        return 1;
+    }
+    if (ds4_session_materialize_logits_internal(s, err, errlen) != 0) return 1;
+
+    ds4_gpu_graph *g = &s->graph;
+    ds4_frontier_snapshot *f = &s->frontier;
+    f->valid = false;
+    if (!frontier_snapshot_alloc(f, g)) {
+        if (errlen) snprintf(err, errlen, "failed to allocate CUDA frontier snapshot");
+        return 1;
+    }
+
+    const uint32_t pos = (uint32_t)s->checkpoint.len;
+    f->raw_live = session_raw_live_rows(g, pos);
+    f->dspark_rows = pos < DS4_DSPARK_WINDOW ? pos : DS4_DSPARK_WINDOW;
+    if (g->dspark_n_raw != f->dspark_rows) {
+        if (errlen) {
+            snprintf(err, errlen,
+                     "DSpark frontier is not aligned with checkpoint (%u/%u rows)",
+                     g->dspark_n_raw, f->dspark_rows);
+        }
+        return 1;
+    }
+
+    bool ok = ds4_gpu_begin_commands() != 0;
+    const uint32_t raw_first = pos - f->raw_live;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = ds4_gpu_ring_rows_save_tensor(f->layer_raw[il],
+                                            g->layer_raw_cache[il],
+                                            g->raw_cap,
+                                            raw_first,
+                                            f->raw_live,
+                                            DS4_N_HEAD_DIM) != 0;
+        f->n_comp[il] = g->layer_n_comp[il];
+        f->n_index_comp[il] = g->layer_n_index_comp[il];
+
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (!ok || ratio == 0) continue;
+        const uint64_t ab = layer_attn_state_bytes(ratio);
+        ok = ds4_gpu_tensor_copy_async(f->layer_attn_state_kv[il], 0,
+                                        g->layer_attn_state_kv[il], 0, ab) != 0 &&
+             ds4_gpu_tensor_copy_async(f->layer_attn_state_score[il], 0,
+                                        g->layer_attn_state_score[il], 0, ab) != 0;
+        if (ok && ratio == 4) {
+            const uint64_t ib = layer_index_state_bytes(ratio);
+            ok = ds4_gpu_tensor_copy_async(f->layer_index_state_kv[il], 0,
+                                            g->layer_index_state_kv[il], 0, ib) != 0 &&
+                 ds4_gpu_tensor_copy_async(f->layer_index_state_score[il], 0,
+                                            g->layer_index_state_score[il], 0, ib) != 0;
+        }
+    }
+    const uint32_t dspark_first = pos - f->dspark_rows;
+    for (uint32_t b = 0; ok && b < DS4_DSPARK_N_BLOCK; b++) {
+        ok = ds4_gpu_ring_rows_save_tensor(f->dspark_raw[b],
+                                            g->dspark_raw_cache[b],
+                                            DS4_DSPARK_WINDOW,
+                                            dspark_first,
+                                            f->dspark_rows,
+                                            DS4_N_HEAD_DIM) != 0;
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok) {
+        if (errlen) snprintf(err, errlen, "failed to capture CUDA frontier tensors");
+        return 1;
+    }
+
+    ds4_tokens_copy(&f->checkpoint, &s->checkpoint);
+    memcpy(f->logits, s->logits,
+           (size_t)DS4_N_VOCAB * sizeof(f->logits[0]));
+    f->valid = true;
+    if (!f->announced) {
+        fprintf(stderr,
+                "ds4: CUDA prompt frontier snapshot active (%.2f MiB device, append-only compressed KV)\n",
+                (double)f->device_bytes / (1024.0 * 1024.0));
+        f->announced = true;
+    }
+    return 0;
+#endif
+}
+
+int ds4_session_frontier_restore(ds4_session *s, const ds4_tokens *prompt,
+                                 char *err, size_t errlen) {
+#if defined(DS4_NO_GPU) || defined(__APPLE__) || defined(DS4_ROCM_BUILD)
+    (void)s;
+    (void)prompt;
+    (void)err;
+    (void)errlen;
+    return 0;
+#else
+    if (!s) {
+        if (errlen) snprintf(err, errlen, "invalid frontier restore request");
+        return -1;
+    }
+    ds4_frontier_snapshot *f = &s->frontier;
+    if (!f->valid || f->checkpoint.len <= 0) {
+        return 0;
+    }
+    if (prompt &&
+        (prompt->len < f->checkpoint.len ||
+         !ds4_tokens_starts_with(prompt, &f->checkpoint))) return 0;
+
+    ds4_gpu_graph *g = &s->graph;
+    const uint32_t pos = (uint32_t)f->checkpoint.len;
+    const uint32_t expected_raw = session_raw_live_rows(g, pos);
+    const uint32_t expected_dspark =
+        pos < DS4_DSPARK_WINDOW ? pos : DS4_DSPARK_WINDOW;
+    if (f->raw_live != expected_raw || f->dspark_rows != expected_dspark) {
+        f->valid = false;
+        if (errlen) snprintf(err, errlen, "saved CUDA frontier layout is stale");
+        return -1;
+    }
+
+    bool ok = ds4_gpu_begin_commands() != 0;
+    const uint32_t raw_first = pos - f->raw_live;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        ok = ds4_gpu_ring_rows_restore_tensor(g->layer_raw_cache[il],
+                                               f->layer_raw[il],
+                                               g->raw_cap,
+                                               raw_first,
+                                               0,
+                                               f->raw_live,
+                                               DS4_N_HEAD_DIM) != 0;
+        g->layer_n_comp[il] = f->n_comp[il];
+        g->layer_n_index_comp[il] = f->n_index_comp[il];
+        g->layer_gvr_hint_valid[il] = false;
+
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        if (!ok || ratio == 0) continue;
+        const uint64_t ab = layer_attn_state_bytes(ratio);
+        ok = ds4_gpu_tensor_copy_async(g->layer_attn_state_kv[il], 0,
+                                        f->layer_attn_state_kv[il], 0, ab) != 0 &&
+             ds4_gpu_tensor_copy_async(g->layer_attn_state_score[il], 0,
+                                        f->layer_attn_state_score[il], 0, ab) != 0;
+        if (ok && ratio == 4) {
+            const uint64_t ib = layer_index_state_bytes(ratio);
+            ok = ds4_gpu_tensor_copy_async(g->layer_index_state_kv[il], 0,
+                                            f->layer_index_state_kv[il], 0, ib) != 0 &&
+                 ds4_gpu_tensor_copy_async(g->layer_index_state_score[il], 0,
+                                            f->layer_index_state_score[il], 0, ib) != 0;
+        }
+    }
+    const uint32_t dspark_first = pos - f->dspark_rows;
+    for (uint32_t b = 0; ok && b < DS4_DSPARK_N_BLOCK; b++) {
+        ok = ds4_gpu_ring_rows_restore_tensor(g->dspark_raw_cache[b],
+                                               f->dspark_raw[b],
+                                               DS4_DSPARK_WINDOW,
+                                               dspark_first,
+                                               0,
+                                               f->dspark_rows,
+                                               DS4_N_HEAD_DIM) != 0;
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok) {
+        s->checkpoint_valid = false;
+        f->valid = false;
+        if (errlen) snprintf(err, errlen, "failed to restore CUDA frontier tensors");
+        return -1;
+    }
+
+    ds4_tokens_copy(&s->checkpoint, &f->checkpoint);
+    memcpy(s->logits, f->logits,
+           (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    s->checkpoint_valid = true;
+    s->logits_host_valid = true;
+    s->mtp_draft_valid = false;
+    s->dspark_pending_valid = false;
+    g->mtp_n_raw = 0;
+    g->dspark_n_raw = f->dspark_rows;
+    g->token_graph_prepared.valid = false;
+    memset(g->spec_prefix_gvr_hint_valid, 0,
+           sizeof(g->spec_prefix_gvr_hint_valid));
+    return 1;
+#endif
 }
 
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt) {
@@ -32569,6 +32892,9 @@ void ds4_session_invalidate(ds4_session *s) {
     s->dspark_pending_valid = false;
 #ifndef DS4_NO_GPU
     if (!s->distributed && !ds4_session_is_cpu(s)) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        s->frontier.valid = false;
+#endif
         s->graph.token_graph_prepared.valid = false;
         s->graph.dspark_n_raw = 0;
     }
@@ -32583,6 +32909,9 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     s->dspark_pending_valid = false;
 #ifndef DS4_NO_GPU
     if (!s->distributed && !ds4_session_is_cpu(s)) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        s->frontier.valid = false;
+#endif
         s->graph.token_graph_prepared.valid = false;
         s->graph.dspark_n_raw = pos < DS4_DSPARK_WINDOW
             ? (uint32_t)pos : DS4_DSPARK_WINDOW;

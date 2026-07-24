@@ -8,6 +8,82 @@ conservare il throughput DSpark sui contesti lunghi.
 La sezione **Avvio rapido** è la procedura operativa aggiornata. Le sezioni
 successive conservano la cronologia tecnica, comprese prove scartate e rollback.
 
+## Frontier GPU per tool call - 24 luglio 2026
+
+Le richieste con tool conservano ora una sola snapshot della frontier del prompt
+subito prima del decode. La snapshot resta sul device e contiene soltanto lo
+stato mutabile necessario a ripartire esattamente da quel punto:
+
+- le ultime 128 righe raw SWA dei 43 layer;
+- le frontiere attention/indexer e i relativi contatori;
+- i tre ring main-KV DSpark;
+- token e logits gia' disponibili sul lato host.
+
+La compressed KV non viene duplicata: e' append-only, quindi il restore
+riposiziona i contatori e sovrascrive soltanto la nuova coda. L'allocazione usa
+una singola arena CUDA bounded, nell'ordine di circa 25 MiB, e non introduce
+copie device-to-host nel percorso prima del decode.
+
+Quando la canonicalizzazione di una tool call sostituisce la coda generata, il
+server prova prima `source=gpu-frontier` e processa soltanto la coda canonica.
+Se token o layout non coincidono, rimangono invariati i fallback su checkpoint
+disco e replay completo. I log utili per il gate Athena sono:
+
+```text
+ds4: CUDA prompt frontier snapshot active (... MiB device, append-only compressed KV)
+ds4-server: GPU prompt frontier captured tokens=... ...ms
+ds4-server: tool checkpoint rebuild done ... source=gpu-frontier cached=... replay=...
+```
+
+Il gate controlla regressione CUDA completa, hash/qualita' invariati, decode
+DSpark non inferiore al baseline e riduzione del replay dopo una tool call.
+Su Athena e' stato superato:
+
+```text
+cuda-regression: frontier ring + batched async D2D restore OK
+cuda long-context regression: OK
+ds4: CUDA prompt frontier snapshot active (23.14 MiB device, append-only compressed KV)
+ds4-server: GPU prompt frontier captured tokens=345 2.388ms
+ds4-server: GPU prompt frontier restored cached=345 prompt=408 replay=63
+ds4-server: chat ctx=345..408:63 TOOLS prompt done 0.512s
+```
+
+Nel test controllato la coda tool e' stata resa deliberatamente diversa
+(`Rome` contro `Milan`) per impedire il normale live-prefix hit. Il server ha
+ripristinato 345 token dalla frontier GPU e ne ha riprocessati soltanto 63.
+La risposta deterministica a `temperature=0` e' risultata identica al cold
+prefill dello stesso prompt, incluso l'hash SHA-256 normalizzato:
+
+```text
+10f62d5605334a5f239c563ba80d0b2a26257b39d482beef8dfe5f24a3bd8f27
+```
+
+La cattura avviene fuori dal loop di decode, soltanto sulle richieste con tool.
+Nel test ha richiesto 1-2,4 ms; il fallback disco/full replay resta attivo se il
+prefisso testuale o il layout della snapshot non coincidono.
+
+Il successivo test end-to-end con Claude Code ha validato quattro restore
+consecutivi fino a 126.876 token:
+
+| Frontier | Coda nuova | Prefill coda | Tempo |
+| ---: | ---: | ---: | ---: |
+| 24.979 -> 28.545 | 3.566 token | 903,2 t/s | 3,95 s |
+| 28.545 -> 88.550 | 60.005 token | 920,6 t/s | 65,18 s |
+| 88.550 -> 112.476 | 23.926 token | 868,4 t/s | 27,55 s |
+| 112.476 -> 126.876 | 14.400 token | 849,6 t/s | 16,95 s |
+
+Le cinque catture sono costate complessivamente circa 6,9 ms e hanno occupato
+23,14 MiB. I quattro restore hanno evitato di riprocessare 254.550 token di
+prefisso. Stimando il vecchio full replay alle velocita' osservate nello stesso
+run, il tempo cumulativo dei quattro prefill sarebbe stato circa 407 secondi;
+il percorso incrementale ne ha richiesti 114, con circa 293 secondi risparmiati
+e una riduzione stimata del TTFT cumulativo del 72%.
+
+Nello stesso run il decode DSpark ha misurato 26,4 t/s a 25K, 26,1 t/s a 28K,
+22,4 t/s a 88K e 21,2 t/s a 112K. La generazione finale di 3.035 token a 126K
+ha mantenuto 16,2 t/s. La memoria di sistema e' rimasta intorno a 115 GiB usati
+e il processo DS4 non ha usato swap.
+
 ## Sidecar DSpark Q2 compatto promosso - 24 luglio 2026
 
 Il launcher e il builder supportano ora due sidecar DSpark. Il Q2 e' il

@@ -7905,6 +7905,8 @@ struct server {
     live_tool_state responses_live;
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
+    char *gpu_frontier_text;
+    size_t gpu_frontier_text_len;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     pthread_mutex_t tool_mu;
@@ -9168,6 +9170,28 @@ static int live_text_prefix_prompt(server *s, const request *req,
     return live_tokens->len;
 }
 
+static int gpu_frontier_text_prefix_prompt(server *s, const request *req,
+                                           ds4_tokens *effective_prompt,
+                                           char *err, size_t errlen) {
+    if (!s || !req || !req->prompt_text || !effective_prompt ||
+        !s->gpu_frontier_text || s->gpu_frontier_text_len == 0) return 0;
+    const size_t prompt_len = strlen(req->prompt_text);
+    if (!byte_prefix_match(req->prompt_text, prompt_len,
+                           s->gpu_frontier_text,
+                           s->gpu_frontier_text_len)) return 0;
+
+    const int restored =
+        ds4_session_frontier_restore(s->session, NULL, err, errlen);
+    if (restored <= 0) return restored;
+    const ds4_tokens *prefix = ds4_session_tokens(s->session);
+    if (!prefix || prefix->len <= 0) return -1;
+    build_prompt_from_exact_prefix_and_text_suffix(
+        s->engine, prefix,
+        req->prompt_text + s->gpu_frontier_text_len,
+        effective_prompt);
+    return prefix->len;
+}
+
 /* Tool-output-only Responses continuation.
  *
  * Some clients send just the new tool outputs after a tool call.  There is no
@@ -10225,6 +10249,40 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
                     "tool checkpoint canonicalized: common=%d live=%d canonical=%d",
                     common, live_len, canonical.len);
     } else if (rr == DS4_SESSION_REWRITE_REBUILD_NEEDED) {
+        /* The prompt frontier was captured on the accelerator immediately
+         * before generation.  Restore it first, then evaluate only the
+         * canonicalized assistant/tool tail.  A miss or backend error retains
+         * the established disk/full-replay fallback below. */
+        char frontier_err[160] = {0};
+        const double frontier_t0 = now_sec();
+        const int frontier_restored =
+            ds4_session_frontier_restore(s->session, &canonical,
+                                         frontier_err, sizeof(frontier_err));
+        if (frontier_restored == 1) {
+            const int cached = ds4_session_pos(s->session);
+            char sync_err[160] = {0};
+            if (ds4_session_sync(s->session, &canonical,
+                                 sync_err, sizeof(sync_err)) == 0) {
+                const double elapsed = now_sec() - frontier_t0;
+                server_log(DS4_LOG_KVCACHE,
+                           "ds4-server: tool checkpoint rebuild done ctx=%s source=gpu-frontier cached=%d replay=%d target=%d %.3fs",
+                           ctx, cached, canonical.len - cached,
+                           canonical.len, elapsed);
+                trace_event(s, trace_id,
+                            "tool checkpoint canonicalized via GPU frontier: common=%d live=%d canonical=%d cached=%d",
+                            common, live_len, canonical.len, cached);
+                goto done;
+            }
+            ds4_session_invalidate(s->session);
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: GPU frontier suffix replay failed ctx=%s cached=%d target=%d error=\"%s\"; falling back",
+                       ctx, cached, canonical.len, sync_err);
+        } else if (frontier_restored < 0) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: GPU frontier restore failed ctx=%s error=\"%s\"; falling back",
+                       ctx, frontier_err);
+        }
+
         /* The generated DSML suffix and the canonical prompt share a prefix,
          * but the generated tail is too large to overwrite safely inside the
          * live raw-window ring.  Prefer an older disk checkpoint over replaying
@@ -10455,6 +10513,26 @@ static void generate_job(server *s, job *j) {
             cached = text_cached;
             cache_source = "memory-text";
             prompt_for_sync = &effective_prompt;
+        }
+    }
+    if (cached == 0 && !stream_retry_force_disk) {
+        char frontier_err[160] = {0};
+        const int frontier_cached =
+            gpu_frontier_text_prefix_prompt(s, &j->req, &effective_prompt,
+                                            frontier_err,
+                                            sizeof(frontier_err));
+        if (frontier_cached > 0) {
+            cached = frontier_cached;
+            cache_source = "gpu-frontier";
+            prompt_for_sync = &effective_prompt;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: GPU prompt frontier restored cached=%d prompt=%d replay=%d",
+                       cached, effective_prompt.len,
+                       effective_prompt.len - cached);
+        } else if (frontier_cached < 0) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: GPU prompt frontier text restore failed error=\"%s\"",
+                       frontier_err);
         }
     }
     if (cached == 0 && old_pos > 0) {
@@ -10709,6 +10787,29 @@ static void generate_job(server *s, job *j) {
         } else {
             kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
                                                   cold_store_len);
+        }
+    }
+    if (j->req.has_tools) {
+        char frontier_err[160] = {0};
+        const double frontier_t0 = now_sec();
+        if (ds4_session_frontier_capture(s->session,
+                                         frontier_err, sizeof(frontier_err)) == 0) {
+            free(s->gpu_frontier_text);
+            s->gpu_frontier_text =
+                j->req.prompt_text ? xstrdup(j->req.prompt_text) : NULL;
+            s->gpu_frontier_text_len = s->gpu_frontier_text
+                ? strlen(s->gpu_frontier_text) : 0;
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: GPU prompt frontier captured tokens=%d %.3fms",
+                       ds4_session_pos(s->session),
+                       (now_sec() - frontier_t0) * 1000.0);
+        } else {
+            free(s->gpu_frontier_text);
+            s->gpu_frontier_text = NULL;
+            s->gpu_frontier_text_len = 0;
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: GPU prompt frontier unavailable tokens=%d error=\"%s\"",
+                       ds4_session_pos(s->session), frontier_err);
         }
     }
     char id[96];
@@ -12003,6 +12104,7 @@ static void server_close_resources(server *s) {
     live_tool_state_free(&s->responses_live);
     live_tool_state_free(&s->anthropic_live);
     visible_live_free(&s->thinking_live);
+    free(s->gpu_frontier_text);
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
     pthread_cond_destroy(&s->clients_cv);

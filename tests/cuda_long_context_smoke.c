@@ -99,6 +99,62 @@ cleanup:
     return rc;
 }
 
+static int check_frontier_copy_primitives(void) {
+    enum { RING_CAP = 8, ROWS = 4, WIDTH = 4 };
+    float ring_host[RING_CAP * WIDTH];
+    float zero_host[RING_CAP * WIDTH] = {0};
+    float got_host[RING_CAP * WIDTH] = {0};
+    float state_host[WIDTH] = {11.0f, 12.0f, 13.0f, 14.0f};
+    float state_got[WIDTH] = {0};
+    for (uint32_t i = 0; i < RING_CAP * WIDTH; i++) {
+        ring_host[i] = (float)(1000u + i);
+    }
+
+    ds4_gpu_tensor *ring = ds4_gpu_tensor_alloc(sizeof(ring_host));
+    ds4_gpu_tensor *backup =
+        ds4_gpu_tensor_alloc((uint64_t)ROWS * WIDTH * sizeof(float));
+    ds4_gpu_tensor *state = ds4_gpu_tensor_alloc(sizeof(state_host));
+    ds4_gpu_tensor *state_backup = ds4_gpu_tensor_alloc(sizeof(state_host));
+    int rc = 1;
+    if (!ring || !backup || !state || !state_backup ||
+        !ds4_gpu_tensor_write(ring, 0, ring_host, sizeof(ring_host)) ||
+        !ds4_gpu_tensor_write(state, 0, state_host, sizeof(state_host)) ||
+        !ds4_gpu_ring_rows_save_tensor(backup, ring, RING_CAP, 6, ROWS, WIDTH) ||
+        !ds4_gpu_tensor_copy_async(state_backup, 0, state, 0,
+                                   sizeof(state_host)) ||
+        !ds4_gpu_end_commands() ||
+        !ds4_gpu_tensor_write(ring, 0, zero_host, sizeof(zero_host)) ||
+        !ds4_gpu_tensor_write(state, 0, zero_host, sizeof(state_host)) ||
+        !ds4_gpu_ring_rows_restore_tensor(ring, backup, RING_CAP, 6, 0,
+                                          ROWS, WIDTH) ||
+        !ds4_gpu_tensor_copy_async(state, 0, state_backup, 0,
+                                   sizeof(state_host)) ||
+        !ds4_gpu_end_commands() ||
+        !ds4_gpu_tensor_read(ring, 0, got_host, sizeof(got_host)) ||
+        !ds4_gpu_tensor_read(state, 0, state_got, sizeof(state_got))) {
+        goto cleanup;
+    }
+
+    for (uint32_t r = 0; r < ROWS; r++) {
+        const uint32_t phys = (6u + r) % RING_CAP;
+        for (uint32_t c = 0; c < WIDTH; c++) {
+            const float expected = ring_host[phys * WIDTH + c];
+            if (got_host[phys * WIDTH + c] != expected) goto cleanup;
+        }
+    }
+    if (memcmp(state_host, state_got, sizeof(state_host)) != 0) goto cleanup;
+    fprintf(stderr,
+            "cuda-regression: frontier ring + batched async D2D restore OK\n");
+    rc = 0;
+
+cleanup:
+    ds4_gpu_tensor_free(state_backup);
+    ds4_gpu_tensor_free(state);
+    ds4_gpu_tensor_free(backup);
+    ds4_gpu_tensor_free(ring);
+    return rc;
+}
+
 static int check_gvr_topk(void) {
     const uint32_t n_comp = 16384;
     const uint32_t n_tokens = 2;
@@ -798,6 +854,10 @@ int main(void) {
     ds4_gpu_nvtx_range_pop();
     int rc = check_large_topk();
     if (rc != 0) fprintf(stderr, "cuda-regression: FAILED exact Top-K\n");
+    if (check_frontier_copy_primitives() != 0) {
+        fprintf(stderr, "cuda-regression: FAILED frontier copy primitives\n");
+        rc = 1;
+    }
     if (check_gvr_topk() != 0) {
         fprintf(stderr, "cuda-regression: FAILED exact GVR Top-K\n");
         rc = 1;

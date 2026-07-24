@@ -23,11 +23,19 @@ DeepSeek-V4-Flash Q2/imatrix target:
 | Clean mixed coding session with compact Q2 sidecar | 20.88 t/s weighted |
 | Physical context enabled by default | 262144 tokens |
 | Experimental physical context | 1M tokens |
+| Sustained GB10 temperature observed in long runs | about 75 C |
+| Memory behavior with the compact Q2 sidecar | stable, about 5.06 GiB less than Q4 |
 
 The original CUDA path measured about 13 decode t/s on the same machine.
 Decode varies with prompt, sampling and DSpark acceptance. Prefill averages are
 also affected by short final chunks, so the table reports both request-level
-results and the best complete chunk.
+results and the best complete chunk. The temperature is an operational
+observation from Athena rather than a controlled thermal benchmark; ambient
+temperature, cooling, clocks and workload can change it. Long test sessions did
+not show progressive memory growth, and the compact Q2 sidecar provides about
+5.06 GiB more UMA headroom than Q4.
+
+![Measured DS4 GB10 prefill and decode performance](docs/gb10-performance.svg)
 
 ## What this fork delivers
 
@@ -38,6 +46,8 @@ results and the best complete chunk.
 - Stable long-context prefill beyond the earlier 131k fast-path boundary.
 - Canonical KV checkpoints for append-only chat and tool-call workloads.
 - Pipelined model upload and release of copied GGUF pages.
+- Stable unified-memory use and sustained long-run temperatures around 75 C on
+  the measured GB10 system.
 - A 256k physical context with an 85% client-visible safety guard.
 - OpenAI, Responses and Anthropic-compatible HTTP endpoints.
 - Reproducible CUDA regressions, benchmark scripts and Nsight instrumentation.
@@ -99,8 +109,9 @@ rollback history are maintained in [README-GB10.md](README-GB10.md).
 ## Install on GB10/GX10
 
 The commands below assume a GB10/GX10 Linux host with CUDA installed at
-`/usr/local/cuda`. They use the `athena` account and keep persistent files out
-of `/tmp`.
+`/usr/local/cuda`. The `/home/athena` paths shown below reproduce the measured
+machine, but they are examples rather than requirements. The installer defaults
+to `$HOME/ds4` for models and can itself run from any checkout directory.
 
 Requirements:
 
@@ -113,9 +124,9 @@ Requirements:
 Recommended layout:
 
 ```text
-/home/athena/DS4-GB10-GX10-DSpark-CUDA   # source checkout
-/home/athena/ds4                         # target, sidecars and logs
-/tmp/ds4-gb10-dspark-kv                  # disposable KV disk cache, default 16 GiB budget
+~/DS4-GB10-GX10-DSpark-CUDA   # source checkout
+~/ds4                         # target, sidecars and logs
+/tmp/ds4-gb10-dspark-kv       # disposable KV disk cache, default 16 GiB budget
 ```
 
 ### Automatic installation
@@ -125,7 +136,7 @@ target, fetch the official DSpark shards, build both sidecars, run the CUDA
 regression and compile the server:
 
 ```bash
-cd /home/athena && git clone https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA.git && cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && ./install-gb10.sh --install-deps --dspark both
+cd "$HOME" && git clone https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA.git && cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && ./install-gb10.sh --install-deps --dspark both
 ```
 
 To save disk and conversion time, build only the desired sidecar:
@@ -146,19 +157,31 @@ Preview paths and planned work without downloading:
 ./install-gb10.sh --dspark both --dry-run
 ```
 
+Use a different model location:
+
+```bash
+./install-gb10.sh --dspark q2 --model-dir /mnt/models/ds4
+DS4_MODEL_DIR=/mnt/models/ds4 ./run-dspark-server.sh
+```
+
+The checkout path is also free: clone the repository anywhere and run
+`install-gb10.sh` from that checkout. For still finer control,
+`DS4_DSPARK_HF_DIR`, `DS4_DSPARK_GGUF`, `DS4_MODEL` and
+`DS4_DSPARK_MODEL` override the individual paths.
+
 The following sections show the same procedure step by step.
 
 ### 1. Install tools and clone
 
 ```bash
 sudo apt update && sudo apt install -y build-essential git curl wget rsync python3
-cd /home/athena && git clone https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA.git
+cd "$HOME" && git clone https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA.git
 ```
 
 For an existing clean checkout:
 
 ```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && git fetch origin && git pull --ff-only origin main
+cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && git fetch origin && git pull --ff-only origin main
 ```
 
 ### 2. Download the target model
@@ -167,8 +190,8 @@ Create the persistent model directory and download the recommended
 DeepSeek-V4-Flash Q2/imatrix target:
 
 ```bash
-mkdir -p /home/athena/ds4 && cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && DS4_GGUF_DIR=/home/athena/ds4 ./download_model.sh q2-imatrix
-ln -sfn /home/athena/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf /home/athena/ds4/ds4flash.gguf
+mkdir -p "$HOME/ds4" && cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && DS4_GGUF_DIR="$HOME/ds4" ./download_model.sh q2-imatrix
+ln -sfn "$HOME/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf" "$HOME/ds4/ds4flash.gguf"
 ```
 
 To use another compatible target, point `DS4_MODEL` to its GGUF instead of
@@ -180,7 +203,7 @@ Only the index and the three shards containing the official
 DeepSeek-V4-Flash-DSpark module are required:
 
 ```bash
-mkdir -p /home/athena/ds4/dspark-v4flash-hf && cd /home/athena/ds4/dspark-v4flash-hf && for f in config.json model.safetensors.index.json model-00046-of-00048.safetensors model-00047-of-00048.safetensors model-00048-of-00048.safetensors; do wget -c "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark/resolve/main/$f" || exit 1; done
+mkdir -p "$HOME/ds4/dspark-v4flash-hf" && cd "$HOME/ds4/dspark-v4flash-hf" && for f in config.json model.safetensors.index.json model-00046-of-00048.safetensors model-00047-of-00048.safetensors model-00048-of-00048.safetensors; do wget -c "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark/resolve/main/$f" || exit 1; done
 ```
 
 ### 4. Build a sidecar
@@ -188,26 +211,26 @@ mkdir -p /home/athena/ds4/dspark-v4flash-hf && cd /home/athena/ds4/dspark-v4flas
 Build the optional Q4 sidecar:
 
 ```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q4 ./build-dspark-sidecar.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-q4-convert.log
+cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && DS4_DSPARK_VARIANT=q4 ./build-dspark-sidecar.sh 2>&1 | tee "$HOME/ds4/ds4-dspark-q4-convert.log"
 ```
 
 Build the recommended Q2 sidecar:
 
 ```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q2 ./build-dspark-sidecar.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-q2-convert.log
+cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && DS4_DSPARK_VARIANT=q2 ./build-dspark-sidecar.sh 2>&1 | tee "$HOME/ds4/ds4-dspark-q2-convert.log"
 ```
 
 You can build both and choose at startup. The outputs are:
 
 ```text
-/home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf
-/home/athena/ds4/DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf
+~/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf
+~/ds4/DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf
 ```
 
 Confirm their sizes:
 
 ```bash
-ls -lh /home/athena/ds4/DeepSeek-V4-Flash-DSpark-*.gguf
+ls -lh "$HOME"/ds4/DeepSeek-V4-Flash-DSpark-*.gguf
 ```
 
 The Q2 build uses the quantizer's deterministic synthetic importance fallback;
@@ -220,7 +243,7 @@ Stop any running DS4 process first when memory is close to the GB10 limit.
 Then run the required numerical regression and build:
 
 ```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && /usr/local/cuda/bin/nvcc --version && make -B cuda-regression CUDA_ARCH=sm_121a && make -B cuda-spark-graph-sm121
+cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && /usr/local/cuda/bin/nvcc --version && make -B cuda-regression CUDA_ARCH=sm_121a && make -B cuda-spark-graph-sm121
 ```
 
 The regression must end with:
@@ -234,19 +257,19 @@ cuda long-context regression: OK
 Start the default Q2 profile on port `30007`:
 
 ```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && ./run-dspark-server.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-q2.log
+cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && ./run-dspark-server.sh 2>&1 | tee "$HOME/ds4/ds4-dspark-q2.log"
 ```
 
 Start the optional Q4 profile:
 
 ```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q4 ./run-dspark-server.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-q4.log
+cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && DS4_DSPARK_VARIANT=q4 ./run-dspark-server.sh 2>&1 | tee "$HOME/ds4/ds4-dspark-q4.log"
 ```
 
 Start the experimental 1M-context profile with the default Q2 sidecar:
 
 ```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && ./run-dspark-server-1m.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-1m.log
+cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && ./run-dspark-server-1m.sh 2>&1 | tee "$HOME/ds4/ds4-dspark-1m.log"
 ```
 
 The 1M launcher fixes the physical context at 1048576 tokens, advertises 85%,
@@ -258,7 +281,7 @@ unified-memory budget.
 To run the 1M profile with Q4 instead:
 
 ```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q4 ./run-dspark-server-1m.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-q4-1m.log
+cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && DS4_DSPARK_VARIANT=q4 ./run-dspark-server-1m.sh 2>&1 | tee "$HOME/ds4/ds4-dspark-q4-1m.log"
 ```
 
 The server listens on `http://0.0.0.0:30007` and exposes OpenAI-compatible,
@@ -280,8 +303,8 @@ For DSpark timing and acceptance statistics, start with telemetry and analyze
 the resulting log:
 
 ```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q2 DS4_TELEMETRY=1 ./run-dspark-server.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-q2-telemetry.log
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && ./analyze-dspark-log.sh /home/athena/ds4/ds4-dspark-q2-telemetry.log
+cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && DS4_DSPARK_VARIANT=q2 DS4_TELEMETRY=1 ./run-dspark-server.sh 2>&1 | tee "$HOME/ds4/ds4-dspark-q2-telemetry.log"
+cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && ./analyze-dspark-log.sh "$HOME/ds4/ds4-dspark-q2-telemetry.log"
 ```
 
 Current GB10 release defaults in `run-dspark-server.sh`:
@@ -376,7 +399,7 @@ that exercises the corresponding prefill or verifier path.
 For Tensor Core confirmation:
 
 ```bash
-grep -E 'tiny-batch Tensor Core|Tensor Core gemms|tiny-TC|GB10 verifier' /home/athena/ds4/ds4-dspark-release.log
+grep -E 'tiny-batch Tensor Core|Tensor Core gemms|tiny-TC|GB10 verifier' "$HOME/ds4/ds4-dspark-release.log"
 ```
 
 Expected startup includes `tiny-TC=1` and `tiny-TC-Q8=1` in the GB10 verifier

@@ -87,6 +87,39 @@ Nello stesso run il decode DSpark ha misurato 26,4 t/s a 25K, 26,1 t/s a 28K,
 ha mantenuto 16,2 t/s. La memoria di sistema e' rimasta intorno a 115 GiB usati
 e il processo DS4 non ha usato swap.
 
+## Scheduler DSpark sensibile al contesto - 24 luglio 2026
+
+La telemetria del verifier distingue ora fasce hardware da 32K token e conserva
+per ogni `K=1..5` costo del target, throughput recente e acceptance
+condizionale. Lo scheduler usa questi dati locali insieme alla confidence head:
+può ridurre K nella prosa lunga a bassa acceptance senza restare bloccato sul
+campione storico raccolto durante tool call più prevedibili. Un probe raro
+mantiene osservabili le altre ampiezze e permette loro di tornare candidate.
+
+Con `DS4_DSPARK_ALWAYS_DRAFT=1`, il draft e' gia' stato calcolato quando viene
+scelto K. In questo caso il minimo è K=1: scegliere K=0 dopo aver pagato il
+drafter ha prodotto una regressione misurata ed e' stato escluso. Rejection
+sampling, logits target, RNG e criterio di acceptance non sono cambiati.
+
+Confronto controllato sullo stesso prompt, sidecar Q2, frontiera 98.304, chunk
+8192 e 1.024 token generati:
+
+| Build | Prefill | Decode | Cicli | Token/ciclo | Picco RSS |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| baseline frontier ring | 922,19 t/s | 10,96 t/s | 671 | 1,5261 | 2.484,8 MB |
+| scheduler context-aware | 920,00 t/s | 11,07 t/s | 660 | 1,5515 | 2.473,9 MB |
+
+Il guadagno decode di questo carico severo e' circa 1%; il prefill differisce
+dello 0,24%, entro il rumore del run singolo. La telemetria si abilita con
+`DS4_TELEMETRY=1`; le righe `dspark scheduler` includono `pos`, bucket,
+confidence, acceptance recente, costo e rate per K.
+
+E' stato anche provato il warm-start GVR exact del Top-512 seriale in broadcast
+sulle 2-6 righe del verifier. La parita' esatta e il fallback Radix hanno
+superato la regressione, ma K=1 e' passato da 122,5 a 125,3 ms nel confronto
+end-to-end. L'estensione multi-riga e' stata quindi rimossa; resta soltanto il
+GVR exact a token singolo gia' validato.
+
 ## Sidecar DSpark Q2 compatto promosso - 24 luglio 2026
 
 Il launcher e il builder supportano ora due sidecar DSpark. Il Q2 e' il

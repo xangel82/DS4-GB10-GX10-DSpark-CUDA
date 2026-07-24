@@ -25929,6 +25929,7 @@ static void ds4_acquire_instance_lock(void) {
     atexit(ds4_release_instance_lock);
 }
 
+#define DS4_DSPARK_CONTEXT_BUCKETS 8u
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
 #define DS4_FRONTIER_SNAPSHOT_SLOTS 4u
 
@@ -25976,8 +25977,18 @@ struct ds4_session {
     double dspark_cycle_stable_seconds[DS4_DSPARK_BLOCK_SIZE + 1];
     uint64_t dspark_cycle_stable_tokens[DS4_DSPARK_BLOCK_SIZE + 1];
     uint64_t dspark_cycle_stable_samples[DS4_DSPARK_BLOCK_SIZE + 1];
+    double dspark_bucket_verify_ewma[DS4_DSPARK_CONTEXT_BUCKETS]
+                                      [DS4_DSPARK_BLOCK_SIZE + 1];
+    uint64_t dspark_bucket_verify_samples[DS4_DSPARK_CONTEXT_BUCKETS]
+                                          [DS4_DSPARK_BLOCK_SIZE + 1];
+    double dspark_bucket_rate_ewma[DS4_DSPARK_CONTEXT_BUCKETS]
+                                   [DS4_DSPARK_BLOCK_SIZE + 1];
+    uint64_t dspark_bucket_rate_samples[DS4_DSPARK_CONTEXT_BUCKETS]
+                                        [DS4_DSPARK_BLOCK_SIZE + 1];
     double dspark_accept_success[DS4_DSPARK_BLOCK_SIZE];
     double dspark_accept_trials[DS4_DSPARK_BLOCK_SIZE];
+    double dspark_recent_accept_ewma[DS4_DSPARK_BLOCK_SIZE];
+    uint64_t dspark_recent_accept_samples[DS4_DSPARK_BLOCK_SIZE];
     double dspark_sts_log_temperature[DS4_DSPARK_BLOCK_SIZE];
     uint64_t dspark_sts_samples[DS4_DSPARK_BLOCK_SIZE];
     uint32_t dspark_last_early_stop;
@@ -30792,6 +30803,16 @@ static double dspark_sigmoid(double x) {
     return z / (1.0 + z);
 }
 
+static uint32_t dspark_context_bucket(const ds4_session *s) {
+    uint64_t pos = s && s->checkpoint.len > 0
+        ? (uint64_t)s->checkpoint.len : 0u;
+    uint64_t bucket = pos >> 15u; /* 32K-token hardware-cost bands. */
+    if (bucket >= DS4_DSPARK_CONTEXT_BUCKETS) {
+        bucket = DS4_DSPARK_CONTEXT_BUCKETS - 1u;
+    }
+    return (uint32_t)bucket;
+}
+
 static double dspark_env_position_double(
         const char *name, uint32_t pos, double fallback,
         double min_value, double max_value) {
@@ -30839,6 +30860,15 @@ static double dspark_calibrated_confidence(
      * to the Q2 target actually running on this machine. */
     const double model_weight = 16.0 / (16.0 + trials);
     predicted = model_weight * predicted + (1.0 - model_weight) * empirical;
+    /* Tool syntax and unconstrained reasoning have very different local
+     * acceptance.  The lifetime aggregate above is intentionally stable, but
+     * cannot react when a request moves from one regime to the other.  Blend
+     * in a short conditional EWMA after four observations.  This changes only
+     * verifier width selection; target rejection sampling remains exact. */
+    if (s->dspark_recent_accept_samples[pos] >= 4u) {
+        predicted = predicted * 0.35 +
+                    s->dspark_recent_accept_ewma[pos] * 0.65;
+    }
     if (predicted < 0.02) predicted = 0.02;
     if (predicted > 0.995) predicted = 0.995;
     return predicted;
@@ -30879,6 +30909,11 @@ static void dspark_note_sts(
 
 static double dspark_verify_cost_estimate(const ds4_session *s, uint32_t k) {
     if (k == 0) return 0.0;
+    const uint32_t bucket = dspark_context_bucket(s);
+    if (k <= DS4_DSPARK_BLOCK_SIZE &&
+        s->dspark_bucket_verify_samples[bucket][k] >= 2u) {
+        return s->dspark_bucket_verify_ewma[bucket][k];
+    }
     if (k <= DS4_DSPARK_BLOCK_SIZE && s->dspark_verify_samples[k] != 0) {
         return s->dspark_verify_ewma[k];
     }
@@ -30921,6 +30956,14 @@ static bool dspark_scheduler_calibrated(
 static double dspark_stable_cycle_rate(
         const ds4_session *s, uint32_t k) {
     if (!s || k == 0 || k > DS4_DSPARK_BLOCK_SIZE) return 0.0;
+    const uint32_t bucket = dspark_context_bucket(s);
+    if (s->dspark_bucket_rate_samples[bucket][k] >= 3u &&
+        s->dspark_bucket_rate_ewma[bucket][k] > 0.0) {
+        return s->dspark_bucket_rate_ewma[bucket][k];
+    }
+    if (s->dspark_cycle_rate_ewma[k] > 0.0) {
+        return s->dspark_cycle_rate_ewma[k];
+    }
     if (s->dspark_cycle_stable_samples[k] != 0 &&
         s->dspark_cycle_stable_seconds[k] > 0.0) {
         return (double)s->dspark_cycle_stable_tokens[k] /
@@ -31026,20 +31069,29 @@ static uint32_t dspark_choose_verify_len(
 
     double anchor = s->dspark_anchor_ewma;
     if (anchor <= 0.0) anchor = 0.067;
-    /* Once every K has real GB10 measurements, trust the best demonstrated
-     * end-to-end cycle over an imperfectly calibrated confidence head.  The
-     * head is still used during exploration and whenever no measured K beats
-     * ordinary decode.  Bad stretches are handled by the existing K-aware
-     * circuit breaker, which continuously updates the selected K EWMA. */
+    /* Keep all K families observable after startup.  Tool syntax and free-form
+     * reasoning can reverse the winner within one request; without a sparse
+     * probe the old lifetime champion becomes self-reinforcing forever. */
+    const uint64_t probe_interval = (uint64_t)dspark_env_double(
+            "DS4_DSPARK_K_PROBE_INTERVAL", 128.0, 16.0, 4096.0);
+    if (getenv("DS4_DSPARK_CHAMPION_DISABLE") == NULL &&
+        probe_interval != 0u && s->dspark_cycles != 0u &&
+        (s->dspark_cycles % probe_interval) == 0u) {
+        const uint32_t probe =
+            1u + (uint32_t)((s->dspark_cycles / probe_interval) % max_k);
+        s->dspark_last_champion = probe;
+        return probe;
+    }
+
+    /* Record the current context-local champion for diagnostics, but evaluate
+     * it together with this cycle's confidence below.  Returning it here used
+     * to lock K=4 through long low-acceptance thinking stretches. */
     if (getenv("DS4_DSPARK_CHAMPION_DISABLE") == NULL) {
         double champion_rate = 0.0;
         const uint32_t champion = dspark_measured_champion(
                 s, max_k, min_samples, &champion_rate);
-        const double margin = dspark_env_double(
-                "DS4_DSPARK_CHAMPION_MARGIN", 1.01, 1.0, 2.0);
-        if (champion != 0 && champion_rate > margin / anchor) {
+        if (champion != 0 && champion_rate > 0.0) {
             s->dspark_last_champion = champion;
-            return champion;
         }
     }
     /* The pending current token is the first row of the verifier, not a
@@ -31049,8 +31101,8 @@ static uint32_t dspark_choose_verify_len(
      * therefore means draft + ordinary target decode, not a clean target-only
      * cycle.  Comparing against 1/anchor made K=0 look artificially fast and
      * discarded hundreds of paid drafts on GB10. */
-    double best_rate = 1.0 / (draft_seconds + anchor);
-    uint32_t best_k = 0;
+    double best_rate = 0.0;
+    uint32_t best_k = 1u;
     double expected_tokens = 1.0;
     double survival = 1.0;
     const double threshold = dspark_env_double(
@@ -31108,12 +31160,20 @@ static uint32_t dspark_choose_verify_len(
 static void dspark_note_acceptance(
         ds4_session *s, uint32_t verified, uint32_t committed) {
     for (uint32_t p = 0; p < verified && p < DS4_DSPARK_BLOCK_SIZE; p++) {
+        const double observed = committed > p ? 1.0 : 0.0;
         s->dspark_accept_trials[p] += 1.0;
-        if (committed > p) {
+        if (observed != 0.0) {
             s->dspark_accept_success[p] += 1.0;
-        } else {
-            break;
         }
+        const double alpha =
+            s->dspark_recent_accept_samples[p] < 4u ? 0.5 : 0.12;
+        s->dspark_recent_accept_ewma[p] =
+            s->dspark_recent_accept_samples[p] == 0u
+                ? observed
+                : s->dspark_recent_accept_ewma[p] * (1.0 - alpha) +
+                  observed * alpha;
+        s->dspark_recent_accept_samples[p]++;
+        if (observed == 0.0) break;
     }
 }
 
@@ -31124,6 +31184,17 @@ static void dspark_note_verify_time(ds4_session *s, uint32_t k, double seconds) 
         ? seconds
         : s->dspark_verify_ewma[k] * (1.0 - alpha) + seconds * alpha;
     s->dspark_verify_samples[k]++;
+
+    const uint32_t bucket = dspark_context_bucket(s);
+    const uint64_t bucket_samples =
+        s->dspark_bucket_verify_samples[bucket][k];
+    const double bucket_alpha = bucket_samples < 4u ? 0.5 : 0.15;
+    s->dspark_bucket_verify_ewma[bucket][k] = bucket_samples == 0u
+        ? seconds
+        : s->dspark_bucket_verify_ewma[bucket][k] *
+              (1.0 - bucket_alpha) +
+          seconds * bucket_alpha;
+    s->dspark_bucket_verify_samples[bucket][k]++;
 }
 
 static void dspark_note_cycle_rate(
@@ -31136,6 +31207,16 @@ static void dspark_note_cycle_rate(
     s->dspark_cycle_rate_ewma[k] = samples <= 1
         ? rate
         : s->dspark_cycle_rate_ewma[k] * (1.0 - alpha) + rate * alpha;
+    const uint32_t bucket = dspark_context_bucket(s);
+    const uint64_t bucket_samples =
+        s->dspark_bucket_rate_samples[bucket][k];
+    const double bucket_alpha = bucket_samples < 4u ? 0.5 : 0.2;
+    s->dspark_bucket_rate_ewma[bucket][k] = bucket_samples == 0u
+        ? rate
+        : s->dspark_bucket_rate_ewma[bucket][k] *
+              (1.0 - bucket_alpha) +
+          rate * bucket_alpha;
+    s->dspark_bucket_rate_samples[bucket][k]++;
     if (samples > 2) {
         s->dspark_cycle_stable_tokens[k] += emitted;
         s->dspark_cycle_stable_seconds[k] += seconds;
@@ -31788,10 +31869,6 @@ static int ds4_session_eval_dspark_cycle(
                                         err, errlen);
     }
     int proposal_cap = verify_cap;
-    if (s->dspark_history_active && historical_champion > 0 &&
-        historical_champion < (uint32_t)proposal_cap) {
-        proposal_cap = (int)historical_champion;
-    }
 
     /* The released DSpark checkpoint exposes an exact autoregressive draft
      * distribution after the Markov correction.  Use true speculative
@@ -31951,7 +32028,9 @@ static int ds4_session_eval_dspark_cycle(
     if (log) {
         fprintf(stderr,
                 "ds4: dspark scheduler selected=%d block=%d proposed=%d configured=%d "
+                "pos=%d bucket=%u "
                 "conf=[%.3f %.3f %.3f %.3f %.3f] "
+                "recent=[%.3f %.3f %.3f %.3f %.3f] "
                 "cost_ms=[%.1f %.1f %.1f %.1f %.1f] "
                 "rate_tps=[%.2f %.2f %.2f %.2f %.2f] "
                 "stable_tps=[%.2f %.2f %.2f %.2f %.2f] "
@@ -31962,11 +32041,18 @@ static int ds4_session_eval_dspark_cycle(
                 draft_cap,
                 proposal_cap,
                 configured_cap,
+                s->checkpoint.len,
+                dspark_context_bucket(s),
                 dspark_calibrated_confidence(s, confidence, 0),
                 dspark_calibrated_confidence(s, confidence, 1),
                 dspark_calibrated_confidence(s, confidence, 2),
                 dspark_calibrated_confidence(s, confidence, 3),
                 dspark_calibrated_confidence(s, confidence, 4),
+                s->dspark_recent_accept_ewma[0],
+                s->dspark_recent_accept_ewma[1],
+                s->dspark_recent_accept_ewma[2],
+                s->dspark_recent_accept_ewma[3],
+                s->dspark_recent_accept_ewma[4],
                 dspark_verify_cost_estimate(s, 1) * 1000.0,
                 dspark_verify_cost_estimate(s, 2) * 1000.0,
                 dspark_verify_cost_estimate(s, 3) * 1000.0,

@@ -258,8 +258,10 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
  * restored, 0 when no matching frontier exists, and -1 on a backend error.
  * A NULL prompt lets a caller that already proved the rendered-text prefix
  * restore the saved exact tokenization. */
-int ds4_session_frontier_capture(ds4_session *s, char *err, size_t errlen);
+int ds4_session_frontier_capture(ds4_session *s, uint64_t *snapshot_id,
+                                 char *err, size_t errlen);
 int ds4_session_frontier_restore(ds4_session *s, const ds4_tokens *prompt,
+                                 uint64_t snapshot_id,
                                  char *err, size_t errlen);
 int ds4_session_common_prefix(ds4_session *s, const ds4_tokens *prompt);
 int ds4_session_argmax(ds4_session *s);

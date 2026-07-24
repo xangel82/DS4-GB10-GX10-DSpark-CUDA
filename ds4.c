@@ -25930,9 +25930,12 @@ static void ds4_acquire_instance_lock(void) {
 }
 
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+#define DS4_FRONTIER_SNAPSHOT_SLOTS 4u
+
 typedef struct {
     bool valid;
-    bool announced;
+    uint64_t id;
+    uint64_t age;
     token_vec checkpoint;
     float *logits;
     ds4_gpu_tensor *arena;
@@ -26004,7 +26007,9 @@ struct ds4_session {
     bool mtp_draft_valid;
     bool logits_host_valid;
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    ds4_frontier_snapshot frontier;
+    ds4_frontier_snapshot frontier[DS4_FRONTIER_SNAPSHOT_SLOTS];
+    uint64_t frontier_clock;
+    bool frontier_announced;
 #endif
 };
 
@@ -26248,6 +26253,66 @@ static bool frontier_snapshot_alloc(ds4_frontier_snapshot *f,
 fail:
     frontier_snapshot_free(f);
     return false;
+}
+
+static void frontier_snapshots_invalidate_all(ds4_session *s) {
+    if (!s) return;
+    for (uint32_t i = 0; i < DS4_FRONTIER_SNAPSHOT_SLOTS; i++) {
+        s->frontier[i].valid = false;
+    }
+}
+
+static ds4_frontier_snapshot *frontier_snapshot_capture_slot(ds4_session *s) {
+    ds4_frontier_snapshot *free_slot = NULL;
+    ds4_frontier_snapshot *oldest = &s->frontier[0];
+    for (uint32_t i = 0; i < DS4_FRONTIER_SNAPSHOT_SLOTS; i++) {
+        ds4_frontier_snapshot *f = &s->frontier[i];
+        if (f->valid &&
+            f->checkpoint.len == s->checkpoint.len &&
+            f->checkpoint.len > 0 &&
+            memcmp(f->checkpoint.v, s->checkpoint.v,
+                   (size_t)f->checkpoint.len * sizeof(f->checkpoint.v[0])) == 0) {
+            return f;
+        }
+        if (!f->valid) {
+            if (!free_slot) free_slot = f;
+        } else if (!oldest->valid || f->age < oldest->age) {
+            oldest = f;
+        }
+    }
+    return free_slot ? free_slot : oldest;
+}
+
+static ds4_frontier_snapshot *frontier_snapshot_restore_slot(
+        ds4_session *s, const ds4_tokens *prompt, uint64_t snapshot_id) {
+    ds4_frontier_snapshot *best = NULL;
+    for (uint32_t i = 0; i < DS4_FRONTIER_SNAPSHOT_SLOTS; i++) {
+        ds4_frontier_snapshot *f = &s->frontier[i];
+        if (!f->valid || f->checkpoint.len <= 0) continue;
+        if (snapshot_id != 0 && f->id != snapshot_id) continue;
+        if (prompt &&
+            (prompt->len < f->checkpoint.len ||
+             !ds4_tokens_starts_with(prompt, &f->checkpoint))) {
+            continue;
+        }
+        if (!best ||
+            (prompt && f->checkpoint.len > best->checkpoint.len) ||
+            (!prompt && f->age > best->age)) {
+            best = f;
+        }
+    }
+    return best;
+}
+
+static void frontier_snapshots_invalidate_after(
+        ds4_session *s, uint32_t checkpoint_len, uint64_t keep_id) {
+    for (uint32_t i = 0; i < DS4_FRONTIER_SNAPSHOT_SLOTS; i++) {
+        ds4_frontier_snapshot *f = &s->frontier[i];
+        if (f->valid && f->id != keep_id &&
+            (uint32_t)f->checkpoint.len > checkpoint_len) {
+            f->valid = false;
+        }
+    }
 }
 #endif
 
@@ -26723,7 +26788,7 @@ int ds4_session_load_layer_payload(ds4_session *s, FILE *fp,
     }
     s->dspark_pending_valid = false;
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    s->frontier.valid = false;
+    frontier_snapshots_invalidate_all(s);
 #endif
     if (ds4_engine_has_dspark(s->engine)) {
         payload_set_err(err, errlen,
@@ -27503,7 +27568,7 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
     }
     s->dspark_pending_valid = false;
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    s->frontier.valid = false;
+    frontier_snapshots_invalidate_all(s);
 #endif
     if (s->distributed) {
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
@@ -29326,7 +29391,9 @@ void ds4_session_free(ds4_session *s) {
 #ifndef DS4_NO_GPU
     else {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-        frontier_snapshot_free(&s->frontier);
+        for (uint32_t i = 0; i < DS4_FRONTIER_SNAPSHOT_SLOTS; i++) {
+            frontier_snapshot_free(&s->frontier[i]);
+        }
 #endif
         metal_graph_free(&s->graph);
     }
@@ -30075,7 +30142,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
     s->checkpoint.len = 0;
     s->mtp_draft_valid = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    s->frontier.valid = false;
+    frontier_snapshots_invalidate_all(s);
 #endif
     if (!metal_graph_reset_prefill_state(&s->graph)) {
         snprintf(err, errlen, "%s prefill state reset failed", backend_name);
@@ -30197,12 +30264,15 @@ ds4_session_rewrite_result ds4_session_rewrite_from_common(
     return DS4_SESSION_REWRITE_ERROR;
 }
 
-int ds4_session_frontier_capture(ds4_session *s, char *err, size_t errlen) {
+int ds4_session_frontier_capture(ds4_session *s, uint64_t *snapshot_id,
+                                 char *err, size_t errlen) {
 #if defined(DS4_NO_GPU) || defined(__APPLE__) || defined(DS4_ROCM_BUILD)
     (void)s;
+    if (snapshot_id) *snapshot_id = 0;
     if (errlen) snprintf(err, errlen, "GPU frontier snapshots require CUDA");
     return 1;
 #else
+    if (snapshot_id) *snapshot_id = 0;
     if (!s || s->distributed || ds4_session_is_cpu(s) ||
         !ds4_engine_has_dspark(s->engine) || !s->checkpoint_valid) {
         if (errlen) snprintf(err, errlen, "session has no capturable CUDA DSpark frontier");
@@ -30211,7 +30281,7 @@ int ds4_session_frontier_capture(ds4_session *s, char *err, size_t errlen) {
     if (ds4_session_materialize_logits_internal(s, err, errlen) != 0) return 1;
 
     ds4_gpu_graph *g = &s->graph;
-    ds4_frontier_snapshot *f = &s->frontier;
+    ds4_frontier_snapshot *f = frontier_snapshot_capture_slot(s);
     f->valid = false;
     if (!frontier_snapshot_alloc(f, g)) {
         if (errlen) snprintf(err, errlen, "failed to allocate CUDA frontier snapshot");
@@ -30276,22 +30346,33 @@ int ds4_session_frontier_capture(ds4_session *s, char *err, size_t errlen) {
     ds4_tokens_copy(&f->checkpoint, &s->checkpoint);
     memcpy(f->logits, s->logits,
            (size_t)DS4_N_VOCAB * sizeof(f->logits[0]));
+    s->frontier_clock++;
+    if (s->frontier_clock == 0) s->frontier_clock++;
+    f->id = s->frontier_clock;
+    f->age = s->frontier_clock;
     f->valid = true;
-    if (!f->announced) {
+    if (snapshot_id) *snapshot_id = f->id;
+    if (!s->frontier_announced) {
         fprintf(stderr,
-                "ds4: CUDA prompt frontier snapshot active (%.2f MiB device, append-only compressed KV)\n",
-                (double)f->device_bytes / (1024.0 * 1024.0));
-        f->announced = true;
+                "ds4: CUDA prompt frontier ring active "
+                "(slots=%u %.2f MiB/slot max=%.2f MiB device, append-only compressed KV)\n",
+                DS4_FRONTIER_SNAPSHOT_SLOTS,
+                (double)f->device_bytes / (1024.0 * 1024.0),
+                (double)(f->device_bytes * DS4_FRONTIER_SNAPSHOT_SLOTS) /
+                    (1024.0 * 1024.0));
+        s->frontier_announced = true;
     }
     return 0;
 #endif
 }
 
 int ds4_session_frontier_restore(ds4_session *s, const ds4_tokens *prompt,
+                                 uint64_t snapshot_id,
                                  char *err, size_t errlen) {
 #if defined(DS4_NO_GPU) || defined(__APPLE__) || defined(DS4_ROCM_BUILD)
     (void)s;
     (void)prompt;
+    (void)snapshot_id;
     (void)err;
     (void)errlen;
     return 0;
@@ -30300,13 +30381,9 @@ int ds4_session_frontier_restore(ds4_session *s, const ds4_tokens *prompt,
         if (errlen) snprintf(err, errlen, "invalid frontier restore request");
         return -1;
     }
-    ds4_frontier_snapshot *f = &s->frontier;
-    if (!f->valid || f->checkpoint.len <= 0) {
-        return 0;
-    }
-    if (prompt &&
-        (prompt->len < f->checkpoint.len ||
-         !ds4_tokens_starts_with(prompt, &f->checkpoint))) return 0;
+    ds4_frontier_snapshot *f =
+        frontier_snapshot_restore_slot(s, prompt, snapshot_id);
+    if (!f) return 0;
 
     ds4_gpu_graph *g = &s->graph;
     const uint32_t pos = (uint32_t)f->checkpoint.len;
@@ -30379,6 +30456,7 @@ int ds4_session_frontier_restore(ds4_session *s, const ds4_tokens *prompt,
     g->token_graph_prepared.valid = false;
     memset(g->spec_prefix_gvr_hint_valid, 0,
            sizeof(g->spec_prefix_gvr_hint_valid));
+    frontier_snapshots_invalidate_after(s, pos, f->id);
     return 1;
 #endif
 }
@@ -32893,7 +32971,7 @@ void ds4_session_invalidate(ds4_session *s) {
 #ifndef DS4_NO_GPU
     if (!s->distributed && !ds4_session_is_cpu(s)) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-        s->frontier.valid = false;
+        frontier_snapshots_invalidate_all(s);
 #endif
         s->graph.token_graph_prepared.valid = false;
         s->graph.dspark_n_raw = 0;
@@ -32910,7 +32988,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
 #ifndef DS4_NO_GPU
     if (!s->distributed && !ds4_session_is_cpu(s)) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-        s->frontier.valid = false;
+        frontier_snapshots_invalidate_all(s);
 #endif
         s->graph.token_graph_prepared.valid = false;
         s->graph.dspark_n_raw = pos < DS4_DSPARK_WINDOW

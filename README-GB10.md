@@ -10,9 +10,9 @@ successive conservano la cronologia tecnica, comprese prove scartate e rollback.
 
 ## Frontier GPU per tool call - 24 luglio 2026
 
-Le richieste con tool conservano ora una sola snapshot della frontier del prompt
-subito prima del decode. La snapshot resta sul device e contiene soltanto lo
-stato mutabile necessario a ripartire esattamente da quel punto:
+Le richieste con tool conservano ora fino a quattro snapshot della frontier del
+prompt prima del decode. Il ring resta sul device e ogni slot contiene soltanto
+lo stato mutabile necessario a ripartire esattamente da quel punto:
 
 - le ultime 128 righe raw SWA dei 43 layer;
 - le frontiere attention/indexer e i relativi contatori;
@@ -20,9 +20,12 @@ stato mutabile necessario a ripartire esattamente da quel punto:
 - token e logits gia' disponibili sul lato host.
 
 La compressed KV non viene duplicata: e' append-only, quindi il restore
-riposiziona i contatori e sovrascrive soltanto la nuova coda. L'allocazione usa
-una singola arena CUDA bounded, nell'ordine di circa 25 MiB, e non introduce
-copie device-to-host nel percorso prima del decode.
+riposiziona i contatori e sovrascrive soltanto la nuova coda. Ogni slot usa una
+singola arena CUDA bounded da circa 23,14 MiB; il massimo osservato per quattro
+slot e' 92,56 MiB e non introduce copie device-to-host nel percorso prima del
+decode. Gli slot vengono identificati esplicitamente e sostituiti in ordine
+LRU, così una tool call può tornare a una frontier precedente senza perdere le
+altre ramificazioni ancora valide.
 
 Quando la canonicalizzazione di una tool call sostituisce la coda generata, il
 server prova prima `source=gpu-frontier` e processa soltanto la coda canonica.
@@ -30,9 +33,9 @@ Se token o layout non coincidono, rimangono invariati i fallback su checkpoint
 disco e replay completo. I log utili per il gate Athena sono:
 
 ```text
-ds4: CUDA prompt frontier snapshot active (... MiB device, append-only compressed KV)
-ds4-server: GPU prompt frontier captured tokens=... ...ms
-ds4-server: tool checkpoint rebuild done ... source=gpu-frontier cached=... replay=...
+ds4: CUDA prompt frontier ring active (slots=4 ... MiB/slot max=... MiB device, append-only compressed KV)
+ds4-server: GPU prompt frontier captured id=... tokens=... ...ms
+ds4-server: GPU prompt frontier restored id=... cached=... prompt=... replay=...
 ```
 
 Il gate controlla regressione CUDA completa, hash/qualita' invariati, decode
@@ -42,9 +45,9 @@ Su Athena e' stato superato:
 ```text
 cuda-regression: frontier ring + batched async D2D restore OK
 cuda long-context regression: OK
-ds4: CUDA prompt frontier snapshot active (23.14 MiB device, append-only compressed KV)
-ds4-server: GPU prompt frontier captured tokens=345 2.388ms
-ds4-server: GPU prompt frontier restored cached=345 prompt=408 replay=63
+ds4: CUDA prompt frontier ring active (slots=4 23.14 MiB/slot max=92.56 MiB device, append-only compressed KV)
+ds4-server: GPU prompt frontier captured id=1 tokens=345 2.388ms
+ds4-server: GPU prompt frontier restored id=1 cached=345 prompt=408 replay=63
 ds4-server: chat ctx=345..408:63 TOOLS prompt done 0.512s
 ```
 
@@ -60,7 +63,7 @@ prefill dello stesso prompt, incluso l'hash SHA-256 normalizzato:
 
 La cattura avviene fuori dal loop di decode, soltanto sulle richieste con tool.
 Nel test ha richiesto 1-2,4 ms; il fallback disco/full replay resta attivo se il
-prefisso testuale o il layout della snapshot non coincidono.
+prefisso testuale, l'identificatore o il layout della snapshot non coincidono.
 
 Il successivo test end-to-end con Claude Code ha validato quattro restore
 consecutivi fino a 126.876 token:

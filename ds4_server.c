@@ -7892,6 +7892,16 @@ typedef struct {
     bool tool_checkpoint;
 } visible_live_state;
 
+#define DS4_SERVER_GPU_FRONTIER_SLOTS 4u
+
+typedef struct {
+    uint64_t snapshot_id;
+    uint64_t age;
+    int tokens;
+    char *text;
+    size_t text_len;
+} gpu_frontier_text_entry;
+
 static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
@@ -7905,8 +7915,8 @@ struct server {
     live_tool_state responses_live;
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
-    char *gpu_frontier_text;
-    size_t gpu_frontier_text_len;
+    gpu_frontier_text_entry gpu_frontier[DS4_SERVER_GPU_FRONTIER_SLOTS];
+    uint64_t gpu_frontier_clock;
     bool disable_exact_dsml_tool_replay;
     bool enable_cors;
     pthread_mutex_t tool_mu;
@@ -9170,26 +9180,75 @@ static int live_text_prefix_prompt(server *s, const request *req,
     return live_tokens->len;
 }
 
+static gpu_frontier_text_entry *gpu_frontier_capture_entry(
+        server *s, int tokens, const char *text) {
+    gpu_frontier_text_entry *free_slot = NULL;
+    gpu_frontier_text_entry *oldest = &s->gpu_frontier[0];
+    for (uint32_t i = 0; i < DS4_SERVER_GPU_FRONTIER_SLOTS; i++) {
+        gpu_frontier_text_entry *e = &s->gpu_frontier[i];
+        if (e->snapshot_id != 0 && e->tokens == tokens && e->text &&
+            strcmp(e->text, text) == 0) {
+            return e;
+        }
+        if (e->snapshot_id == 0) {
+            if (!free_slot) free_slot = e;
+        } else if (oldest->snapshot_id == 0 || e->age < oldest->age) {
+            oldest = e;
+        }
+    }
+    return free_slot ? free_slot : oldest;
+}
+
+static void gpu_frontier_store_text(server *s, uint64_t snapshot_id,
+                                    int tokens, const char *text) {
+    if (!s || snapshot_id == 0 || !text) return;
+    gpu_frontier_text_entry *e =
+        gpu_frontier_capture_entry(s, tokens, text);
+    char *copy = xstrdup(text);
+    free(e->text);
+    s->gpu_frontier_clock++;
+    if (s->gpu_frontier_clock == 0) s->gpu_frontier_clock++;
+    e->snapshot_id = snapshot_id;
+    e->age = s->gpu_frontier_clock;
+    e->tokens = tokens;
+    e->text = copy;
+    e->text_len = strlen(copy);
+}
+
 static int gpu_frontier_text_prefix_prompt(server *s, const request *req,
                                            ds4_tokens *effective_prompt,
                                            char *err, size_t errlen) {
-    if (!s || !req || !req->prompt_text || !effective_prompt ||
-        !s->gpu_frontier_text || s->gpu_frontier_text_len == 0) return 0;
+    if (!s || !req || !req->prompt_text || !effective_prompt) return 0;
     const size_t prompt_len = strlen(req->prompt_text);
-    if (!byte_prefix_match(req->prompt_text, prompt_len,
-                           s->gpu_frontier_text,
-                           s->gpu_frontier_text_len)) return 0;
+    for (;;) {
+        gpu_frontier_text_entry *best = NULL;
+        for (uint32_t i = 0; i < DS4_SERVER_GPU_FRONTIER_SLOTS; i++) {
+            gpu_frontier_text_entry *e = &s->gpu_frontier[i];
+            if (e->snapshot_id == 0 || !e->text || e->text_len == 0) continue;
+            if (!byte_prefix_match(req->prompt_text, prompt_len,
+                                   e->text, e->text_len)) continue;
+            if (!best || e->text_len > best->text_len) best = e;
+        }
+        if (!best) return 0;
 
-    const int restored =
-        ds4_session_frontier_restore(s->session, NULL, err, errlen);
-    if (restored <= 0) return restored;
-    const ds4_tokens *prefix = ds4_session_tokens(s->session);
-    if (!prefix || prefix->len <= 0) return -1;
-    build_prompt_from_exact_prefix_and_text_suffix(
-        s->engine, prefix,
-        req->prompt_text + s->gpu_frontier_text_len,
-        effective_prompt);
-    return prefix->len;
+        const int restored =
+            ds4_session_frontier_restore(s->session, NULL, best->snapshot_id,
+                                         err, errlen);
+        if (restored == 0) {
+            free(best->text);
+            memset(best, 0, sizeof(*best));
+            continue;
+        }
+        if (restored < 0) return restored;
+
+        const ds4_tokens *prefix = ds4_session_tokens(s->session);
+        if (!prefix || prefix->len != best->tokens) return -1;
+        build_prompt_from_exact_prefix_and_text_suffix(
+            s->engine, prefix,
+            req->prompt_text + best->text_len,
+            effective_prompt);
+        return prefix->len;
+    }
 }
 
 /* Tool-output-only Responses continuation.
@@ -10257,6 +10316,7 @@ static void canonicalize_tool_checkpoint(server *s, const job *j, const char *ct
         const double frontier_t0 = now_sec();
         const int frontier_restored =
             ds4_session_frontier_restore(s->session, &canonical,
+                                         0,
                                          frontier_err, sizeof(frontier_err));
         if (frontier_restored == 1) {
             const int cached = ds4_session_pos(s->session);
@@ -10791,22 +10851,20 @@ static void generate_job(server *s, job *j) {
     }
     if (j->req.has_tools) {
         char frontier_err[160] = {0};
+        uint64_t snapshot_id = 0;
         const double frontier_t0 = now_sec();
         if (ds4_session_frontier_capture(s->session,
+                                         &snapshot_id,
                                          frontier_err, sizeof(frontier_err)) == 0) {
-            free(s->gpu_frontier_text);
-            s->gpu_frontier_text =
-                j->req.prompt_text ? xstrdup(j->req.prompt_text) : NULL;
-            s->gpu_frontier_text_len = s->gpu_frontier_text
-                ? strlen(s->gpu_frontier_text) : 0;
+            gpu_frontier_store_text(s, snapshot_id,
+                                    ds4_session_pos(s->session),
+                                    j->req.prompt_text);
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: GPU prompt frontier captured tokens=%d %.3fms",
+                       "ds4-server: GPU prompt frontier captured id=%llu tokens=%d %.3fms",
+                       (unsigned long long)snapshot_id,
                        ds4_session_pos(s->session),
                        (now_sec() - frontier_t0) * 1000.0);
         } else {
-            free(s->gpu_frontier_text);
-            s->gpu_frontier_text = NULL;
-            s->gpu_frontier_text_len = 0;
             server_log(DS4_LOG_WARNING,
                        "ds4-server: GPU prompt frontier unavailable tokens=%d error=\"%s\"",
                        ds4_session_pos(s->session), frontier_err);
@@ -12104,7 +12162,9 @@ static void server_close_resources(server *s) {
     live_tool_state_free(&s->responses_live);
     live_tool_state_free(&s->anthropic_live);
     visible_live_free(&s->thinking_live);
-    free(s->gpu_frontier_text);
+    for (uint32_t i = 0; i < DS4_SERVER_GPU_FRONTIER_SLOTS; i++) {
+        free(s->gpu_frontier[i].text);
+    }
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
     pthread_cond_destroy(&s->clients_cv);
@@ -16671,6 +16731,36 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
+static void test_gpu_frontier_text_ring_evicts_oldest(void) {
+    server s = {0};
+    gpu_frontier_store_text(&s, 1, 10, "a");
+    gpu_frontier_store_text(&s, 2, 20, "bb");
+    gpu_frontier_store_text(&s, 3, 30, "ccc");
+    gpu_frontier_store_text(&s, 4, 40, "dddd");
+    gpu_frontier_store_text(&s, 5, 50, "eeeee");
+
+    bool seen[7] = {0};
+    for (uint32_t i = 0; i < DS4_SERVER_GPU_FRONTIER_SLOTS; i++) {
+        TEST_ASSERT(s.gpu_frontier[i].snapshot_id >= 2);
+        TEST_ASSERT(s.gpu_frontier[i].snapshot_id <= 5);
+        seen[s.gpu_frontier[i].snapshot_id] = true;
+    }
+    TEST_ASSERT(!seen[1] && seen[2] && seen[3] && seen[4] && seen[5]);
+
+    gpu_frontier_store_text(&s, 6, 30, "ccc");
+    int matches = 0;
+    for (uint32_t i = 0; i < DS4_SERVER_GPU_FRONTIER_SLOTS; i++) {
+        gpu_frontier_text_entry *e = &s.gpu_frontier[i];
+        if (e->tokens == 30) {
+            matches++;
+            TEST_ASSERT(e->snapshot_id == 6);
+            TEST_ASSERT(!strcmp(e->text, "ccc"));
+        }
+        free(e->text);
+    }
+    TEST_ASSERT(matches == 1);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_request_defaults_use_min_p_filtering();
     test_thinking_sampling_respects_explicit_client_values();
@@ -16742,6 +16832,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
+    test_gpu_frontier_text_ring_evicts_oldest();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();
     test_stop_list_parses_all_sequences();

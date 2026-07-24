@@ -243,6 +243,24 @@ Start the optional Q4 profile:
 cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q4 ./run-dspark-server.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-q4.log
 ```
 
+Start the experimental 1M-context profile with the default Q2 sidecar:
+
+```bash
+cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && ./run-dspark-server-1m.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-1m.log
+```
+
+The 1M launcher fixes the physical context at 1048576 tokens, advertises 85%,
+uses a 4096-token prefill chunk and keeps checkpoints in an isolated KV
+directory. Stop any active `ds4-server` first. Do not raise the 1M chunk to
+8192 on the measured GB10 setup: that combination exceeded the available
+unified-memory budget.
+
+To run the 1M profile with Q4 instead:
+
+```bash
+cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q4 ./run-dspark-server-1m.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-q4-1m.log
+```
+
 The server listens on `http://0.0.0.0:30007` and exposes OpenAI-compatible,
 Responses and Anthropic-compatible APIs.
 
@@ -289,19 +307,6 @@ With the default completion budget, the server advertises about 222k total
 context and about 220k input tokens.  The remaining physical context is kept as
 a safety margin for generation and for clients such as Claude Code to trigger
 their own compaction before DS4 reaches the hard 256k limit.
-
-An experimental capacity-first launcher is also included for a 1M physical
-context. It uses a 4096-token chunk, an isolated disk-KV directory and the same
-85% advertised guard:
-
-```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && ./run-dspark-server-1m.sh 2>&1 | tee /tmp/ds4-1m.log
-```
-
-The 1M profile is not the default throughput configuration. Do not raise its
-chunk to 8192 on the measured GB10 setup: that combination exceeded the
-available unified-memory budget. See `README-GB10.md` for the measured memory
-limits and rollback procedure.
 
 The detailed lab notes, memory accounting and longer A/B history live in
 `README-GB10.md`.

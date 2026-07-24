@@ -3,16 +3,17 @@
 # Copyright (c) 2026 Marco Palaferri. Licensed under the MIT License.
 set -euo pipefail
 
-HF_DIR="${DS4_DSPARK_HF_DIR:-/home/athena/ds4/dspark-v4flash-hf}"
-VARIANT="${DS4_DSPARK_VARIANT:-q4}"
+MODEL_DIR="${DS4_MODEL_DIR:-$HOME/ds4}"
+HF_DIR="${DS4_DSPARK_HF_DIR:-$MODEL_DIR/dspark-v4flash-hf}"
+VARIANT="${DS4_DSPARK_VARIANT:-q2}"
 case "$VARIANT" in
   q4)
-    DEFAULT_OUT="/home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf"
+    DEFAULT_OUT="$MODEL_DIR/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf"
     EXPECTED_SIZE="about 10.7 GiB"
     QUANT_ARGS=()
     ;;
   q2)
-    DEFAULT_OUT="/home/athena/ds4/DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf"
+    DEFAULT_OUT="$MODEL_DIR/DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf"
     EXPECTED_SIZE="about 5.6 GiB"
     QUANT_ARGS=(
       --routed-w1 iq2_xxs

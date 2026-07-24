@@ -3,14 +3,15 @@
 # Copyright (c) 2026 Marco Palaferri. Licensed under the MIT License.
 set -euo pipefail
 
-MODEL="${DS4_MODEL:-/home/athena/ds4/ds4flash.gguf}"
-DSPARK_VARIANT="${DS4_DSPARK_VARIANT:-q4}"
+MODEL_DIR="${DS4_MODEL_DIR:-$HOME/ds4}"
+MODEL="${DS4_MODEL:-$MODEL_DIR/ds4flash.gguf}"
+DSPARK_VARIANT="${DS4_DSPARK_VARIANT:-q2}"
 case "$DSPARK_VARIANT" in
   q4)
-    DSPARK_DEFAULT="/home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf"
+    DSPARK_DEFAULT="$MODEL_DIR/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf"
     ;;
   q2)
-    DSPARK_DEFAULT="/home/athena/ds4/DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf"
+    DSPARK_DEFAULT="$MODEL_DIR/DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf"
     ;;
   *)
     echo "Invalid DS4_DSPARK_VARIANT: $DSPARK_VARIANT (expected q4 or q2)" >&2

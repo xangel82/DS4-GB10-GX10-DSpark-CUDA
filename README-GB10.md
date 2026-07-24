@@ -10,13 +10,13 @@ successive conservano la cronologia tecnica, comprese prove scartate e rollback.
 
 ## Sidecar DSpark Q2 compatto promosso - 24 luglio 2026
 
-Il launcher e il builder supportano ora due sidecar DSpark. Il Q4 rimane il
-default conservativo; il Q2 e' un profilo `memory-first` selezionabile:
+Il launcher e il builder supportano ora due sidecar DSpark. Il Q2 e' il
+default `memory-first`; il Q4 resta disponibile come profilo conservativo:
 
 | Variante | Routed gate/up | Routed down | Dimensione | Uso consigliato |
 | --- | --- | --- | ---: | --- |
-| `q4` | Q4_K | Q4_K | circa 10,70 GiB | default, acceptance piu' prevedibile |
-| `q2` | IQ2_XXS | Q2_K | circa 5,64 GiB | recupero di circa 5,06 GiB UMA |
+| `q2` | IQ2_XXS | Q2_K | circa 5,64 GiB | default, recupero di circa 5,06 GiB UMA |
+| `q4` | Q4_K | Q4_K | circa 10,70 GiB | confronto conservativo opzionale |
 
 Il Q2 conserva Q8 per attention, shared expert e proiezioni dense. Se non viene
 fornita una imatrix DSpark, il quantizer usa la sua importance sintetica
@@ -39,11 +39,37 @@ cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q4 ./build-dspark-sidecar.s
 cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q2 ./build-dspark-sidecar.sh
 ```
 
+La costruzione Q2 va eseguita su Athena. Richiede in
+`/home/athena/ds4/dspark-v4flash-hf` l'indice Safetensors e i tre shard che
+contengono il drafter DSpark:
+
+```text
+model.safetensors.index.json
+model-00046-of-00048.safetensors
+model-00047-of-00048.safetensors
+model-00048-of-00048.safetensors
+```
+
+Il comando completo compila il quantizer nativo e scrive direttamente il
+sidecar promosso nella directory modelli di Athena:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q2 DS4_DSPARK_HF_DIR=/home/athena/ds4/dspark-v4flash-hf DS4_DSPARK_GGUF=/home/athena/ds4/DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf ./build-dspark-sidecar.sh 2>&1 | tee /tmp/ds4-dspark-q2-convert.log
+```
+
+Il builder conserva Q8 per i tensori densi e applica `IQ2_XXS` a routed
+gate/up e `Q2_K` a routed down. La Q2 validata usa l'importance sintetica
+deterministica del quantizer; non richiede una imatrix esterna. Al termine:
+
+```bash
+ls -lh /home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf /home/athena/ds4/DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf
+```
+
 Avvio:
 
 ```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && ./run-dspark-server.sh
 cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q4 ./run-dspark-server.sh
-cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q2 ./run-dspark-server.sh
 ```
 
 `DS4_DSPARK_MODEL=/percorso/custom.gguf` continua ad avere priorita' sul
@@ -820,6 +846,20 @@ Verifica minima:
 
 ## Avvio rapido
 
+### Installazione automatica
+
+Su una macchina nuova, lo script seguente scarica il target Q2/imatrix in
+`/home/athena/ds4`, scarica gli shard ufficiali DSpark, costruisce entrambi i
+sidecar Q4 e Q2, esegue `cuda-regression` e compila il server:
+
+```bash
+cd /home/athena && git clone https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA.git && cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && ./install-gb10.sh --install-deps --dspark both
+```
+
+Per costruire una sola variante usare `--dspark q4` oppure `--dspark q2`.
+Download e GGUF gia' completi vengono riutilizzati; `--force-sidecar` forza
+soltanto la rigenerazione dei sidecar.
+
 ### 1. Checkout
 
 Nuova installazione:
@@ -843,13 +883,13 @@ Il launcher predefinito richiede:
 
 ```text
 /home/athena/ds4/ds4flash.gguf
-/home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf
+/home/athena/ds4/DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf
 ```
 
-La variante compatta opzionale usa:
+La variante Q4 opzionale usa:
 
 ```text
-/home/athena/ds4/DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf
+/home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf
 ```
 
 Il target Q2/imatrix può essere scaricato con:
@@ -874,8 +914,10 @@ cd ~/DS4-GB10-GX10-DSpark-CUDA && ./build-dspark-sidecar.sh 2>&1 | tee /tmp/ds4-
 
 Percorsi differenti possono essere passati con `DS4_MODEL`,
 `DS4_DSPARK_MODEL`, `DS4_DSPARK_HF_DIR` e `DS4_DSPARK_GGUF`. Per costruire e
-usare il sidecar compatto impostare `DS4_DSPARK_VARIANT=q2`; il valore
-predefinito e' `q4`.
+usare il sidecar compatto non serve alcun override: il valore predefinito e'
+`q2`. Per selezionare Q4 impostare
+`DS4_DSPARK_VARIANT=q4`. Entrambi i percorsi predefiniti sono sotto
+`/home/athena/ds4`.
 
 ### 3. Regressione CUDA obbligatoria
 

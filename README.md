@@ -1,347 +1,276 @@
 # DS4 GB10/GX10 DSpark CUDA
 
-This repository is an experimental GB10/GX10-oriented fork of Salvatore
-Sanfilippo's `antirez/ds4` project:
+Run DeepSeek-V4-Flash with lossless DSpark speculative decoding on one NVIDIA
+GB10/GX10. This fork of [antirez/ds4](https://github.com/antirez/ds4) is tuned
+for long-context coding and agent workloads, with exact sparse attention,
+GPU-side verification and reproducible GB10 benchmarks.
 
-```text
-https://github.com/antirez/ds4
+Repository:
+[xangel82/DS4-GB10-GX10-DSpark-CUDA](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA)
+
+## Results at a glance
+
+Measured on Athena, a single NVIDIA GB10, using the recommended
+DeepSeek-V4-Flash Q2/imatrix target:
+
+| Workload | Measured result |
+| --- | ---: |
+| Short and medium prefill | 900-953 t/s average |
+| Best complete 8192-token chunk | 1009.78 t/s |
+| Long append, 27.7k to 95.1k context | 913.15 t/s |
+| Deep append, 127.8k to 180.8k context | 836.16 t/s |
+| DSpark tool-call decode | commonly 24-26 t/s |
+| Clean mixed coding session with compact Q2 sidecar | 20.88 t/s weighted |
+| Physical context enabled by default | 262144 tokens |
+| Experimental physical context | 1M tokens |
+
+The original CUDA path measured about 13 decode t/s on the same machine.
+Decode varies with prompt, sampling and DSpark acceptance. Prefill averages are
+also affected by short final chunks, so the table reports both request-level
+results and the best complete chunk.
+
+## What this fork delivers
+
+- Lossless DSpark speculative decoding with GPU-side p/q rejection sampling.
+- Exact Top-512 compressed sparse attention with Blackwell SM121a kernels.
+- Routed-MoE D2R/MMQ prefill for IQ2_XXS gate/up and Q2_K down weights.
+- Token-tile HMMA attention and native MXFP4 indexer scoring.
+- Stable long-context prefill beyond the earlier 131k fast-path boundary.
+- Canonical KV checkpoints for append-only chat and tool-call workloads.
+- Pipelined model upload and release of copied GGUF pages.
+- A 256k physical context with an 85% client-visible safety guard.
+- OpenAI, Responses and Anthropic-compatible HTTP endpoints.
+- Reproducible CUDA regressions, benchmark scripts and Nsight instrumentation.
+
+The target model remains authoritative. DSpark drafts are accepted with
+`min(1, p(x) / q(x))`; rejected drafts are replaced from the positive residual
+`max(p-q, 0)`. This preserves the target sampling distribution rather than
+using a lossy exact-match shortcut.
+
+## Choose the DSpark sidecar
+
+The target model is identical in both profiles. Only the three-block DSpark
+drafter changes:
+
+| Variant | Routed experts | Size | Best for |
+| --- | --- | ---: | --- |
+| `q2` | IQ2_XXS gate/up, Q2_K down | about 5.64 GiB | Recommended default, about 5.06 GiB more UMA headroom |
+| `q4` | Q4_K gate/up/down | about 10.70 GiB | Optional conservative profile for acceptance comparisons |
+
+The validated compact Q2 run completed 15 direct requests, generated 7866
+tokens and averaged 20.88 decode t/s. Tool-call turns reached 24-26 t/s and a
+3311-token final analysis ran at 17.40 t/s. Its output passed manual coherence
+and completeness review. Q2 makes the drafter faster, about 15.28 ms in that
+run, but acceptance remains workload-dependent; Q4 therefore stays the
+comparison profile while Q2 is the installation default.
+
+The default launcher selects Q2:
+
+```bash
+./run-dspark-server.sh
 ```
 
-Fork repository:
+Select Q4 without replacing the Q2 file:
 
-```text
-https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA
+```bash
+DS4_DSPARK_VARIANT=q4 ./run-dspark-server.sh
 ```
 
-This checkout contains a GB10-oriented DS4 runtime for DeepSeek-V4-Flash with a
-DSpark sidecar.  The goal is single-machine inference on NVIDIA GB10 with
-speculative decoding enabled, preserving target-model sampling semantics.
+## Performance progress
 
-## Why this fork exists
+The major measured milestones on the same GB10 were:
 
-This fork documents a practical optimization effort on NVIDIA GB10/GX10 for
-DeepSeek-V4-Flash local inference.  The work focused on measuring real
-bottlenecks, implementing CUDA-side speculative decoding paths, and validating
-performance with reproducible logs, scripts and analyzer tools.
+| Milestone | Prefill | Decode |
+| --- | ---: | ---: |
+| Original CUDA path | - | about 13 t/s |
+| Raw-GGUF routed-MoE MMQ | 404.46 t/s | 23.00 t/s at 83k |
+| Token-tile HMMA attention | 509.14 t/s | unchanged |
+| Fused HC/RMS/RoPE/MoE pipeline | 902-953 t/s | commonly 23-26 t/s on tool turns |
+| Direct-F16 sparse attention beyond 131k | 836.16 t/s at 127.8k-180.8k | 19.89 t/s after 180.8k |
 
-The goal is not to be a generic inference framework.  It is a focused
-engineering branch for one concrete target: making DeepSeek-V4-Flash run faster
-on a single GB10/GX10 machine without changing the target model distribution.
+The HMMA transition improved a position-matched 57,344-token interval by
+25.88%. The direct-F16 capacity fix improved the measured deep append by
+33.80% and removed the artificial performance cliff beyond 131k without
+adding a score matrix or persistent F32 KV mirror.
 
-## Engineering highlights
-
-- Implemented DSpark sidecar loading and GGUF conversion support.
-- Added true p/q speculative rejection sampling for DSpark drafts.
-- Moved verifier-side p/q acceptance logic to CUDA.
-- Added DSpark-specific CUDA Graph variants for drafter and verifier paths.
-- Added GB10-oriented Tensor Core tiny-batch experiments.
-- Added Q8 tiny-batch reuse and Q8/F16 hot-cache launch profiles.
-- Added raw-GGUF routed-MoE MMQ prefill with paired IQ2_XXS gate/up, Q2_K
-  down projection and a token-bounded stream-K schedule.
-- Added token-tile HMMA attention for exact Top-K indexed and dense raw/mixed
-  prefill batches, structurally excluding decode and the DSpark verifier.
-- Fused wide-prefill HC expansion, RMS, inverse RoPE packing and routed-MoE
-  reduction epilogues while preserving the canonical FP32 state and reusing
-  existing scratch buffers.
-- Added a compact 68-byte MXFP4 indexer cache and native SM121a block-scaled
-  scoring, using token tiles for prefill and head tiles for 1-6 row verifier
-  batches.
-- Added exact Radix Top-512 for large prefill batches, an exact parallel
-  4096-column chunk tree for small batches and exact one-row GVR dispatch.
-- Added byte-neutral in-place SoA replacement for target routed-MoE weights,
-  with a numerically equivalent Q8_K small-batch path for decode/verification
-  and D2R/MMQ tiers for large prefill batches.
-- Stored FP8-rounded compressed attention KV directly as F16 and consumed it
-  from the stage-32 token-tile path without a persistent F32 duplicate.
-- Extended the direct-F16 FlashMLA-style indexed attention path to the actual
-  compressed-KV tensor capacity, removing the artificial 131k fast-path cliff
-  without adding a score matrix, mirror or persistent scratch.
-- Added reproducible cold/append GB10 sweeps with DSpark decode, process-memory
-  high-water marks and deterministic token hashes. The complete path has been
-  validated end to end on Athena through 180.8k context.
-- Added pipelined direct-I/O model upload and release of copied GGUF source
-  pages to reduce startup time and host page residency.
-- Added long-prefix KV reuse so repeated tool turns can prefill only the
-  appended suffix when the canonical token prefix still matches.
-- Added a client-visible context guard so frontends compact before the physical
-  DS4 context is exhausted.
-- Added reproducible run scripts, benchmark analyzers and release-oriented
-  installation notes.
-
-## What changed
-
-- DSpark sidecar support for `DeepSeek-V4-Flash-DSpark`.
-- Lossless speculative rejection sampling: drafts are sampled from `q`, target
-  rows define `p`, acceptance is `min(1, p(x) / q(x))`, and rejected drafts are
-  replaced from the positive residual `max(p-q, 0)`.
-- GPU-side p/q verification: target logits, draft probabilities, acceptance
-  uniforms and residual uniforms stay on CUDA; the host reads only compact
-  verifier results and the continuation logits row.
-- DSpark-specific CUDA Graph families for drafter and verifier K variants.
-- GB10 launch profile with:
-  - copied target model in device memory;
-  - 12 GiB Q8->F16 hot cache;
-  - Q8 tiny-batch reuse;
-  - DSpark Tensor Core tiny-batch path enabled by default;
-  - always-on DSpark drafting for a single active GB10 decode stream;
-  - `balanced` memory profile, 8192-token prefill chunks and copied sidecar;
-  - 256k physical context with an 85% advertised context guard;
-  - 16 GiB default disk budget for persisted KV checkpoints.
-- Append-prefill optimization for long chats: canonical KV checkpoints are
-  retained near long stable prompt boundaries, so subsequent requests with the
-  same exact prefix can resume from disk and process only the new tail. On tool
-  canonicalization mismatches, eviction now protects the longest checkpoint
-  reusable by the incoming prompt instead of falling back to an older anchor.
-  Direct post-tool RAM continuation remains a follow-up in `README-GB10.md`.
-- `/v1/models` now advertises both `context_length` and `max_input_tokens`;
-  `max_input_tokens` reserves the configured completion budget so clients can
-  compact before generation runs into the physical context ceiling.
-
-The current default allocates a 256k physical context and advertises 85% of it.
-A real long-chat run sustained 913.15 prefill token/s from 27.7k to 95.1k,
-859.77 token/s from 95.1k to 125.3k, and 836.16 token/s from 127.8k to 180.8k.
-Before the dynamic direct-F16 capacity fix, the first chunk beyond 131k fell
-from about 860 to 648 token/s and the 147.2k to 207.1k append averaged 624.92
-token/s. The updated path kept its six complete post-threshold chunks between
-858.48 and 828.20 token/s, removing that artificial cliff without allocating
-additional buffers. DSpark decode after the 180.8k prefill measured 19.89
-token/s over 290 generated tokens. Exact decode numbers vary with prompt,
-sampling, draft acceptance and chunk-boundary tails.
-
-## Measured GB10 results
-
-These numbers are from the development machine used for this fork: one NVIDIA
-GB10 running `DeepSeek-V4-Flash` plus the `DeepSeek-V4-Flash-DSpark` sidecar.
-They are useful as a sanity check, not as a guaranteed benchmark.
-
-| Profile | Result | Notes |
-| --- | ---: | --- |
-| Original CUDA path, before the GB10 work | ~13 t/s | Starting point observed during the first Athena runs. |
-| CUDA Graph + fused compressor + Q8/F16 cache path | ~14.5-14.7 t/s | Stable non-speculative baseline. |
-| MTP sidecar experiments | ~15.1 t/s | Worked, but verifier cost limited the gain. |
-| DSpark exact-match verifier, early versions | ~13-14.5 t/s | Too many fallback/bypass cycles; not the final algorithm. |
-| DSpark p/q rejection sampling, always drafting | ~16.8-17.6 t/s | First correct speculative sampling path with consistent gain. |
-| DSpark p/q rejection + GPU verifier + Tensor Core tiny batches | ~18.2 t/s weighted decode | Earlier release milestone; chunks reached about 19 t/s. |
-| Raw-GGUF MMQ MoE + token-bounded stream-K | 404.46 t/s prefill | Weighted baseline over `ctx=24576..81920`; decode remained 23.00 t/s at 83k. |
-| Token-tile HMMA indexed + raw/mixed attention | 509.14 t/s prefill | Same 57,344-token interval, **+25.88%**; full 61,214-token request averaged 496.57 t/s. |
-| Pre-epilogue pipeline, cold 13.6k prompt | 787.06 t/s prefill | Historical same-machine baseline; first 8192-token chunk reached 854.26 t/s. |
-| Fused epilogue pipeline, cold 25.3k prompt | 902.67 t/s prefill | Three complete chunks measured 835.81, 991.09 and 977.94 t/s; the 776-token tail reduced the request average. |
-| Fused epilogue pipeline, cold 13.4k prompt | 952.97 t/s prefill | First 8192-token chunk reached 1009.78 t/s; the next 4096-token chunk reached 952.66 t/s. |
-| Fused epilogue pipeline, append 57.8k -> 78.2k | 730.56 t/s prefill | 20,397 appended tokens; the central 8192-token chunk reached 898.45 t/s. |
-| Fused epilogue pipeline, append 77.2k -> 90.5k | 760.77 t/s prefill | 13,348 appended tokens; the complete central chunk reached 891.13 t/s. |
-| Current DSpark decode at 90.5k / 93.5k | 24.00 / 23.46 t/s | Measured over 284 and 222 generated tokens respectively; tool-call generation and canonical KV reuse remained active. |
-| 256k profile, append 27.7k -> 95.1k | 913.15 t/s prefill | 67,316 appended tokens; complete chunks declined gradually from 940.58 to 896.36 t/s. |
-| 256k profile, old path beyond 131k | 624.92 t/s prefill | 59,856 appended tokens from 147.2k to 207.1k; complete chunks measured about 641 to 618 t/s after the fast-path cutoff. |
-| 256k profile, dynamic direct-F16 beyond 131k | 836.16 t/s prefill | 53,017 appended tokens from 127.8k to 180.8k, **+33.80%** versus the earlier deep append; complete post-threshold chunks measured 858.48 to 828.20 t/s. |
-| DSpark decode after 180.8k prefill | 19.89 t/s | 290 generated tokens in the same operational run; no CUDA error, OOM or attention fallback. |
-
-Representative earlier DSpark analyzer output (kept as scheduler history):
-
-```text
-Fused verifier cycles:     1029
-Ordinary/fallback cycles:  0
-P/Q rejection cycles:      1029
-Verifier acceptance:       53.18%
-Mean verifier target rows: 4.956
-Mean verifier draft time:  20.572 ms
-Mean verifier target time: 148.339 ms
-Mean fused cycle:          168.911 ms
-Verifier-cycle throughput: 18.376 t/s
-Weighted request decode:   18.274 t/s
-```
-
-The important qualitative result is not only the raw t/s number: the final path
-uses true speculative rejection sampling, so accepted drafts preserve the target
-model sampling distribution instead of using a lossy exact-match shortcut.
-
-The earlier 509.14 t/s prefill comparison was position matched. Across its seven complete
-8192-token chunks, every chunk improved by 23.25-26.52%; elapsed time for the
-57,344-token interval fell from 141.78 to 112.63 seconds. The primary 80.76 GiB
-model upload completed in 19.076 seconds at 4.23 GiB/s; the separate 10.70 GiB
-sidecar copy took 69.999 seconds in that run. The newer figures above include
-the MXFP4 scorer, exact shape-specific Top-K dispatch, FlashMLA-style exact
-sparse attention and fused HC/RMS/RoPE/MoE epilogues. Large batches use the
-prefill tiers, while decode and speculative verification remain on the Q8_K
-small-batch path. The CUDA regression permits at most one F16 ULP between the
-materialized and fused epilogues and rejects FP32 differences above `2e-6`.
+Detailed profiler reports, rejected experiments, numerical tolerances and
+rollback history are maintained in [README-GB10.md](README-GB10.md).
 
 ## Install on GB10/GX10
 
-Choose a stable checkout path.  The examples below use the `athena` user and
-keep source code and model files under `/home/athena`, not under `/tmp`.
+The commands below assume a GB10/GX10 Linux host with CUDA installed at
+`/usr/local/cuda`. They use the `athena` account and keep persistent files out
+of `/tmp`.
+
+Requirements:
+
+- one NVIDIA GB10/GX10 with 128 GB unified memory;
+- a CUDA 13 toolchain capable of compiling `sm_121a`;
+- enough disk space for the 80.76 GiB target, one or both DSpark sidecars,
+  the temporary Hugging Face shards and the configured KV disk cache;
+- Linux build tools, Git, Python 3, `wget`, `curl` and `rsync`.
 
 Recommended layout:
 
 ```text
 /home/athena/DS4-GB10-GX10-DSpark-CUDA   # source checkout
-/home/athena/ds4                         # model files and logs
+/home/athena/ds4                         # target, sidecars and logs
 /tmp/ds4-gb10-dspark-kv                  # disposable KV disk cache, default 16 GiB budget
 ```
 
-### 1. Clone and compile
+### Automatic installation
+
+For a fresh machine, clone the repository and let the installer download the
+target, fetch the official DSpark shards, build both sidecars, run the CUDA
+regression and compile the server:
 
 ```bash
-cd /home/athena
-git clone https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA.git
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA
+cd /home/athena && git clone https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA.git && cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && ./install-gb10.sh --install-deps --dspark both
 ```
 
-Install/build dependencies expected by this fork:
+To save disk and conversion time, build only the desired sidecar:
 
 ```bash
-sudo apt update
-sudo apt install -y build-essential git curl wget rsync python3
+./install-gb10.sh --install-deps --dspark q4
+./install-gb10.sh --install-deps --dspark q2
 ```
 
-CUDA must already be installed and visible at `/usr/local/cuda`. Verify the
-native GB10 toolchain, run the CUDA regression, then build the server:
+Downloads are resumable and existing GGUF files are reused. Run with
+`--force-sidecar` only when an existing sidecar must be regenerated. The
+installer stops before the CUDA regression if another `ds4-server` process is
+active, protecting unified-memory headroom.
+
+Preview paths and planned work without downloading:
+
+```bash
+./install-gb10.sh --dspark both --dry-run
+```
+
+The following sections show the same procedure step by step.
+
+### 1. Install tools and clone
+
+```bash
+sudo apt update && sudo apt install -y build-essential git curl wget rsync python3
+cd /home/athena && git clone https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA.git
+```
+
+For an existing clean checkout:
+
+```bash
+cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && git fetch origin && git pull --ff-only origin main
+```
+
+### 2. Download the target model
+
+Create the persistent model directory and download the recommended
+DeepSeek-V4-Flash Q2/imatrix target:
+
+```bash
+mkdir -p /home/athena/ds4 && cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && DS4_GGUF_DIR=/home/athena/ds4 ./download_model.sh q2-imatrix
+ln -sfn /home/athena/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf /home/athena/ds4/ds4flash.gguf
+```
+
+To use another compatible target, point `DS4_MODEL` to its GGUF instead of
+creating the symlink.
+
+### 3. Download the DSpark source shards
+
+Only the index and the three shards containing the official
+DeepSeek-V4-Flash-DSpark module are required:
+
+```bash
+mkdir -p /home/athena/ds4/dspark-v4flash-hf && cd /home/athena/ds4/dspark-v4flash-hf && for f in config.json model.safetensors.index.json model-00046-of-00048.safetensors model-00047-of-00048.safetensors model-00048-of-00048.safetensors; do wget -c "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark/resolve/main/$f" || exit 1; done
+```
+
+### 4. Build a sidecar
+
+Build the optional Q4 sidecar:
+
+```bash
+cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q4 ./build-dspark-sidecar.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-q4-convert.log
+```
+
+Build the recommended Q2 sidecar:
+
+```bash
+cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q2 ./build-dspark-sidecar.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-q2-convert.log
+```
+
+You can build both and choose at startup. The outputs are:
+
+```text
+/home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf
+/home/athena/ds4/DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf
+```
+
+Confirm their sizes:
+
+```bash
+ls -lh /home/athena/ds4/DeepSeek-V4-Flash-DSpark-*.gguf
+```
+
+The Q2 build uses the quantizer's deterministic synthetic importance fallback;
+no separate DSpark imatrix is required. Custom source and output paths can be
+set with `DS4_DSPARK_HF_DIR` and `DS4_DSPARK_GGUF`.
+
+### 5. Validate and compile
+
+Stop any running DS4 process first when memory is close to the GB10 limit.
+Then run the required numerical regression and build:
 
 ```bash
 cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && /usr/local/cuda/bin/nvcc --version && make -B cuda-regression CUDA_ARCH=sm_121a && make -B cuda-spark-graph-sm121
 ```
 
-The regression must end with `cuda long-context regression: OK`. It validates
-large Radix Top-K, the exact small-batch chunk tree and GVR dispatch, packed
-MXFP4 scoring, aligned-SoA D2R and Q8_K MoE parity, both attention variants,
-and the fused HC/RMS/RoPE/MoE prefill epilogues. Stop an already running server
-first if memory is close to the GB10 limit.
-
-### 2. Prepare model directory
-
-The release launcher expects this model directory by default:
-
-```bash
-mkdir -p /home/athena/ds4
-```
-
-The two model files expected by the default launcher are:
+The regression must end with:
 
 ```text
-/home/athena/ds4/ds4flash.gguf
-/home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf
+cuda long-context regression: OK
 ```
 
-The recommended Q2/imatrix target can be downloaded with the repository
-helper:
+### 6. Start the server
+
+Start the default Q2 profile on port `30007`:
 
 ```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && DS4_GGUF_DIR=/home/athena/ds4 ./download_model.sh q2-imatrix && ln -sfn /home/athena/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf /home/athena/ds4/ds4flash.gguf
+cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && ./run-dspark-server.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-q2.log
 ```
 
-Alternatively, copy or build a compatible DeepSeek-V4-Flash GGUF as:
-
-```text
-/home/athena/ds4/ds4flash.gguf
-```
-
-If your main model has a different name or path, either rename/symlink it to
-`/home/athena/ds4/ds4flash.gguf`, or launch with:
+Start the optional Q4 profile:
 
 ```bash
-DS4_MODEL=/path/to/your/main-model.gguf ./run-dspark-server.sh
+cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q4 ./run-dspark-server.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-q4.log
 ```
 
-### 3. Download and build the DSpark sidecar
+The server listens on `http://0.0.0.0:30007` and exposes OpenAI-compatible,
+Responses and Anthropic-compatible APIs.
 
-The DSpark sidecar is much smaller than the main model.  For a first install,
-download only the DSpark module files used by DeepSeek's
-`DeepSeek-V4-Flash-DSpark` repository:
+### 7. Verify and measure
 
 ```bash
-mkdir -p /home/athena/ds4/dspark-v4flash-hf
-cd /home/athena/ds4/dspark-v4flash-hf
-
-for f in \
-  config.json \
-  model.safetensors.index.json \
-  model-00046-of-00048.safetensors \
-  model-00047-of-00048.safetensors \
-  model-00048-of-00048.safetensors
-do
-  wget -c "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-DSpark/resolve/main/$f"
-done
+curl -fsS http://127.0.0.1:30007/v1/models
 ```
 
-Then convert those HF shards into the GGUF sidecar used by this fork:
+Minimal OpenAI-compatible request:
 
 ```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA
-./build-dspark-sidecar.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-convert.log
+curl -fsS http://127.0.0.1:30007/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"deepseek-chat","messages":[{"role":"user","content":"Explain speculative decoding in one sentence."}],"max_tokens":128}'
 ```
 
-The output should be:
+For DSpark timing and acceptance statistics, start with telemetry and analyze
+the resulting log:
 
 ```bash
-/home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf
-```
-
-An optional memory-first sidecar quantizes routed gate/up to IQ2_XXS and routed
-down to Q2_K while retaining the dense Q8 tensors:
-
-```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA
-DS4_DSPARK_VARIANT=q2 ./build-dspark-sidecar.sh
-```
-
-This produces
-`/home/athena/ds4/DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf` (about
-5.6 GiB instead of 10.7 GiB). Q4 remains the conservative default because Q2
-acceptance, and therefore decode throughput, varies with the generated text.
-
-After conversion, the temporary Hugging Face shard directory can be kept for
-future rebuilds or removed to save disk space:
-
-```bash
-du -sh /home/athena/ds4/dspark-v4flash-hf
-du -sh /home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf
-```
-
-Custom paths are supported:
-
-```bash
-DS4_DSPARK_HF_DIR=/path/to/hf-shards \
-DS4_DSPARK_GGUF=/path/to/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf \
-./build-dspark-sidecar.sh
-```
-
-### 4. Run the server
-
-Default release profile, port `30007`:
-
-```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA
-./run-dspark-server.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-release.log
-```
-
-Select the compact sidecar without changing the Q4 installation:
-
-```bash
-DS4_DSPARK_VARIANT=q2 ./run-dspark-server.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-q2.log
-```
-
-Telemetry profile for benchmarking:
-
-```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA
-DS4_TELEMETRY=1 ./run-dspark-server.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-release.log
-```
-
-Analyze:
-
-```bash
-cd /home/athena/DS4-GB10-GX10-DSpark-CUDA
-./analyze-dspark-log.sh /home/athena/ds4/ds4-dspark-release.log 1
-```
-
-Quick API check:
-
-```bash
-curl http://127.0.0.1:30007/v1/models
+cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_VARIANT=q2 DS4_TELEMETRY=1 ./run-dspark-server.sh 2>&1 | tee /home/athena/ds4/ds4-dspark-q2-telemetry.log
+cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && ./analyze-dspark-log.sh /home/athena/ds4/ds4-dspark-q2-telemetry.log
 ```
 
 Current GB10 release defaults in `run-dspark-server.sh`:
 
 ```text
+DS4_MODEL_DIR=$HOME/ds4
+DS4_DSPARK_VARIANT=q2
 DS4_CTX=262144
 DS4_ADVERTISE_CONTEXT_PCT=85
 DS4_MAX_TOKENS=2200
@@ -361,11 +290,6 @@ context and about 220k input tokens.  The remaining physical context is kept as
 a safety margin for generation and for clients such as Claude Code to trigger
 their own compaction before DS4 reaches the hard 256k limit.
 
-The long-anchor values intentionally scale from `DS4_CTX`: at 256k context they
-resolve to 131072 and 16384 tokens.  This preserves the append-prefill behavior
-when the physical context is changed for A/B tests, instead of hardcoding one
-specific checkpoint boundary.
-
 An experimental capacity-first launcher is also included for a 1M physical
 context. It uses a 4096-token chunk, an isolated disk-KV directory and the same
 85% advertised guard:
@@ -378,13 +302,6 @@ The 1M profile is not the default throughput configuration. Do not raise its
 chunk to 8192 on the measured GB10 setup: that combination exceeded the
 available unified-memory budget. See `README-GB10.md` for the measured memory
 limits and rollback procedure.
-
-To test a different guard or disk budget:
-
-```bash
-DS4_ADVERTISE_CONTEXT_PCT=95 ./run-dspark-server.sh
-DS4_KV_DISK_SPACE_MB=65536 ./run-dspark-server.sh
-```
 
 The detailed lab notes, memory accounting and longer A/B history live in
 `README-GB10.md`.

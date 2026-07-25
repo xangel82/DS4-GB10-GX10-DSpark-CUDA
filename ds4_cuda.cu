@@ -258,10 +258,11 @@ static void cuda_token_graph_release(void);
 
 /* Auxiliary speculative graphs must never replace the normal token graphs.
  * MTP uses two eight-slot families.  DSpark gets five verifier and five
- * drafter eight-slot families, one for each K, so an adaptive K change never
- * forces a graph topology rebuild. */
+ * drafter eight-slot families, one for each neural K.  HybridLC adds only the
+ * three selected long verifier widths (8, 12 and 16 rows), avoiding a family
+ * for every intermediate width. */
 enum {
-    DS4_CUDA_MTP_GRAPH_VARIANTS = 16 + 10 * 8,
+    DS4_CUDA_MTP_GRAPH_VARIANTS = 16 + 10 * 8 + 3 * 8,
     /* The DSpark verifier has two observed, recurring graph topologies for a
      * single logical K/position variant.  Retaining both prevents an
      * alternating cudaGraphExecUpdate failure from destroying and rebuilding
@@ -273,7 +274,8 @@ enum {
     DS4_CUDA_MTP_GRAPH_DRAFT_FAMILY = 2u,
     DS4_CUDA_DSPARK_GRAPH_K1_FAMILY = 4u,
     DS4_CUDA_DSPARK_DRAFT_GRAPH_K1_FAMILY = 128u,
-    DS4_CUDA_MTP_GRAPH_ALL_FAMILIES = 4095u
+    DS4_CUDA_DSPARK_HYBRID_GRAPH_N8_FAMILY = 4096u,
+    DS4_CUDA_MTP_GRAPH_ALL_FAMILIES = 32767u
 };
 static cudaGraphExec_t
     g_mtp_graph_exec[DS4_CUDA_MTP_GRAPH_VARIANTS]
@@ -302,7 +304,7 @@ static uint32_t cuda_mtp_graph_topology_slots(uint32_t variant) {
     /* Only DSpark verifier variants 16..55 exhibited the alternating
      * topology.  MTP and DSpark drafter graphs retain their original single
      * slot, keeping the extra graph memory tightly scoped. */
-    return variant >= 16u && variant < 56u &&
+    return ((variant >= 16u && variant < 56u) || variant >= 96u) &&
            getenv("DS4_CUDA_DSPARK_GRAPH_TOPOLOGY_CACHE_DISABLE") == NULL
         ? DS4_CUDA_MTP_GRAPH_TOPOLOGY_SLOTS
         : 1u;
@@ -314,8 +316,12 @@ static uint32_t cuda_mtp_graph_family_bit(uint32_t variant) {
         const uint32_t k = (variant - 16u) / 8u;
         return DS4_CUDA_DSPARK_GRAPH_K1_FAMILY << k;
     }
-    const uint32_t k = (variant - 56u) / 8u;
-    return DS4_CUDA_DSPARK_DRAFT_GRAPH_K1_FAMILY << k;
+    if (variant < 96u) {
+        const uint32_t k = (variant - 56u) / 8u;
+        return DS4_CUDA_DSPARK_DRAFT_GRAPH_K1_FAMILY << k;
+    }
+    const uint32_t width = (variant - 96u) / 8u;
+    return DS4_CUDA_DSPARK_HYBRID_GRAPH_N8_FAMILY << width;
 }
 static const char *cuda_mtp_graph_family_name(uint32_t variant) {
     if (variant < 8u) return "mtp-verifier";
@@ -330,12 +336,19 @@ static const char *cuda_mtp_graph_family_name(uint32_t variant) {
         "dspark-drafter-k3", "dspark-drafter-k4",
         "dspark-drafter-k5"
     };
+    static const char *hybrid_names[3] = {
+        "dspark-hybrid-n8", "dspark-hybrid-n12", "dspark-hybrid-n16"
+    };
     if (variant < 56u) {
         uint32_t k = (variant - 16u) / 8u;
         return verify_names[k < 5u ? k : 0u];
     }
-    uint32_t k = (variant - 56u) / 8u;
-    return draft_names[k < 5u ? k : 0u];
+    if (variant < 96u) {
+        uint32_t k = (variant - 56u) / 8u;
+        return draft_names[k < 5u ? k : 0u];
+    }
+    uint32_t width = (variant - 96u) / 8u;
+    return hybrid_names[width < 3u ? width : 0u];
 }
 static void cuda_nsys_capture_stop(const char *reason);
 static void cuda_nsys_prefill_capture_stop(const char *reason);
@@ -3963,9 +3976,20 @@ extern "C" int ds4_gpu_dspark_graph_begin(uint32_t n_tokens,
                                             uint32_t pos) {
     /* Official DSpark verifies the pending current token together with K
      * drafts.  The five graph families therefore represent row counts 2..6. */
-    if (n_tokens < 2u || n_tokens > 6u) return 0;
-    const uint32_t variant = 16u + (n_tokens - 2u) * 8u +
-                             (position_variant & 7u);
+    if (n_tokens < 2u || n_tokens > 16u) return 0;
+    uint32_t family_base = 0;
+    if (n_tokens <= 6u) {
+        family_base = 16u + (n_tokens - 2u) * 8u;
+    } else if (n_tokens == 8u) {
+        family_base = 96u;
+    } else if (n_tokens == 12u) {
+        family_base = 104u;
+    } else if (n_tokens == 16u) {
+        family_base = 112u;
+    } else {
+        return 0;
+    }
+    const uint32_t variant = family_base + (position_variant & 7u);
     return cuda_aux_graph_begin(variant, pos, "DS4_CUDA_DSPARK_GRAPH");
 }
 
@@ -4188,7 +4212,8 @@ extern "C" int ds4_gpu_mtp_graph_end(void) {
         g_mtp_graph_draft_launches++;
     } else if (family == DS4_CUDA_MTP_GRAPH_VERIFY_FAMILY) {
         g_mtp_graph_verifier_launches++;
-    } else if (family >= DS4_CUDA_DSPARK_DRAFT_GRAPH_K1_FAMILY) {
+    } else if (family >= DS4_CUDA_DSPARK_DRAFT_GRAPH_K1_FAMILY &&
+               family < DS4_CUDA_DSPARK_HYBRID_GRAPH_N8_FAMILY) {
         g_dspark_graph_draft_launches++;
     } else {
         g_dspark_graph_verifier_launches++;
@@ -11939,6 +11964,298 @@ __global__ static void dspark_rejection_verify_kernel(
     }
 }
 
+__global__ static void dspark_one_hot_rows_kernel(
+        float *draft_probs,
+        const int32_t *dspark_tokens,
+        uint32_t row_offset,
+        uint32_t n_rows,
+        uint32_t n_vocab) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    const int32_t token = dspark_tokens[row_offset + row + 1u];
+    if (token >= 0 && (uint32_t)token < n_vocab) {
+        draft_probs[(uint64_t)(row_offset + row) * n_vocab +
+                    (uint32_t)token] = 1.0f;
+    }
+}
+
+struct dspark_sparse_q_payload {
+    uint8_t n[15];
+    int32_t id[15][8];
+    float prob[15][8];
+};
+
+__global__ static void dspark_sparse_rows_kernel(
+        float *draft_probs,
+        uint32_t row_offset,
+        uint32_t n_rows,
+        uint32_t n_vocab,
+        dspark_sparse_q_payload payload) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    float *out = draft_probs + (uint64_t)(row_offset + row) * n_vocab;
+    for (uint32_t i = 0; i < payload.n[row]; i++) {
+        out[(uint32_t)payload.id[row][i]] = payload.prob[row][i];
+    }
+}
+
+/* Block Verification from arXiv:2403.10444.  One CTA deliberately owns the
+ * complete linear path: prefix acceptance probabilities are sequential, while
+ * each vocabulary reduction uses all 1024 threads.  The maximum path is only
+ * 15 drafts, so this avoids global intermediate arrays and host round trips. */
+__global__ static void dspark_block_verify_kernel(
+        int32_t *out_tokens,
+        int32_t *out_accept,
+        const float *target_logits,
+        const float *draft_probs,
+        const int32_t *dspark_tokens,
+        const float *accept_uniforms,
+        const float *residual_uniforms,
+        uint32_t n_rows,
+        uint32_t n_vocab,
+        float temperature,
+        float min_p) {
+    enum { THREADS = 1024, MAX_ROWS = 15 };
+    __shared__ float scratch[THREADS];
+    __shared__ float row_max[MAX_ROWS + 1];
+    __shared__ float row_sum[MAX_ROWS + 1];
+    __shared__ float prefix_accept[MAX_ROWS + 1];
+    __shared__ uint32_t accepted_prefix;
+    __shared__ uint32_t selected_thread;
+    __shared__ float selected_offset;
+
+    const uint32_t tid = threadIdx.x;
+    const uint32_t chunk = (n_vocab + THREADS - 1u) / THREADS;
+    const uint32_t begin = tid * chunk;
+    const uint32_t end = min(begin + chunk, n_vocab);
+
+    if (tid == 0) {
+        accepted_prefix = 0;
+        prefix_accept[0] = 1.0f;
+        for (uint32_t i = 0; i < n_rows; i++) {
+            out_tokens[i] = dspark_tokens[i + 1u];
+            out_accept[i] = 0;
+        }
+    }
+    __syncthreads();
+
+    for (uint32_t row = 0; row <= n_rows; row++) {
+        const float *logits = target_logits + (uint64_t)row * n_vocab;
+        float local_max = -INFINITY;
+        for (uint32_t i = begin; i < end; i++) {
+            const float v = logits[i];
+            if (isfinite(v) && v > local_max) local_max = v;
+        }
+        scratch[tid] = local_max;
+        __syncthreads();
+        for (uint32_t step = THREADS / 2u; step > 0u; step >>= 1u) {
+            if (tid < step) {
+                scratch[tid] = fmaxf(scratch[tid], scratch[tid + step]);
+            }
+            __syncthreads();
+        }
+        const float maximum = scratch[0];
+        float local_sum = 0.0f;
+        if (isfinite(maximum)) {
+            for (uint32_t i = begin; i < end; i++) {
+                const float v = logits[i];
+                if (!isfinite(v)) continue;
+                const float w = expf((v - maximum) / temperature);
+                if (w >= min_p) local_sum += w;
+            }
+        }
+        scratch[tid] = local_sum;
+        __syncthreads();
+        for (uint32_t step = THREADS / 2u; step > 0u; step >>= 1u) {
+            if (tid < step) scratch[tid] += scratch[tid + step];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            row_max[row] = maximum;
+            row_sum[row] = scratch[0];
+        }
+        __syncthreads();
+    }
+
+    for (uint32_t prefix = 1; prefix <= n_rows; prefix++) {
+        const uint32_t draft_row = prefix - 1u;
+        const int32_t draft_token = dspark_tokens[prefix];
+        if (tid == 0) {
+            float p_token = 0.0f;
+            const float sum = row_sum[draft_row];
+            if (draft_token >= 0 && (uint32_t)draft_token < n_vocab &&
+                sum > 0.0f && isfinite(sum)) {
+                const float v =
+                    target_logits[(uint64_t)draft_row * n_vocab +
+                                  (uint32_t)draft_token];
+                if (isfinite(v)) {
+                    const float w =
+                        expf((v - row_max[draft_row]) / temperature);
+                    if (w >= min_p) p_token = w / sum;
+                }
+            }
+            const float q_token =
+                draft_token >= 0 && (uint32_t)draft_token < n_vocab
+                    ? draft_probs[(uint64_t)draft_row * n_vocab +
+                                  (uint32_t)draft_token]
+                    : 0.0f;
+            float a = q_token > 0.0f
+                ? prefix_accept[prefix - 1u] * p_token / q_token
+                : 0.0f;
+            if (!isfinite(a) || a < 0.0f) a = 0.0f;
+            if (a > 1.0f) a = 1.0f;
+            prefix_accept[prefix] = a;
+        }
+        __syncthreads();
+
+        float threshold = prefix_accept[prefix];
+        if (prefix < n_rows) {
+            const float *logits =
+                target_logits + (uint64_t)prefix * n_vocab;
+            const float *q = draft_probs + (uint64_t)prefix * n_vocab;
+            const float sum = row_sum[prefix];
+            const float a = prefix_accept[prefix];
+            float local_residual = 0.0f;
+            if (sum > 0.0f && isfinite(sum)) {
+                for (uint32_t i = begin; i < end; i++) {
+                    const float v = logits[i];
+                    float p = 0.0f;
+                    if (isfinite(v)) {
+                        const float w =
+                            expf((v - row_max[prefix]) / temperature);
+                        if (w >= min_p) p = w / sum;
+                    }
+                    const float residual = a * p - q[i];
+                    if (residual > 0.0f) local_residual += residual;
+                }
+            }
+            scratch[tid] = local_residual;
+            __syncthreads();
+            for (uint32_t step = THREADS / 2u; step > 0u; step >>= 1u) {
+                if (tid < step) scratch[tid] += scratch[tid + step];
+                __syncthreads();
+            }
+            if (tid == 0) {
+                const float residual = scratch[0];
+                const float denom = residual + 1.0f - a;
+                threshold = denom > 0.0f ? residual / denom : 1.0f;
+                scratch[0] = threshold;
+            }
+            __syncthreads();
+            threshold = scratch[0];
+        }
+        if (tid == 0) {
+            const float u = fminf(fmaxf(accept_uniforms[draft_row], 0.0f),
+                                  0.9999999403953552f);
+            if (u <= threshold) accepted_prefix = prefix;
+        }
+        __syncthreads();
+    }
+
+    const uint32_t correction_row = accepted_prefix;
+    const float *logits =
+        target_logits + (uint64_t)correction_row * n_vocab;
+    const float *q = correction_row < n_rows
+        ? draft_probs + (uint64_t)correction_row * n_vocab : NULL;
+    const float a = prefix_accept[correction_row];
+    const float sum = row_sum[correction_row];
+    float local_mass = 0.0f;
+    if (sum > 0.0f && isfinite(sum)) {
+        for (uint32_t i = begin; i < end; i++) {
+            const float v = logits[i];
+            float p = 0.0f;
+            if (isfinite(v)) {
+                const float w =
+                    expf((v - row_max[correction_row]) / temperature);
+                if (w >= min_p) p = w / sum;
+            }
+            const float mass = q ? fmaxf(a * p - q[i], 0.0f) : p;
+            local_mass += mass;
+        }
+    }
+    scratch[tid] = local_mass;
+    __syncthreads();
+    for (uint32_t step = THREADS / 2u; step > 0u; step >>= 1u) {
+        if (tid < step) scratch[tid] += scratch[tid + step];
+        __syncthreads();
+    }
+    const float total_mass = scratch[0];
+
+    float range_mass = local_mass;
+    scratch[tid] = range_mass;
+    __syncthreads();
+    if (tid == 0) {
+        const uint32_t uniform_row =
+            correction_row < n_rows ? correction_row : n_rows - 1u;
+        const float u =
+            fminf(fmaxf(residual_uniforms[uniform_row], 0.0f),
+                  0.9999999403953552f);
+        const float target = u * total_mass;
+        float prefix = 0.0f;
+        selected_thread = 0;
+        selected_offset = 0.0f;
+        for (uint32_t t = 0; t < THREADS; t++) {
+            const float mass = scratch[t];
+            if (mass > 0.0f) {
+                selected_thread = t;
+                selected_offset = mass;
+            }
+            if (mass > 0.0f && target <= prefix + mass) {
+                selected_thread = t;
+                selected_offset = target - prefix;
+                break;
+            }
+            prefix += mass;
+        }
+    }
+    __syncthreads();
+
+    if (tid == selected_thread) {
+        float remaining = selected_offset;
+        int32_t selected = 0;
+        bool found = false;
+        for (uint32_t i = begin; i < end; i++) {
+            const float v = logits[i];
+            float p = 0.0f;
+            if (isfinite(v) && sum > 0.0f && isfinite(sum)) {
+                const float w =
+                    expf((v - row_max[correction_row]) / temperature);
+                if (w >= min_p) p = w / sum;
+            }
+            const float mass = q ? fmaxf(a * p - q[i], 0.0f) : p;
+            if (mass <= 0.0f) continue;
+            selected = (int32_t)i;
+            remaining -= mass;
+            if (remaining <= 0.0f) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            for (uint32_t i = end; i > begin; i--) {
+                const uint32_t token = i - 1u;
+                const float v = logits[token];
+                if (!isfinite(v)) continue;
+                const float w =
+                    expf((v - row_max[correction_row]) / temperature);
+                if (w < min_p) continue;
+                const float p = sum > 0.0f ? w / sum : 0.0f;
+                if (!q || a * p - q[token] > 0.0f) {
+                    selected = (int32_t)token;
+                    break;
+                }
+            }
+        }
+        if (accepted_prefix < n_rows) {
+            out_tokens[accepted_prefix] = selected;
+        }
+    }
+    __syncthreads();
+    if (tid < n_rows) {
+        out_accept[tid] = tid < accepted_prefix ? 1 : 0;
+    }
+}
+
 __global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     uint32_t t = blockIdx.x;
     if (t >= n_tokens || threadIdx.x != 0) return;
@@ -12912,6 +13229,146 @@ extern "C" int ds4_gpu_dspark_rejection_verify_tensor(
             temperature,
             min_p);
     return cuda_ok(cudaGetLastError(), "DSpark rejection verify launch");
+}
+
+extern "C" int ds4_gpu_dspark_one_hot_draft_rows_tensor(
+        ds4_gpu_tensor       *draft_probs,
+        const ds4_gpu_tensor *dspark_tokens,
+        uint32_t                row_offset,
+        uint32_t                n_rows,
+        uint32_t                n_vocab) {
+    if (!draft_probs || !dspark_tokens || n_rows == 0u || n_vocab == 0u ||
+        row_offset > 15u || n_rows > 15u - row_offset ||
+        draft_probs->bytes <
+            (uint64_t)(row_offset + n_rows) * n_vocab * sizeof(float) ||
+        dspark_tokens->bytes <
+            (uint64_t)(row_offset + n_rows + 1u) * sizeof(int32_t)) {
+        return 0;
+    }
+    float *rows = (float *)draft_probs->ptr + (uint64_t)row_offset * n_vocab;
+    cudaError_t err = cudaMemsetAsync(rows,
+                                      0,
+                                      (uint64_t)n_rows * n_vocab *
+                                          sizeof(float),
+                                      cudaStreamPerThread);
+    if (err != cudaSuccess) {
+        return cuda_ok(err, "DSpark retrieval q clear");
+    }
+    dspark_one_hot_rows_kernel<<<(n_rows + 63u) / 64u, 64>>>(
+            (float *)draft_probs->ptr,
+            (const int32_t *)dspark_tokens->ptr,
+            row_offset,
+            n_rows,
+            n_vocab);
+    return cuda_ok(cudaGetLastError(), "DSpark retrieval q launch");
+}
+
+extern "C" int ds4_gpu_dspark_sparse_draft_rows_tensor(
+        ds4_gpu_tensor       *draft_probs,
+        uint32_t                row_offset,
+        uint32_t                n_rows,
+        uint32_t                n_vocab,
+        const uint8_t          *row_sizes,
+        const int32_t          *token_ids,
+        const float            *token_probs,
+        const int32_t          *proposed_tokens,
+        uint32_t                row_stride) {
+    if (!draft_probs || !row_sizes || !token_ids || !token_probs ||
+        !proposed_tokens || n_rows == 0u || n_vocab == 0u ||
+        row_stride == 0u || row_stride > 8u ||
+        row_offset > 15u || n_rows > 15u - row_offset ||
+        draft_probs->bytes <
+            (uint64_t)(row_offset + n_rows) * n_vocab * sizeof(float)) {
+        return 0;
+    }
+
+    dspark_sparse_q_payload payload = {};
+    for (uint32_t row = 0; row < n_rows; row++) {
+        const uint32_t count = row_sizes[row];
+        if (count == 0u || count > row_stride || count > 8u) return 0;
+        float sum = 0.0f;
+        bool contains_proposed = false;
+        for (uint32_t i = 0; i < count; i++) {
+            const int32_t id = token_ids[(uint64_t)row * row_stride + i];
+            const float prob =
+                token_probs[(uint64_t)row * row_stride + i];
+            if (id < 0 || (uint32_t)id >= n_vocab ||
+                !std::isfinite(prob) || !(prob > 0.0f)) {
+                return 0;
+            }
+            for (uint32_t j = 0; j < i; j++) {
+                if (payload.id[row][j] == id) return 0;
+            }
+            payload.id[row][i] = id;
+            payload.prob[row][i] = prob;
+            sum += prob;
+            contains_proposed =
+                contains_proposed || id == proposed_tokens[row];
+        }
+        if (!contains_proposed || !std::isfinite(sum) ||
+            std::fabs(sum - 1.0f) > 1.0e-4f) {
+            return 0;
+        }
+        payload.n[row] = (uint8_t)count;
+    }
+
+    float *rows = (float *)draft_probs->ptr + (uint64_t)row_offset * n_vocab;
+    cudaError_t err = cudaMemsetAsync(
+            rows,
+            0,
+            (uint64_t)n_rows * n_vocab * sizeof(float),
+            cudaStreamPerThread);
+    if (err != cudaSuccess) return cuda_ok(err, "DSpark sparse q clear");
+    dspark_sparse_rows_kernel<<<(n_rows + 63u) / 64u, 64>>>(
+            (float *)draft_probs->ptr,
+            row_offset,
+            n_rows,
+            n_vocab,
+            payload);
+    return cuda_ok(cudaGetLastError(), "DSpark sparse q launch");
+}
+
+extern "C" int ds4_gpu_dspark_block_verify_tensor(
+        ds4_gpu_tensor       *out_tokens,
+        ds4_gpu_tensor       *out_accept,
+        const ds4_gpu_tensor *spec_logits,
+        const ds4_gpu_tensor *draft_probs,
+        const ds4_gpu_tensor *dspark_tokens,
+        const ds4_gpu_tensor *accept_uniforms,
+        const ds4_gpu_tensor *residual_uniforms,
+        uint32_t                n_rows,
+        uint32_t                n_vocab,
+        float                   temperature,
+        float                   min_p) {
+    if (!out_tokens || !out_accept || !spec_logits || !draft_probs ||
+        !dspark_tokens || !accept_uniforms || !residual_uniforms ||
+        n_rows == 0u || n_rows > 15u || n_vocab == 0u ||
+        temperature <= 0.0f || min_p < 0.0f || min_p > 1.0f ||
+        out_tokens->bytes < (uint64_t)n_rows * sizeof(int32_t) ||
+        out_accept->bytes < (uint64_t)n_rows * sizeof(int32_t) ||
+        spec_logits->bytes <
+            (uint64_t)(n_rows + 1u) * n_vocab * sizeof(float) ||
+        draft_probs->bytes <
+            (uint64_t)n_rows * n_vocab * sizeof(float) ||
+        dspark_tokens->bytes <
+            (uint64_t)(n_rows + 1u) * sizeof(int32_t) ||
+        accept_uniforms->bytes < (uint64_t)n_rows * sizeof(float) ||
+        residual_uniforms->bytes < (uint64_t)n_rows * sizeof(float)) {
+        return 0;
+    }
+    dspark_block_verify_kernel<<<1, 1024>>>(
+            (int32_t *)out_tokens->ptr,
+            (int32_t *)out_accept->ptr,
+            (const float *)spec_logits->ptr,
+            (const float *)draft_probs->ptr,
+            (const int32_t *)dspark_tokens->ptr,
+            (const float *)accept_uniforms->ptr,
+            (const float *)residual_uniforms->ptr,
+            n_rows,
+            n_vocab,
+            temperature,
+            min_p);
+    return cuda_ok(cudaGetLastError(), "DSpark BlockV launch");
 }
 
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(

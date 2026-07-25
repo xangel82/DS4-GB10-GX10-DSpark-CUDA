@@ -8,6 +8,129 @@ conservare il throughput DSpark sui contesti lunghi.
 La sezione **Avvio rapido** è la procedura operativa aggiornata. Le sezioni
 successive conservano la cronologia tecnica, comprese prove scartate e rollback.
 
+## HybridLC predefinito: DSpark + retrieval + BlockV - 26 luglio 2026
+
+Il launcher abilita per default HybridLC, che estende la catena neurale DSpark
+con una coda recuperata dal contesto già verificato. Il percorso resta lossless:
+il target verifica ogni proposta e BlockV applica la correzione dalla
+distribuzione residua esatta. Il rollback operativo è
+`DS4_DSPARK_HYBRID_LC=0`.
+
+Prima della verifica target si può ancora misurare il retriever in shadow mode,
+senza modificare token, `q`, CUDA Graph o output. Se production non è impostato
+esplicitamente, il launcher lo disattiva automaticamente durante lo shadow:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_HYBRID_LC_SHADOW=1 DS4_TELEMETRY=1 ./run-dspark-server.sh 2>&1 | tee /tmp/ds4-hybrid-shadow.log
+```
+
+L'avvio normale usa HybridLC senza richiedere flag. Per raccogliere la
+telemetria completa:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_TELEMETRY=1 ./run-dspark-server.sh 2>&1 | tee /tmp/ds4-hybrid-lc.log
+```
+
+L'implementazione completa mantiene una sola catena lineare e lossless:
+
+- DSpark produce sempre il blocco neurale ufficiale da cinque slot; lo
+  scheduler esistente sceglie il prefisso `K=1..5`;
+- un indice hash incrementale cerca in `O(1)` un suffix esatto di otto token
+  nelle ultime 131.072 posizioni. La sequenza viene sempre ricontrollata
+  token-per-token, quindi una collisione hash non può produrre un match falso;
+- l'indice conserva le due occorrenze più recenti e misura un match esteso fino
+  a 64 token. Restore, rewind e canonicalizzazione invalidano l'oracle;
+- quando il suffix esatto termina, una tabella bounded top-8 propone la
+  transizione successiva. La sua `q` è la distribuzione normalizzata realmente
+  campionata, non una confidence implicita;
+- ogni draft conserva token, sorgente (`neural`, `suffix`, `transition`),
+  supporto sparse di `q` e probabilità del token sul cammino;
+- suffix e transizioni vengono materializzati nella matrice `q` con un kernel
+  sparse; il suffix esatto è una riga one-hot;
+- il target verifica una sola catena fino a 15 draft. Le sole nuove famiglie
+  CUDA Graph sono le larghezze complessive `N=8`, `N=12` e `N=16`; `N=3` e
+  `N=6` riusano l'oracle già misurato dal verifier DSpark;
+- lo scheduler misura costo target e throughput per bucket di contesto e per
+  larghezza, esegue due probe iniziali per N e poi sceglie il rate migliore
+  rispetto al prefisso neurale. Un probe raro evita che il vincitore diventi
+  permanente quando cambia il tipo di testo;
+- `DS4_DSPARK_HYBRID_WIDTH=8|12|16` richiede una larghezza per benchmark
+  controllati quando il retriever ha prodotto abbastanza righe; in caso
+  contrario resta il prefisso neurale, senza padding fittizio;
+- con HybridLC attivo, ogni ciclo DSpark full-vocabulary usa Block Verification,
+  anche quando il retriever non aggiunge una coda
+  (`arXiv:2403.10444`): prefisso accettato congiuntamente e correzione dalla
+  distribuzione residua esatta `max(a_i p_i - q_i, 0)`;
+- a temperatura zero resta il confronto greedy esistente;
+- un riferimento CPU ricontrolla il prefisso BlockV al primo ciclo e poi ogni
+  1.024 cicli. Una divergenza ripristina la snapshot e disabilita HybridLC per
+  la sola sessione. L'intervallo si cambia con
+  `DS4_DSPARK_HYBRID_SELF_CHECK_INTERVAL`;
+- lo shadow oracle conserva una sola previsione pendente fino alla sua
+  risoluzione, senza sostituirla al ciclo successivo. La coverage `>=8`/`>=16`
+  usa come denominatore tutti i cicli shadow che interrogano il retriever;
+  accuratezza token e match completi usano invece soltanto le code che diventano
+  osservabili dopo l'accettazione integrale del prefisso neurale. Sono contati
+  anche i rebuild causati da rewind/canonicalizzazione;
+- acceptance della coda sotto il 20% attiva un cooldown di 64 cicli.
+
+Con il flag spento il percorso corrente rimane invariato: cinque snapshot di
+prefisso, sei righe di backup DSpark e gli stessi buffer `q`/verifier. Con il
+flag acceso vengono allocati i buffer fino a 15 draft e le snapshot aggiuntive.
+L'oracle host usa circa 10,5 MiB costanti: 262.144 slot suffix e una tabella
+top-8 per il vocabolario. Non cresce con il contesto fisico, quindi il profilo
+da 1M non crea una seconda struttura da un milione di elementi. Lo shadow mode
+alloca soltanto l'oracle host, non i buffer target da 16 righe.
+
+La regressione CUDA copre `q` one-hot e sparse, acceptance totale, rifiuto con
+campionamento residuo e restore delle frontier:
+
+```text
+cuda-regression: HybridLC sparse q + lossless BlockV (rows=1..15) OK
+cuda long-context regression: OK
+```
+
+Il report unificato separa suffix e transizioni, unisce la curva esistente
+`N=3/6` a quella HybridLC `N=8/12/16`, controlla shadow e self-check e può
+confrontare il decode con un log baseline:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && ./tools/hybrid_lc_report.py /tmp/ds4-hybrid-lc.log --baseline /tmp/ds4-baseline.log --require-all-widths --json /tmp/ds4-hybrid-lc-report.json
+```
+
+Il gate shadow segue gli oracle del paper: almeno il 20% dei cicli interrogati
+con exact match `>=8`, oppure almeno il 10% con exact match `>=16`. Le soglie
+sono modificabili con `--min-shadow-match8-coverage` e
+`--min-shadow-match16-coverage`; `--min-shadow-accuracy` controlla
+separatamente l'accuratezza token-per-token della coda proposta.
+
+Nei log, `hybrid_enabled=1` indica tutti i cicli eseguiti con la feature di
+produzione, `hybrid=1` soltanto quelli che hanno realmente aggiunto una coda
+retrieval e `blockv=1` quelli verificati con BlockV. Questa separazione evita di
+confondere un miss del retriever con un fallback o con una feature disattivata.
+
+La validazione GB10 del 25-26 luglio ha superato il gate del report:
+
+- 1.406 cicli production, di cui 1.315 verificati con BlockV;
+- 183 cicli retrieval, con 1.022 token accettati su 1.446 (`70,68%`);
+- acceptance suffix `70,96%`, match esatto medio di 34,66 token;
+- N=8 a 26,89 t/s, N=12 a 34,15 t/s e N=16 a 34,97 t/s;
+- due self-check CPU/GPU superati, nessun errore, OOM o swap del processo;
+- decode telemetrico 20,48 t/s contro 20,06 t/s baseline; il run silenzioso ha
+  misurato 21,30 t/s. Tra 25K e 100K i turni operativi sono rimasti fra 25,84
+  e 26,73 t/s, con picchi superiori a 30 t/s;
+- i prefill append sostanziali sono rimasti fra circa 851 e 907 t/s.
+
+Il vantaggio dipende dalla copertura: nella risposta finale libera da 2.195
+token il retrieval è intervenuto soltanto nel 6,1% dei cicli e il decode è
+sceso a 16,37 t/s. Quando il suffix era disponibile, N=12/N=16 ha mantenuto
+31,29/35,32 t/s. Il risultato promuove quindi HybridLC perché accelera in modo
+marcato le regioni ripetitive senza cambiare la distribuzione target, non perché
+elimini il costo della generazione neurale non coperta.
+
+Production e shadow mode restano mutuamente esclusivi. Se entrambe vengono
+impostate esplicitamente a `1`, il launcher rifiuta la configurazione.
+
 ## Frontier GPU per tool call - 24 luglio 2026
 
 Le richieste con tool conservano ora fino a quattro snapshot della frontier del

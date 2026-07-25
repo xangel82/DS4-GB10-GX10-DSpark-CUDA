@@ -155,6 +155,283 @@ cleanup:
     return rc;
 }
 
+static int check_dspark_hybrid_blockv(void) {
+    enum { VOCAB = 2, ROWS = 2 };
+    const float equal_logits[(ROWS + 1) * VOCAB] = {
+        logf(0.25f), logf(0.75f),
+        logf(0.25f), logf(0.75f),
+        logf(0.25f), logf(0.75f),
+    };
+    const float equal_q[ROWS * VOCAB] = {
+        0.25f, 0.75f,
+        0.25f, 0.75f,
+    };
+    const int32_t equal_tokens[ROWS + 1] = {0, 1, 0};
+    const float uniforms[ROWS] = {0.99f, 0.99f};
+    int32_t got_tokens[ROWS] = {-1, -1};
+    int32_t got_accept[ROWS] = {0, 0};
+
+    ds4_gpu_tensor *logits =
+        ds4_gpu_tensor_alloc(sizeof(equal_logits));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(sizeof(equal_q));
+    ds4_gpu_tensor *tokens =
+        ds4_gpu_tensor_alloc(sizeof(equal_tokens));
+    ds4_gpu_tensor *accept_uniforms =
+        ds4_gpu_tensor_alloc(sizeof(uniforms));
+    ds4_gpu_tensor *residual_uniforms =
+        ds4_gpu_tensor_alloc(sizeof(uniforms));
+    ds4_gpu_tensor *out_tokens =
+        ds4_gpu_tensor_alloc(sizeof(got_tokens));
+    ds4_gpu_tensor *out_accept =
+        ds4_gpu_tensor_alloc(sizeof(got_accept));
+    int rc = 1;
+    if (!logits || !q || !tokens || !accept_uniforms ||
+        !residual_uniforms || !out_tokens || !out_accept ||
+        !ds4_gpu_tensor_write(logits, 0, equal_logits,
+                              sizeof(equal_logits)) ||
+        !ds4_gpu_tensor_write(q, 0, equal_q, sizeof(equal_q)) ||
+        !ds4_gpu_tensor_write(tokens, 0, equal_tokens,
+                              sizeof(equal_tokens)) ||
+        !ds4_gpu_tensor_write(accept_uniforms, 0, uniforms,
+                              sizeof(uniforms)) ||
+        !ds4_gpu_tensor_write(residual_uniforms, 0, uniforms,
+                              sizeof(uniforms)) ||
+        !ds4_gpu_dspark_block_verify_tensor(
+                out_tokens, out_accept, logits, q, tokens,
+                accept_uniforms, residual_uniforms,
+                ROWS, VOCAB, 1.0f, 0.0f) ||
+        !ds4_gpu_tensor_read(out_tokens, 0, got_tokens,
+                             sizeof(got_tokens)) ||
+        !ds4_gpu_tensor_read(out_accept, 0, got_accept,
+                             sizeof(got_accept))) {
+        goto cleanup;
+    }
+    if (got_accept[0] != 1 || got_accept[1] != 1) goto cleanup;
+
+    {
+        const float edge_uniforms[][ROWS] = {
+            {0.0f, 0.0f},
+            {nextafterf(0.0f, 1.0f), nextafterf(0.0f, 1.0f)},
+            {nextafterf(1.0f, 0.0f), nextafterf(1.0f, 0.0f)},
+        };
+        for (uint32_t edge = 0;
+             edge < sizeof(edge_uniforms) / sizeof(edge_uniforms[0]);
+             edge++) {
+            memset(got_accept, 0, sizeof(got_accept));
+            if (!ds4_gpu_tensor_write(
+                        accept_uniforms, 0, edge_uniforms[edge],
+                        sizeof(edge_uniforms[edge])) ||
+                !ds4_gpu_tensor_write(
+                        residual_uniforms, 0, edge_uniforms[edge],
+                        sizeof(edge_uniforms[edge])) ||
+                !ds4_gpu_dspark_block_verify_tensor(
+                        out_tokens, out_accept, logits, q, tokens,
+                        accept_uniforms, residual_uniforms,
+                        ROWS, VOCAB, 1.0f, 0.0f) ||
+                !ds4_gpu_tensor_read(out_accept, 0, got_accept,
+                                     sizeof(got_accept))) {
+                goto cleanup;
+            }
+            if (got_accept[0] != 1 || got_accept[1] != 1) goto cleanup;
+        }
+    }
+
+    {
+        const float reject_logits[2 * VOCAB] = {
+            logf(0.7f), logf(0.3f),
+            logf(0.7f), logf(0.3f),
+        };
+        const float reject_q[VOCAB] = {0.2f, 0.8f};
+        const int32_t reject_tokens[2] = {0, 1};
+        const float reject_uniform = 0.9f;
+        if (!ds4_gpu_tensor_write(logits, 0, reject_logits,
+                                  sizeof(reject_logits)) ||
+            !ds4_gpu_tensor_write(q, 0, reject_q, sizeof(reject_q)) ||
+            !ds4_gpu_tensor_write(tokens, 0, reject_tokens,
+                                  sizeof(reject_tokens)) ||
+            !ds4_gpu_tensor_write(accept_uniforms, 0, &reject_uniform,
+                                  sizeof(reject_uniform)) ||
+            !ds4_gpu_tensor_write(residual_uniforms, 0, &reject_uniform,
+                                  sizeof(reject_uniform)) ||
+            !ds4_gpu_dspark_block_verify_tensor(
+                    out_tokens, out_accept, logits, q, tokens,
+                    accept_uniforms, residual_uniforms,
+                    1, VOCAB, 1.0f, 0.0f) ||
+            !ds4_gpu_tensor_read(out_tokens, 0, got_tokens,
+                                 sizeof(got_tokens[0])) ||
+            !ds4_gpu_tensor_read(out_accept, 0, got_accept,
+                                 sizeof(got_accept[0]))) {
+            goto cleanup;
+        }
+        if (got_accept[0] != 0 || got_tokens[0] != 0) goto cleanup;
+    }
+
+    {
+        float zero_q[ROWS * VOCAB] = {0};
+        const int32_t one_hot_tokens[ROWS + 1] = {0, 1, 0};
+        float one_hot_got[ROWS * VOCAB] = {0};
+        if (!ds4_gpu_tensor_write(q, 0, zero_q, sizeof(zero_q)) ||
+            !ds4_gpu_tensor_write(tokens, 0, one_hot_tokens,
+                                  sizeof(one_hot_tokens)) ||
+            !ds4_gpu_dspark_one_hot_draft_rows_tensor(
+                    q, tokens, 0, ROWS, VOCAB) ||
+            !ds4_gpu_tensor_read(q, 0, one_hot_got,
+                                 sizeof(one_hot_got))) {
+            goto cleanup;
+        }
+        if (one_hot_got[0] != 0.0f || one_hot_got[1] != 1.0f ||
+            one_hot_got[2] != 1.0f || one_hot_got[3] != 0.0f) {
+            goto cleanup;
+        }
+
+        const uint8_t sparse_sizes[ROWS] = {2, 1};
+        const int32_t sparse_ids[ROWS * VOCAB] = {0, 1, 1, 0};
+        const float sparse_probs[ROWS * VOCAB] = {
+            0.25f, 0.75f, 1.0f, 0.0f
+        };
+        const int32_t sparse_proposed[ROWS] = {1, 1};
+        memset(one_hot_got, 0, sizeof(one_hot_got));
+        if (!ds4_gpu_dspark_sparse_draft_rows_tensor(
+                    q, 0, ROWS, VOCAB,
+                    sparse_sizes, sparse_ids, sparse_probs,
+                    sparse_proposed, VOCAB) ||
+            !ds4_gpu_tensor_read(q, 0, one_hot_got,
+                                 sizeof(one_hot_got))) {
+            goto cleanup;
+        }
+        if (fabsf(one_hot_got[0] - 0.25f) > 1.0e-7f ||
+            fabsf(one_hot_got[1] - 0.75f) > 1.0e-7f ||
+            one_hot_got[2] != 0.0f || one_hot_got[3] != 1.0f) {
+            goto cleanup;
+        }
+
+        {
+            const uint8_t two[1] = {2};
+            const uint8_t one[1] = {1};
+            const int32_t duplicate_ids[2] = {0, 0};
+            const int32_t valid_ids[2] = {0, 1};
+            const int32_t out_of_range_ids[2] = {0, VOCAB};
+            const float one_prob[1] = {1.0f};
+            const float half_probs[2] = {0.5f, 0.5f};
+            const float bad_sum_probs[2] = {0.4f, 0.5f};
+            const float nan_probs[2] = {NAN, 1.0f};
+            const int32_t proposed_zero[1] = {0};
+            const int32_t proposed_one[1] = {1};
+            if (ds4_gpu_dspark_sparse_draft_rows_tensor(
+                        q, 0, 1, VOCAB, two, duplicate_ids, half_probs,
+                        proposed_zero, 2) ||
+                ds4_gpu_dspark_sparse_draft_rows_tensor(
+                        q, 0, 1, VOCAB, one, valid_ids, one_prob,
+                        proposed_one, 2) ||
+                ds4_gpu_dspark_sparse_draft_rows_tensor(
+                        q, 0, 1, VOCAB, two, valid_ids, bad_sum_probs,
+                        proposed_zero, 2) ||
+                ds4_gpu_dspark_sparse_draft_rows_tensor(
+                        q, 0, 1, VOCAB, two, valid_ids, nan_probs,
+                        proposed_zero, 2) ||
+                ds4_gpu_dspark_sparse_draft_rows_tensor(
+                        q, 0, 1, VOCAB, two, out_of_range_ids, half_probs,
+                        proposed_zero, 2) ||
+                ds4_gpu_dspark_one_hot_draft_rows_tensor(
+                        q, tokens, 15, 1, VOCAB) ||
+                ds4_gpu_dspark_block_verify_tensor(
+                        out_tokens, out_accept, logits, q, tokens,
+                        accept_uniforms, residual_uniforms,
+                        16, VOCAB, 1.0f, 0.0f) ||
+                ds4_gpu_dspark_block_verify_tensor(
+                        out_tokens, out_accept, logits, q, tokens,
+                        accept_uniforms, residual_uniforms,
+                        1, VOCAB, 0.0f, 0.0f)) {
+                goto cleanup;
+            }
+        }
+    }
+
+    {
+        enum { LONG_ROWS = 15, LONG_VOCAB = 2 };
+        float long_logits[(LONG_ROWS + 1) * LONG_VOCAB];
+        uint8_t long_sizes[LONG_ROWS];
+        int32_t long_ids[LONG_ROWS * LONG_VOCAB];
+        float long_probs[LONG_ROWS * LONG_VOCAB];
+        int32_t long_tokens[LONG_ROWS + 1];
+        int32_t long_proposed[LONG_ROWS];
+        float long_uniforms[LONG_ROWS];
+        int32_t long_accept[LONG_ROWS];
+        for (int i = 0; i < (LONG_ROWS + 1) * LONG_VOCAB; i++) {
+            long_logits[i] = logf(0.5f);
+        }
+        long_tokens[0] = 0;
+        for (int row = 0; row < LONG_ROWS; row++) {
+            long_sizes[row] = 2;
+            long_ids[row * LONG_VOCAB] = 0;
+            long_ids[row * LONG_VOCAB + 1] = 1;
+            long_probs[row * LONG_VOCAB] = 0.5f;
+            long_probs[row * LONG_VOCAB + 1] = 0.5f;
+            long_proposed[row] = row & 1;
+            long_tokens[row + 1] = long_proposed[row];
+            long_uniforms[row] = 0.99f;
+            long_accept[row] = 0;
+        }
+        ds4_gpu_tensor *long_logits_tensor =
+            ds4_gpu_tensor_alloc(sizeof(long_logits));
+        ds4_gpu_tensor *long_q =
+            ds4_gpu_tensor_alloc(sizeof(long_probs));
+        ds4_gpu_tensor *long_tokens_tensor =
+            ds4_gpu_tensor_alloc(sizeof(long_tokens));
+        ds4_gpu_tensor *long_uniform_tensor =
+            ds4_gpu_tensor_alloc(sizeof(long_uniforms));
+        ds4_gpu_tensor *long_out_tokens =
+            ds4_gpu_tensor_alloc(sizeof(long_accept));
+        ds4_gpu_tensor *long_out_accept =
+            ds4_gpu_tensor_alloc(sizeof(long_accept));
+        const bool long_ok =
+            long_logits_tensor && long_q && long_tokens_tensor &&
+            long_uniform_tensor && long_out_tokens && long_out_accept &&
+            ds4_gpu_tensor_write(long_logits_tensor, 0, long_logits,
+                                 sizeof(long_logits)) &&
+            ds4_gpu_tensor_write(long_tokens_tensor, 0, long_tokens,
+                                 sizeof(long_tokens)) &&
+            ds4_gpu_tensor_write(long_uniform_tensor, 0, long_uniforms,
+                                 sizeof(long_uniforms)) &&
+            ds4_gpu_dspark_sparse_draft_rows_tensor(
+                    long_q, 0, LONG_ROWS, LONG_VOCAB,
+                    long_sizes, long_ids, long_probs, long_proposed,
+                    LONG_VOCAB) &&
+            ds4_gpu_dspark_block_verify_tensor(
+                    long_out_tokens, long_out_accept,
+                    long_logits_tensor, long_q, long_tokens_tensor,
+                    long_uniform_tensor, long_uniform_tensor,
+                    LONG_ROWS, LONG_VOCAB, 1.0f, 0.0f) &&
+            ds4_gpu_tensor_read(long_out_accept, 0, long_accept,
+                                sizeof(long_accept));
+        ds4_gpu_tensor_free(long_out_accept);
+        ds4_gpu_tensor_free(long_out_tokens);
+        ds4_gpu_tensor_free(long_uniform_tensor);
+        ds4_gpu_tensor_free(long_tokens_tensor);
+        ds4_gpu_tensor_free(long_q);
+        ds4_gpu_tensor_free(long_logits_tensor);
+        if (!long_ok) goto cleanup;
+        for (int row = 0; row < LONG_ROWS; row++) {
+            if (long_accept[row] != 1) goto cleanup;
+        }
+    }
+
+    fprintf(stderr,
+            "cuda-regression: HybridLC sparse q + lossless BlockV "
+            "(rows=1..15) OK\n");
+    rc = 0;
+
+cleanup:
+    ds4_gpu_tensor_free(out_accept);
+    ds4_gpu_tensor_free(out_tokens);
+    ds4_gpu_tensor_free(residual_uniforms);
+    ds4_gpu_tensor_free(accept_uniforms);
+    ds4_gpu_tensor_free(tokens);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(logits);
+    return rc;
+}
+
 static int check_gvr_topk(void) {
     const uint32_t n_comp = 16384;
     const uint32_t n_tokens = 2;
@@ -856,6 +1133,11 @@ int main(void) {
     if (rc != 0) fprintf(stderr, "cuda-regression: FAILED exact Top-K\n");
     if (check_frontier_copy_primitives() != 0) {
         fprintf(stderr, "cuda-regression: FAILED frontier copy primitives\n");
+        rc = 1;
+    }
+    if (check_dspark_hybrid_blockv() != 0) {
+        fprintf(stderr,
+                "cuda-regression: FAILED HybridLC Block Verification\n");
         rc = 1;
     }
     if (check_gvr_topk() != 0) {

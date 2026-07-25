@@ -44,6 +44,15 @@ LONG_ANCHOR_TRIM_TOKENS="${DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS:-$((CTX / 16))}"
 CONFIDENCE_POST_NORM="${DS4_DSPARK_CONFIDENCE_POST_NORM:-0}"
 GRAPH_TOPOLOGY_CACHE_DISABLE="${DS4_CUDA_DSPARK_GRAPH_TOPOLOGY_CACHE_DISABLE:-0}"
 SECONDARY_COPY_PIPELINED="${DS4_CUDA_SECONDARY_COPY_PIPELINED:-1}"
+HYBRID_LC_SHADOW="${DS4_DSPARK_HYBRID_LC_SHADOW:-0}"
+if [[ -n "${DS4_DSPARK_HYBRID_LC+x}" ]]; then
+  HYBRID_LC="$DS4_DSPARK_HYBRID_LC"
+elif [[ "$HYBRID_LC_SHADOW" == "1" ]]; then
+  HYBRID_LC=0
+else
+  HYBRID_LC=1
+fi
+HYBRID_WIDTH="${DS4_DSPARK_HYBRID_WIDTH:-}"
 
 if [[ ! -f "$MODEL" ]]; then
   echo "Main model not found: $MODEL" >&2
@@ -72,6 +81,26 @@ case "$SECONDARY_COPY_PIPELINED" in
   0|1) ;;
   *) echo "Invalid DS4_CUDA_SECONDARY_COPY_PIPELINED: $SECONDARY_COPY_PIPELINED (expected 0 or 1)" >&2; exit 2 ;;
 esac
+case "$HYBRID_LC" in
+  0|1) ;;
+  *) echo "Invalid DS4_DSPARK_HYBRID_LC: $HYBRID_LC (expected 0 or 1)" >&2; exit 2 ;;
+esac
+case "$HYBRID_LC_SHADOW" in
+  0|1) ;;
+  *) echo "Invalid DS4_DSPARK_HYBRID_LC_SHADOW: $HYBRID_LC_SHADOW (expected 0 or 1)" >&2; exit 2 ;;
+esac
+if [[ "$HYBRID_LC" == "1" && "$HYBRID_LC_SHADOW" == "1" ]]; then
+  echo "DS4_DSPARK_HYBRID_LC and DS4_DSPARK_HYBRID_LC_SHADOW are mutually exclusive" >&2
+  exit 2
+fi
+case "$HYBRID_WIDTH" in
+  ""|8|12|16) ;;
+  *) echo "Invalid DS4_DSPARK_HYBRID_WIDTH: $HYBRID_WIDTH (expected 8, 12, or 16)" >&2; exit 2 ;;
+esac
+if [[ -n "$HYBRID_WIDTH" && "$HYBRID_LC" != "1" ]]; then
+  echo "DS4_DSPARK_HYBRID_WIDTH requires DS4_DSPARK_HYBRID_LC=1" >&2
+  exit 2
+fi
 
 export DS4_CUDA_COPY_MODEL=1
 export DS4_CUDA_SECONDARY_COPY_PIPELINED="$SECONDARY_COPY_PIPELINED"
@@ -208,6 +237,22 @@ fi
 unset DS4_CUDA_TOKEN_GRAPH_PIPELINE
 unset DS4_CUDA_MTP_GRAPH
 unset DS4_CUDA_MTP_TENSOR_CORES
+if [[ "$HYBRID_LC" == "1" ]]; then
+  export DS4_DSPARK_HYBRID_LC=1
+  if [[ -n "$HYBRID_WIDTH" ]]; then
+    export DS4_DSPARK_HYBRID_WIDTH="$HYBRID_WIDTH"
+  else
+    unset DS4_DSPARK_HYBRID_WIDTH
+  fi
+else
+  unset DS4_DSPARK_HYBRID_LC
+  unset DS4_DSPARK_HYBRID_WIDTH
+fi
+if [[ "$HYBRID_LC_SHADOW" == "1" ]]; then
+  export DS4_DSPARK_HYBRID_LC_SHADOW=1
+else
+  unset DS4_DSPARK_HYBRID_LC_SHADOW
+fi
 
 if [[ "$TELEMETRY" == "1" ]]; then
   export DS4_DSPARK_TIMING=1
@@ -232,6 +277,7 @@ echo "Context guard: physical=$CTX advertise=${ADVERTISE_CONTEXT_PCT}%"
 echo "DSpark scheduler: full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY"
 echo "DSpark parity: confidence-input=$CONFIDENCE_INPUT, verifier-topology-cache=$GRAPH_TOPOLOGY_CACHE"
 echo "DSpark sampling: lossless p/q rejection for top_k=0 top_p=1 min-p policy (rollback DS4_DSPARK_REJECTION_DISABLE=1)"
+echo "HybridLC: enabled=$HYBRID_LC shadow=$HYBRID_LC_SHADOW indexed-suffix=8-token transition-q=top8 BlockV=lossless max-draft=15 graph-rows=8/12/16 forced-width=${HYBRID_WIDTH:-auto}"
 echo "GB10 verifier: Q8 batch-reuse=${DS4_CUDA_Q8_BATCH_REUSE:-0}, Q4-sidecar direct-MoE=${DS4_CUDA_MOE_TINY_DIRECT_Q4_ONLY:-0}, tiny-TC=${DS4_CUDA_DSPARK_TENSOR_CORES:-0}, tiny-TC-Q8=${DS4_CUDA_DSPARK_TENSOR_CORES_Q8:-0}"
 if [[ "${DS4_CUDA_NVTX:-0}" == "1" ||
       "${DS4_CUDA_NSYS_PREFILL_START_POS:-}" != "" ||

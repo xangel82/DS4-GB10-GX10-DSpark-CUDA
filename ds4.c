@@ -75,6 +75,15 @@ static const char DS4_REASONING_EFFORT_MAX_PREFIX[] =
  * asks for a reasoning budget the allocated context is not meant to hold. */
 #define DS4_THINK_MAX_MIN_CONTEXT 393216u
 
+static bool ds4_env_enabled(const char *name) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return false;
+    return strcmp(value, "0") != 0 &&
+           strcasecmp(value, "false") != 0 &&
+           strcasecmp(value, "no") != 0 &&
+           strcasecmp(value, "off") != 0;
+}
+
 static bool ds4_backend_uses_graph(ds4_backend backend) {
     return backend == DS4_BACKEND_METAL || backend == DS4_BACKEND_CUDA;
 }
@@ -3115,10 +3124,19 @@ typedef struct {
 enum {
     DS4_DSPARK_N_BLOCK = 3,
     DS4_DSPARK_BLOCK_SIZE = 5,
+    DS4_HYBRID_LC_MAX_DRAFT = 15,
+    DS4_HYBRID_LC_MAX_ROWS = DS4_HYBRID_LC_MAX_DRAFT + 1,
+    DS4_HYBRID_LC_WIDTHS = 5,
+    DS4_HYBRID_LC_SUFFIX_TOKENS = 8,
+    DS4_HYBRID_LC_SUFFIX_MATCH_MAX = 64,
+    DS4_HYBRID_LC_SEARCH_TOKENS = 131072,
+    DS4_HYBRID_LC_SUFFIX_SLOTS = 262144,
+    DS4_HYBRID_LC_TRANSITION_TOP_K = 8,
     /* A DSpark verifier evaluates the pending current token plus K drafts.
-     * Partial acceptance can therefore retain prefixes of one through five
-     * target rows; the sixth row is only needed for the all-accepted logits. */
-    DS4_SPEC_PREFIX_MAX = DS4_DSPARK_BLOCK_SIZE,
+     * HybridLC can append a deterministic retrieval tail.  The pointer tables
+     * cover that experimental maximum, while allocation remains at five
+     * prefixes unless DS4_DSPARK_HYBRID_LC is enabled. */
+    DS4_SPEC_PREFIX_MAX = DS4_HYBRID_LC_MAX_DRAFT,
     DS4_DSPARK_VERIFY_ROWS = DS4_DSPARK_BLOCK_SIZE + 1,
     DS4_DSPARK_WINDOW = 128,
     DS4_DSPARK_MARKOV_RANK = 256,
@@ -10558,6 +10576,9 @@ typedef struct {
     uint32_t spec_prefix_n_index_comp[DS4_SPEC_PREFIX_MAX][DS4_MAX_LAYER];
     bool spec_prefix_gvr_hint_valid[DS4_SPEC_PREFIX_MAX][DS4_MAX_LAYER];
     uint32_t spec_capture_prefixes;
+    uint32_t spec_prefix_cap;
+    uint32_t dspark_draft_cap;
+    uint32_t dspark_verify_cap;
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
@@ -11280,6 +11301,14 @@ static bool metal_graph_alloc_raw_cap(
     g->mtp_enabled = enable_mtp;
     g->dspark_enabled = enable_dspark;
     const bool enable_spec = enable_mtp || enable_dspark;
+    const bool hybrid_lc = enable_dspark &&
+                           ds4_env_enabled("DS4_DSPARK_HYBRID_LC");
+    g->spec_prefix_cap = hybrid_lc
+        ? DS4_HYBRID_LC_MAX_DRAFT : DS4_DSPARK_BLOCK_SIZE;
+    g->dspark_draft_cap = hybrid_lc
+        ? DS4_HYBRID_LC_MAX_DRAFT : DS4_DSPARK_BLOCK_SIZE;
+    g->dspark_verify_cap = hybrid_lc
+        ? DS4_HYBRID_LC_MAX_ROWS : DS4_DSPARK_VERIFY_ROWS;
     if (raw_cap == 0) raw_cap = 1;
     if (ctx_size == 0) ctx_size = raw_cap;
     if (prefill_cap == 0) prefill_cap = 1;
@@ -11394,7 +11423,7 @@ static bool metal_graph_alloc_raw_cap(
             if (enable_spec) {
                 g->spec_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                 g->spec_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
-                for (uint32_t p = 0; p < DS4_SPEC_PREFIX_MAX; p++) {
+                for (uint32_t p = 0; p < g->spec_prefix_cap; p++) {
                     g->spec_prefix_attn_state_kv[p][il] =
                         ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
                     g->spec_prefix_attn_state_score[p][il] =
@@ -11432,7 +11461,7 @@ static bool metal_graph_alloc_raw_cap(
                         g->spec_gvr_hint[il] = ds4_gpu_tensor_alloc(
                                 (uint64_t)DS4_N_INDEXER_TOP_K * sizeof(uint32_t));
                     }
-                    for (uint32_t p = 0; p < DS4_SPEC_PREFIX_MAX; p++) {
+                    for (uint32_t p = 0; p < g->spec_prefix_cap; p++) {
                         g->spec_prefix_index_state_kv[p][il] =
                             ds4_gpu_tensor_alloc(index_width * index_rows * sizeof(float));
                         g->spec_prefix_index_state_score[p][il] =
@@ -11545,7 +11574,7 @@ static bool metal_graph_alloc_raw_cap(
                     managed_kv_cache,
                     (uint64_t)DS4_DSPARK_WINDOW * DS4_N_HEAD_DIM * sizeof(float));
             g->dspark_spec_ring_backup[i] = ds4_gpu_tensor_alloc(
-                    (uint64_t)DS4_DSPARK_VERIFY_ROWS *
+                    (uint64_t)g->dspark_verify_cap *
                     DS4_N_HEAD_DIM * sizeof(float));
         }
         g->dspark_target_hidden = ds4_gpu_tensor_alloc(
@@ -11564,7 +11593,7 @@ static bool metal_graph_alloc_raw_cap(
                 (uint64_t)(DS4_DSPARK_WINDOW + DS4_DSPARK_BLOCK_SIZE) *
                 DS4_N_HEAD_DIM * sizeof(float));
         g->dspark_tokens = ds4_gpu_tensor_alloc(
-                (uint64_t)(DS4_DSPARK_BLOCK_SIZE + 1u) * sizeof(int32_t));
+                (uint64_t)(g->dspark_draft_cap + 1u) * sizeof(int32_t));
         g->dspark_markov_hidden = ds4_gpu_tensor_alloc(
                 (uint64_t)DS4_DSPARK_BLOCK_SIZE *
                 DS4_DSPARK_MARKOV_RANK * sizeof(float));
@@ -11573,18 +11602,18 @@ static bool metal_graph_alloc_raw_cap(
         g->dspark_confidence = ds4_gpu_tensor_alloc(
                 (uint64_t)DS4_DSPARK_BLOCK_SIZE * sizeof(float));
         g->dspark_draft_probs = ds4_gpu_tensor_alloc(
-                (uint64_t)DS4_DSPARK_BLOCK_SIZE *
+                (uint64_t)g->dspark_draft_cap *
                 DS4_N_VOCAB * sizeof(float));
         g->dspark_sample_uniforms = ds4_gpu_tensor_alloc(
                 (uint64_t)DS4_DSPARK_BLOCK_SIZE * sizeof(float));
         g->dspark_accept_uniforms = ds4_gpu_tensor_alloc(
-                (uint64_t)DS4_DSPARK_BLOCK_SIZE * sizeof(float));
+                (uint64_t)g->dspark_draft_cap * sizeof(float));
         g->dspark_residual_uniforms = ds4_gpu_tensor_alloc(
-                (uint64_t)DS4_DSPARK_BLOCK_SIZE * sizeof(float));
+                (uint64_t)g->dspark_draft_cap * sizeof(float));
         g->dspark_verify_tokens = ds4_gpu_tensor_alloc(
-                (uint64_t)DS4_DSPARK_BLOCK_SIZE * sizeof(int32_t));
+                (uint64_t)g->dspark_draft_cap * sizeof(int32_t));
         g->dspark_verify_accept = ds4_gpu_tensor_alloc(
-                (uint64_t)DS4_DSPARK_BLOCK_SIZE * sizeof(int32_t));
+                (uint64_t)g->dspark_draft_cap * sizeof(int32_t));
         g->dspark_n_raw = 0;
         if (g->dspark_mean_weights) {
             state_init_ok = state_init_ok &&
@@ -11730,7 +11759,7 @@ static bool metal_graph_alloc_raw_cap(
                               (g->spec_attn_state_kv[il] != NULL &&
                                g->spec_attn_state_score[il] != NULL));
             for (uint32_t p = 0; layer_cache_ok && enable_spec &&
-                                 p < DS4_SPEC_PREFIX_MAX; p++) {
+                                 p < g->spec_prefix_cap; p++) {
                 layer_cache_ok = g->spec_prefix_attn_state_kv[p][il] != NULL &&
                                  g->spec_prefix_attn_state_score[p][il] != NULL;
             }
@@ -11747,7 +11776,7 @@ static bool metal_graph_alloc_raw_cap(
                                (!DS4_GPU_INDEXER_PACKED ||
                                 g->spec_gvr_hint[il] != NULL)));
             for (uint32_t p = 0; layer_cache_ok && enable_spec &&
-                                 p < DS4_SPEC_PREFIX_MAX; p++) {
+                                 p < g->spec_prefix_cap; p++) {
                 layer_cache_ok = g->spec_prefix_index_state_kv[p][il] != NULL &&
                                  g->spec_prefix_index_state_score[p][il] != NULL &&
                                  (!DS4_GPU_INDEXER_PACKED ||
@@ -13722,7 +13751,7 @@ static uint32_t metal_graph_raw_start_for_span(
 static bool metal_graph_capture_prefix_attn_state(
         ds4_gpu_graph *g, uint32_t il, uint32_t prefix_index) {
     if (prefix_index >= g->spec_capture_prefixes ||
-        prefix_index >= DS4_SPEC_PREFIX_MAX ||
+        prefix_index >= g->spec_prefix_cap ||
         !g->spec_prefix_attn_state_kv[prefix_index][il]) return true;
     const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
     g->spec_prefix_n_comp[prefix_index][il] = g->layer_n_comp[il];
@@ -13735,7 +13764,7 @@ static bool metal_graph_capture_prefix_attn_state(
 static bool metal_graph_capture_prefix_index_state(
         ds4_gpu_graph *g, uint32_t il, uint32_t prefix_index) {
     if (prefix_index >= g->spec_capture_prefixes ||
-        prefix_index >= DS4_SPEC_PREFIX_MAX ||
+        prefix_index >= g->spec_prefix_cap ||
         !g->spec_prefix_index_state_kv[prefix_index][il]) return true;
     const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_index_state_kv[il]);
     g->spec_prefix_n_index_comp[prefix_index][il] = g->layer_n_index_comp[il];
@@ -13748,7 +13777,7 @@ static bool metal_graph_capture_prefix_index_state(
 static bool metal_graph_capture_prefix_gvr_hint(
         ds4_gpu_graph *g, uint32_t il, uint32_t prefix_index) {
     if (prefix_index >= g->spec_capture_prefixes ||
-        prefix_index >= DS4_SPEC_PREFIX_MAX ||
+        prefix_index >= g->spec_prefix_cap ||
         !g->layer_gvr_hint_valid[il]) {
         return true;
     }
@@ -13807,7 +13836,7 @@ static bool metal_graph_indexer_topk_exact(
     for (uint32_t t = 0; capture_prefix_rows && ok && t < n_tokens; t++) {
         const uint32_t prefix = prefix_index_base + t;
         if (prefix >= g->spec_capture_prefixes ||
-            prefix >= DS4_SPEC_PREFIX_MAX) {
+            prefix >= g->spec_prefix_cap) {
             continue;
         }
         ds4_gpu_tensor *dst = g->spec_prefix_gvr_hint[prefix][il];
@@ -23526,8 +23555,8 @@ static bool metal_graph_verify_suffix_tops(
     const uint32_t saved_capture = g->spec_capture_prefixes;
     g->spec_capture_prefixes = capture_prefixes < n_tokens
         ? capture_prefixes : n_tokens - 1u;
-    if (g->spec_capture_prefixes > DS4_SPEC_PREFIX_MAX) {
-        g->spec_capture_prefixes = DS4_SPEC_PREFIX_MAX;
+    if (g->spec_capture_prefixes > g->spec_prefix_cap) {
+        g->spec_capture_prefixes = g->spec_prefix_cap;
     }
     memset(g->spec_prefix_gvr_hint_valid, 0,
            sizeof(g->spec_prefix_gvr_hint_valid));
@@ -25434,6 +25463,108 @@ int ds4_speculative_rejection_self_test(void) {
                                                                 target_probs);
         if (!accepted || token != draft) return 0;
     }
+
+    /* Two-token Block Verification must preserve the first target marginal
+     * even though a later accepted sub-block may supersede an earlier reject.
+     * This exercises the defining non-causal acceptance rule, not merely the
+     * length-one case shared with token verification. */
+    counts[0] = counts[1] = 0;
+    for (uint32_t trial = 0; trial < trials; trial++) {
+        int block_draft[2];
+        block_draft[0] = sample_rng_f32(&rng) < draft_probs[0] ? 0 : 1;
+        block_draft[1] = sample_rng_f32(&rng) < draft_probs[0] ? 0 : 1;
+        float prefix_accept[3] = {1.0f, 0.0f, 0.0f};
+        uint32_t accepted_prefix = 0;
+        for (uint32_t prefix = 1; prefix <= 2; prefix++) {
+            const int token = block_draft[prefix - 1u];
+            float a = prefix_accept[prefix - 1u] *
+                      (token == 0 ? 0.7f : 0.3f) /
+                      draft_probs[token];
+            if (a > 1.0f) a = 1.0f;
+            prefix_accept[prefix] = a;
+            float threshold = a;
+            if (prefix < 2) {
+                const float residual =
+                    fmaxf(a * 0.7f - 0.2f, 0.0f) +
+                    fmaxf(a * 0.3f - 0.8f, 0.0f);
+                const float denom = residual + 1.0f - a;
+                threshold = denom > 0.0f ? residual / denom : 1.0f;
+            }
+            if (sample_rng_f32(&rng) <= threshold) {
+                accepted_prefix = prefix;
+            }
+        }
+        int first = block_draft[0];
+        if (accepted_prefix == 0) {
+            const float r0 = fmaxf(0.7f - 0.2f, 0.0f);
+            const float r1 = fmaxf(0.3f - 0.8f, 0.0f);
+            first = sample_rng_f32(&rng) * (r0 + r1) < r0 ? 0 : 1;
+        }
+        counts[first]++;
+    }
+    const double block_observed0 = (double)counts[0] / (double)trials;
+    if (fabs(block_observed0 - 0.7) > 0.01) return 0;
+
+    /* Sparse q with a longer block exercises zero-probability vocabulary
+     * entries and every possible accepted prefix.  The first emitted marginal
+     * must still equal the dense target distribution. */
+    {
+        const float p[4] = {0.10f, 0.20f, 0.30f, 0.40f};
+        const float q[4] = {0.65f, 0.0f, 0.35f, 0.0f};
+        uint64_t sparse_counts[4] = {0, 0, 0, 0};
+        const uint32_t sparse_trials = 160000u;
+        for (uint32_t trial = 0; trial < sparse_trials; trial++) {
+            int block[3];
+            for (uint32_t row = 0; row < 3u; row++) {
+                block[row] = sample_rng_f32(&rng) < q[0] ? 0 : 2;
+            }
+            float prefix_accept = 1.0f;
+            uint32_t accepted_prefix = 0u;
+            for (uint32_t prefix = 1u; prefix <= 3u; prefix++) {
+                const int token = block[prefix - 1u];
+                float a = prefix_accept * p[token] / q[token];
+                if (a > 1.0f) a = 1.0f;
+                prefix_accept = a;
+                float threshold = a;
+                if (prefix < 3u) {
+                    float residual = 0.0f;
+                    for (uint32_t token_id = 0; token_id < 4u; token_id++) {
+                        residual += fmaxf(a * p[token_id] - q[token_id],
+                                         0.0f);
+                    }
+                    const float denom = residual + 1.0f - a;
+                    threshold = denom > 0.0f ? residual / denom : 1.0f;
+                }
+                if (sample_rng_f32(&rng) <= threshold) {
+                    accepted_prefix = prefix;
+                }
+            }
+            int first = block[0];
+            if (accepted_prefix == 0u) {
+                float residual[4];
+                float sum = 0.0f;
+                for (uint32_t token_id = 0; token_id < 4u; token_id++) {
+                    residual[token_id] =
+                        fmaxf(p[token_id] - q[token_id], 0.0f);
+                    sum += residual[token_id];
+                }
+                float remaining = sample_rng_f32(&rng) * sum;
+                first = 0;
+                for (uint32_t token_id = 0; token_id < 4u; token_id++) {
+                    if (residual[token_id] <= 0.0f) continue;
+                    first = (int)token_id;
+                    remaining -= residual[token_id];
+                    if (remaining <= 0.0f) break;
+                }
+            }
+            sparse_counts[first]++;
+        }
+        for (uint32_t token_id = 0; token_id < 4u; token_id++) {
+            const double observed =
+                (double)sparse_counts[token_id] / (double)sparse_trials;
+            if (fabs(observed - p[token_id]) > 0.012) return 0;
+        }
+    }
     return 1;
 }
 
@@ -25930,6 +26061,46 @@ static void ds4_acquire_instance_lock(void) {
 }
 
 #define DS4_DSPARK_CONTEXT_BUCKETS 8u
+
+typedef enum {
+    DS4_HYBRID_SOURCE_NEURAL = 0,
+    DS4_HYBRID_SOURCE_SUFFIX = 1,
+    DS4_HYBRID_SOURCE_TRANSITION = 2,
+} ds4_hybrid_source;
+
+typedef struct {
+    uint64_t hash;
+    uint32_t latest_end;
+    uint32_t previous_end;
+} ds4_hybrid_suffix_slot;
+
+typedef struct {
+    ds4_hybrid_suffix_slot *suffix;
+    int32_t *transition_token;
+    uint16_t *transition_count;
+    uint32_t *transition_seen;
+    uint32_t indexed_len;
+    uint64_t indexed_tail_hash;
+    uint64_t rebuilds;
+} ds4_hybrid_store;
+
+typedef struct {
+    int token[DS4_HYBRID_LC_MAX_DRAFT];
+    uint8_t source[DS4_HYBRID_LC_MAX_DRAFT];
+    uint8_t q_n[DS4_HYBRID_LC_MAX_DRAFT];
+    int32_t q_id[DS4_HYBRID_LC_MAX_DRAFT]
+                [DS4_HYBRID_LC_TRANSITION_TOP_K];
+    float q_prob[DS4_HYBRID_LC_MAX_DRAFT]
+                [DS4_HYBRID_LC_TRANSITION_TOP_K];
+    float on_path_q[DS4_HYBRID_LC_MAX_DRAFT];
+    uint32_t n;
+    uint32_t neural_n;
+    uint32_t suffix_n;
+    uint32_t transition_n;
+    uint32_t match_len;
+    uint32_t occurrences;
+} ds4_hybrid_draft;
+
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
 #define DS4_FRONTIER_SNAPSHOT_SLOTS 4u
 
@@ -25996,6 +26167,40 @@ struct ds4_session {
     double dspark_anchor_ewma;
     double dspark_draft_ewma;
     double dspark_suffix_rate_ewma;
+    double hybrid_lc_accept_ewma;
+    double hybrid_lc_suffix_accept_ewma;
+    double hybrid_lc_transition_accept_ewma;
+    double hybrid_lc_verify_ewma[DS4_DSPARK_CONTEXT_BUCKETS]
+                                [DS4_HYBRID_LC_WIDTHS];
+    double hybrid_lc_rate_ewma[DS4_DSPARK_CONTEXT_BUCKETS]
+                              [DS4_HYBRID_LC_WIDTHS];
+    uint64_t hybrid_lc_width_samples[DS4_DSPARK_CONTEXT_BUCKETS]
+                                    [DS4_HYBRID_LC_WIDTHS];
+    uint64_t hybrid_lc_attempts;
+    uint64_t hybrid_lc_hits;
+    uint64_t hybrid_lc_drafted;
+    uint64_t hybrid_lc_committed;
+    uint64_t hybrid_lc_shadow_attempts;
+    uint64_t hybrid_lc_shadow_queries;
+    uint64_t hybrid_lc_shadow_match8;
+    uint64_t hybrid_lc_shadow_match16;
+    uint64_t hybrid_lc_shadow_tokens;
+    uint64_t hybrid_lc_shadow_matches;
+    uint64_t hybrid_lc_shadow_full_matches;
+    uint64_t hybrid_lc_blockv_cycles;
+    uint64_t hybrid_lc_self_checks;
+    uint64_t hybrid_lc_self_check_failures;
+    uint64_t hybrid_lc_rng;
+    uint64_t hybrid_lc_shadow_rng;
+    uint32_t hybrid_lc_width_rows;
+    uint32_t hybrid_lc_cooldown;
+    uint32_t hybrid_lc_probe_cursor;
+    uint32_t hybrid_lc_shadow_n;
+    uint32_t hybrid_lc_shadow_pos;
+    int hybrid_lc_shadow_tokens_buf[DS4_HYBRID_LC_MAX_DRAFT];
+    bool hybrid_lc_shadow_failed;
+    bool hybrid_lc_disabled;
+    ds4_hybrid_store *hybrid_lc_store;
     uint32_t dspark_bad_streak;
     uint32_t dspark_k0_streak;
     uint32_t dspark_bypass_left;
@@ -26026,6 +26231,762 @@ struct ds4_session {
 
 static int ds4_session_materialize_logits_internal(
         ds4_session *s, char *err, size_t errlen);
+
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+static uint32_t dspark_context_bucket(const ds4_session *s);
+static double dspark_stable_cycle_rate(
+        const ds4_session *s, uint32_t k);
+
+static bool dspark_hybrid_lc_store_requested(void) {
+    return ds4_env_enabled("DS4_DSPARK_HYBRID_LC") ||
+           ds4_env_enabled("DS4_DSPARK_HYBRID_LC_SHADOW");
+}
+
+static bool dspark_hybrid_lc_enabled(const ds4_session *s) {
+    return s && s->graph.dspark_enabled &&
+           s->graph.dspark_draft_cap == DS4_HYBRID_LC_MAX_DRAFT &&
+           ds4_env_enabled("DS4_DSPARK_HYBRID_LC") &&
+           !s->hybrid_lc_disabled;
+}
+
+static bool dspark_hybrid_lc_shadow_enabled(const ds4_session *s) {
+    return s && s->graph.dspark_enabled &&
+           !ds4_env_enabled("DS4_DSPARK_HYBRID_LC") &&
+           ds4_env_enabled("DS4_DSPARK_HYBRID_LC_SHADOW") &&
+           !s->hybrid_lc_disabled;
+}
+
+static uint64_t dspark_hybrid_lc_hash_tokens(
+        const int *tokens, uint32_t n) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (uint32_t i = 0; i < n; i++) {
+        hash ^= (uint32_t)tokens[i] + UINT64_C(0x9e3779b97f4a7c15);
+        hash *= UINT64_C(1099511628211);
+        hash ^= hash >> 32u;
+    }
+    return hash ? hash : UINT64_C(1);
+}
+
+static uint64_t dspark_hybrid_lc_checkpoint_tail_hash(
+        const token_vec *checkpoint, uint32_t len) {
+    if (!checkpoint || len == 0 || (uint32_t)checkpoint->len < len) return 0;
+    const uint32_t n = len < DS4_HYBRID_LC_SUFFIX_TOKENS
+        ? len : DS4_HYBRID_LC_SUFFIX_TOKENS;
+    return dspark_hybrid_lc_hash_tokens(checkpoint->v + len - n, n);
+}
+
+static ds4_hybrid_store *dspark_hybrid_lc_store_create(void) {
+    ds4_hybrid_store *store = xcalloc(1, sizeof(*store));
+    store->suffix = xmalloc(
+            (size_t)DS4_HYBRID_LC_SUFFIX_SLOTS * sizeof(store->suffix[0]));
+    memset(store->suffix, 0xff,
+           (size_t)DS4_HYBRID_LC_SUFFIX_SLOTS * sizeof(store->suffix[0]));
+    const uint64_t transitions =
+        (uint64_t)DS4_N_VOCAB * DS4_HYBRID_LC_TRANSITION_TOP_K;
+    store->transition_token = xmalloc(
+            (size_t)transitions * sizeof(store->transition_token[0]));
+    store->transition_count = xcalloc(
+            (size_t)transitions, sizeof(store->transition_count[0]));
+    store->transition_seen = xcalloc(
+            DS4_N_VOCAB, sizeof(store->transition_seen[0]));
+    memset(store->transition_token, 0xff,
+           (size_t)transitions * sizeof(store->transition_token[0]));
+    return store;
+}
+
+static void dspark_hybrid_lc_store_free(ds4_hybrid_store *store) {
+    if (!store) return;
+    free(store->transition_seen);
+    free(store->transition_count);
+    free(store->transition_token);
+    free(store->suffix);
+    free(store);
+}
+
+static void dspark_hybrid_lc_store_reset(ds4_hybrid_store *store) {
+    if (!store) return;
+    memset(store->suffix, 0xff,
+           (size_t)DS4_HYBRID_LC_SUFFIX_SLOTS * sizeof(store->suffix[0]));
+    const uint64_t transitions =
+        (uint64_t)DS4_N_VOCAB * DS4_HYBRID_LC_TRANSITION_TOP_K;
+    memset(store->transition_token, 0xff,
+           (size_t)transitions * sizeof(store->transition_token[0]));
+    memset(store->transition_count, 0,
+           (size_t)transitions * sizeof(store->transition_count[0]));
+    memset(store->transition_seen, 0,
+           (size_t)DS4_N_VOCAB * sizeof(store->transition_seen[0]));
+    store->indexed_len = 0;
+    store->indexed_tail_hash = 0;
+    store->rebuilds++;
+}
+
+static void dspark_hybrid_lc_oracle_reset(ds4_session *s) {
+    if (!s) return;
+    dspark_hybrid_lc_store_reset(s->hybrid_lc_store);
+    s->hybrid_lc_shadow_n = 0u;
+    s->hybrid_lc_shadow_pos = 0u;
+    s->hybrid_lc_shadow_failed = false;
+}
+
+static bool dspark_hybrid_lc_checkpoint_suffix_equal(
+        const token_vec *checkpoint, uint32_t a_end, uint32_t b_end) {
+    if (!checkpoint ||
+        a_end + 1u < DS4_HYBRID_LC_SUFFIX_TOKENS ||
+        b_end + 1u < DS4_HYBRID_LC_SUFFIX_TOKENS) {
+        return false;
+    }
+    for (uint32_t i = 0; i < DS4_HYBRID_LC_SUFFIX_TOKENS; i++) {
+        if (checkpoint->v[a_end + 1u - DS4_HYBRID_LC_SUFFIX_TOKENS + i] !=
+            checkpoint->v[b_end + 1u - DS4_HYBRID_LC_SUFFIX_TOKENS + i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void dspark_hybrid_lc_suffix_insert(
+        ds4_hybrid_store *store, const token_vec *checkpoint, uint32_t end) {
+    if (!store || !checkpoint ||
+        end + 1u < DS4_HYBRID_LC_SUFFIX_TOKENS ||
+        end + 1u >= (uint32_t)checkpoint->len) {
+        return;
+    }
+    const int *tokens =
+        checkpoint->v + end + 1u - DS4_HYBRID_LC_SUFFIX_TOKENS;
+    const uint64_t hash = dspark_hybrid_lc_hash_tokens(
+            tokens, DS4_HYBRID_LC_SUFFIX_TOKENS);
+    uint32_t slot = (uint32_t)hash & (DS4_HYBRID_LC_SUFFIX_SLOTS - 1u);
+    const uint32_t min_live = end > DS4_HYBRID_LC_SEARCH_TOKENS
+        ? end - DS4_HYBRID_LC_SEARCH_TOKENS : 0u;
+    for (uint32_t probe = 0; probe < DS4_HYBRID_LC_SUFFIX_SLOTS; probe++) {
+        ds4_hybrid_suffix_slot *entry = &store->suffix[slot];
+        if (entry->latest_end == UINT32_MAX ||
+            (entry->latest_end < min_live &&
+             (entry->previous_end == UINT32_MAX ||
+              entry->previous_end < min_live))) {
+            entry->hash = hash;
+            entry->latest_end = end;
+            entry->previous_end = UINT32_MAX;
+            return;
+        }
+        if (entry->hash == hash &&
+            dspark_hybrid_lc_checkpoint_suffix_equal(
+                    checkpoint, entry->latest_end, end)) {
+            if (entry->latest_end != end) {
+                entry->previous_end = entry->latest_end;
+                entry->latest_end = end;
+            }
+            return;
+        }
+        slot = (slot + 1u) & (DS4_HYBRID_LC_SUFFIX_SLOTS - 1u);
+    }
+}
+
+static void dspark_hybrid_lc_transition_add(
+        ds4_hybrid_store *store, int previous, int next) {
+    if (!store || previous < 0 || next < 0 ||
+        previous >= (int)DS4_N_VOCAB || next >= (int)DS4_N_VOCAB) {
+        return;
+    }
+    const uint64_t base =
+        (uint64_t)(uint32_t)previous * DS4_HYBRID_LC_TRANSITION_TOP_K;
+    uint32_t empty = UINT32_MAX;
+    uint32_t minimum = 0;
+    for (uint32_t i = 0; i < DS4_HYBRID_LC_TRANSITION_TOP_K; i++) {
+        if (store->transition_token[base + i] == next) {
+            if (store->transition_count[base + i] != UINT16_MAX) {
+                store->transition_count[base + i]++;
+            }
+            if (store->transition_seen[previous] != UINT32_MAX) {
+                store->transition_seen[previous]++;
+            }
+            return;
+        }
+        if (store->transition_token[base + i] < 0 && empty == UINT32_MAX) {
+            empty = i;
+        }
+        if (store->transition_count[base + i] <
+            store->transition_count[base + minimum]) {
+            minimum = i;
+        }
+    }
+    const uint32_t target = empty != UINT32_MAX ? empty : minimum;
+    const uint16_t prior = empty != UINT32_MAX
+        ? 0u : store->transition_count[base + target];
+    store->transition_token[base + target] = next;
+    store->transition_count[base + target] =
+        prior == UINT16_MAX ? UINT16_MAX : (uint16_t)(prior + 1u);
+    if (store->transition_seen[previous] != UINT32_MAX) {
+        store->transition_seen[previous]++;
+    }
+}
+
+static void dspark_hybrid_lc_store_sync(ds4_session *s) {
+    ds4_hybrid_store *store = s ? s->hybrid_lc_store : NULL;
+    if (!store) return;
+    const token_vec *checkpoint = &s->checkpoint;
+    const uint32_t len = checkpoint->len > 0
+        ? (uint32_t)checkpoint->len : 0u;
+    bool rebuild = len < store->indexed_len;
+    if (!rebuild && store->indexed_len != 0u) {
+        rebuild = dspark_hybrid_lc_checkpoint_tail_hash(
+                checkpoint, store->indexed_len) != store->indexed_tail_hash;
+    }
+    if (rebuild) dspark_hybrid_lc_oracle_reset(s);
+
+    uint32_t transition_start = store->indexed_len != 0u
+        ? store->indexed_len : 1u;
+    uint32_t suffix_start = store->indexed_len > 0u
+        ? store->indexed_len - 1u : DS4_HYBRID_LC_SUFFIX_TOKENS - 1u;
+    if (store->indexed_len == 0u) {
+        const uint32_t window_start = len > DS4_HYBRID_LC_SEARCH_TOKENS
+            ? len - DS4_HYBRID_LC_SEARCH_TOKENS : 1u;
+        transition_start = window_start;
+        suffix_start = window_start > DS4_HYBRID_LC_SUFFIX_TOKENS - 1u
+            ? window_start : DS4_HYBRID_LC_SUFFIX_TOKENS - 1u;
+    }
+    for (uint32_t i = transition_start; i < len; i++) {
+        dspark_hybrid_lc_transition_add(
+                store, checkpoint->v[i - 1u], checkpoint->v[i]);
+    }
+    if (len > 1u) {
+        for (uint32_t end = suffix_start; end + 1u < len; end++) {
+            dspark_hybrid_lc_suffix_insert(store, checkpoint, end);
+        }
+    }
+    store->indexed_len = len;
+    store->indexed_tail_hash =
+        dspark_hybrid_lc_checkpoint_tail_hash(checkpoint, len);
+}
+
+static int dspark_hybrid_lc_virtual_token(
+        const ds4_session *s,
+        int                first_token,
+        const ds4_hybrid_draft *draft,
+        uint32_t           index) {
+    const uint32_t checkpoint_len = (uint32_t)s->checkpoint.len;
+    if (index < checkpoint_len) return s->checkpoint.v[index];
+    if (index == checkpoint_len) return first_token;
+    const uint32_t draft_index = index - checkpoint_len - 1u;
+    return draft_index < draft->n ? draft->token[draft_index] : -1;
+}
+
+static bool dspark_hybrid_lc_suffix_lookup(
+        ds4_session *s, int first_token, const ds4_hybrid_draft *draft,
+        int *next_token, uint32_t *match_len, uint32_t *occurrences) {
+    ds4_hybrid_store *store = s ? s->hybrid_lc_store : NULL;
+    if (!store || s->checkpoint.len <= DS4_HYBRID_LC_SUFFIX_TOKENS) {
+        return false;
+    }
+    const uint32_t query_len =
+        (uint32_t)s->checkpoint.len + 1u + draft->n;
+    if (query_len < DS4_HYBRID_LC_SUFFIX_TOKENS) return false;
+    int query[DS4_HYBRID_LC_SUFFIX_TOKENS];
+    for (uint32_t i = 0; i < DS4_HYBRID_LC_SUFFIX_TOKENS; i++) {
+        query[i] = dspark_hybrid_lc_virtual_token(
+                s, first_token, draft,
+                query_len - DS4_HYBRID_LC_SUFFIX_TOKENS + i);
+    }
+    const uint64_t hash = dspark_hybrid_lc_hash_tokens(
+            query, DS4_HYBRID_LC_SUFFIX_TOKENS);
+    uint32_t slot = (uint32_t)hash & (DS4_HYBRID_LC_SUFFIX_SLOTS - 1u);
+    const uint32_t min_end =
+        (uint32_t)s->checkpoint.len > DS4_HYBRID_LC_SEARCH_TOKENS
+            ? (uint32_t)s->checkpoint.len - DS4_HYBRID_LC_SEARCH_TOKENS
+            : DS4_HYBRID_LC_SUFFIX_TOKENS - 1u;
+    for (uint32_t probe = 0; probe < DS4_HYBRID_LC_SUFFIX_SLOTS; probe++) {
+        const ds4_hybrid_suffix_slot *entry = &store->suffix[slot];
+        if (entry->latest_end == UINT32_MAX) return false;
+        if (entry->hash == hash) {
+            const uint32_t candidates[2] = {
+                entry->latest_end, entry->previous_end
+            };
+            uint32_t found = 0;
+            for (uint32_t c = 0; c < 2u; c++) {
+                const uint32_t end = candidates[c];
+                if (end == UINT32_MAX || end < min_end ||
+                    end + 1u >= (uint32_t)s->checkpoint.len) {
+                    continue;
+                }
+                bool exact = true;
+                for (uint32_t i = 0; i < DS4_HYBRID_LC_SUFFIX_TOKENS; i++) {
+                    if (s->checkpoint.v[
+                            end + 1u - DS4_HYBRID_LC_SUFFIX_TOKENS + i] !=
+                        query[i]) {
+                        exact = false;
+                        break;
+                    }
+                }
+                if (!exact) continue;
+                found++;
+                if (found == 1u) {
+                    uint32_t extended = DS4_HYBRID_LC_SUFFIX_TOKENS;
+                    while (extended < DS4_HYBRID_LC_SUFFIX_MATCH_MAX &&
+                           extended < query_len && extended <= end) {
+                        const int historical =
+                            s->checkpoint.v[end - extended];
+                        const int current = dspark_hybrid_lc_virtual_token(
+                                s, first_token, draft,
+                                query_len - extended - 1u);
+                        if (historical != current) break;
+                        extended++;
+                    }
+                    *next_token = s->checkpoint.v[end + 1u];
+                    if (match_len) *match_len = extended;
+                }
+            }
+            if (found != 0u) {
+                if (occurrences) *occurrences = found;
+                return true;
+            }
+        }
+        slot = (slot + 1u) & (DS4_HYBRID_LC_SUFFIX_SLOTS - 1u);
+    }
+    return false;
+}
+
+static double dspark_hybrid_lc_transition_threshold(void) {
+    const char *value = getenv("DS4_DSPARK_HYBRID_TRANSITION_MIN_P");
+    if (!value || !value[0]) return 0.55;
+    char *end = NULL;
+    const double parsed = strtod(value, &end);
+    return end != value && *end == '\0' && isfinite(parsed) &&
+           parsed >= 0.0 && parsed <= 1.0 ? parsed : 0.55;
+}
+
+static bool dspark_hybrid_lc_transition_sample(
+        ds4_session *s, int previous, uint64_t *rng,
+        int *token, uint8_t *q_n, int32_t *q_id, float *q_prob,
+        float *on_path_q) {
+    ds4_hybrid_store *store = s ? s->hybrid_lc_store : NULL;
+    if (!store || previous < 0 || previous >= (int)DS4_N_VOCAB ||
+        store->transition_seen[previous] < 4u) {
+        return false;
+    }
+    const uint64_t base =
+        (uint64_t)(uint32_t)previous * DS4_HYBRID_LC_TRANSITION_TOP_K;
+    uint32_t order[DS4_HYBRID_LC_TRANSITION_TOP_K];
+    uint32_t n = 0;
+    uint32_t sum = 0;
+    for (uint32_t i = 0; i < DS4_HYBRID_LC_TRANSITION_TOP_K; i++) {
+        if (store->transition_token[base + i] < 0 ||
+            store->transition_count[base + i] == 0u) {
+            continue;
+        }
+        uint32_t j = n++;
+        while (j > 0u &&
+               store->transition_count[base + order[j - 1u]] <
+               store->transition_count[base + i]) {
+            order[j] = order[j - 1u];
+            j--;
+        }
+        order[j] = i;
+        sum += store->transition_count[base + i];
+    }
+    if (n == 0u || sum == 0u) return false;
+    const double confidence =
+        (double)store->transition_count[base + order[0]] / (double)sum;
+    if (confidence < dspark_hybrid_lc_transition_threshold()) return false;
+
+    float remaining = rng ? sample_rng_f32(rng) : 0.0f;
+    uint32_t selected = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        q_id[i] = store->transition_token[base + order[i]];
+        q_prob[i] =
+            (float)store->transition_count[base + order[i]] / (float)sum;
+        if (remaining >= 0.0f) {
+            remaining -= q_prob[i];
+            if (remaining <= 0.0f) {
+                selected = i;
+                remaining = -1.0f;
+            }
+        }
+    }
+    *token = q_id[selected];
+    *q_n = (uint8_t)n;
+    *on_path_q = q_prob[selected];
+    return true;
+}
+
+static uint32_t dspark_hybrid_lc_build_draft(
+        ds4_session *s, int first_token, const int *neural_tokens,
+        uint32_t neural_n, uint32_t max_draft, int eos_token,
+        uint64_t *rng, ds4_hybrid_draft *draft) {
+    memset(draft, 0, sizeof(*draft));
+    if (!s || !s->hybrid_lc_store || max_draft == 0u) return 0;
+    dspark_hybrid_lc_store_sync(s);
+    if (neural_n > max_draft) neural_n = max_draft;
+    for (uint32_t i = 0; i < neural_n; i++) {
+        draft->token[i] = neural_tokens[i];
+        draft->source[i] = DS4_HYBRID_SOURCE_NEURAL;
+    }
+    draft->n = neural_n;
+    draft->neural_n = neural_n;
+
+    while (draft->n < max_draft) {
+        const uint32_t row = draft->n;
+        int token = -1;
+        uint32_t match_len = 0;
+        uint32_t occurrences = 0;
+        if (dspark_hybrid_lc_suffix_lookup(
+                s, first_token, draft, &token, &match_len, &occurrences)) {
+            draft->token[row] = token;
+            draft->source[row] = DS4_HYBRID_SOURCE_SUFFIX;
+            draft->q_n[row] = 1u;
+            draft->q_id[row][0] = token;
+            draft->q_prob[row][0] = 1.0f;
+            draft->on_path_q[row] = 1.0f;
+            draft->suffix_n++;
+            if (match_len > draft->match_len) draft->match_len = match_len;
+            if (occurrences > draft->occurrences) {
+                draft->occurrences = occurrences;
+            }
+            s->hybrid_lc_hits++;
+        } else {
+            const uint32_t virtual_len =
+                (uint32_t)s->checkpoint.len + 1u + draft->n;
+            const int previous = dspark_hybrid_lc_virtual_token(
+                    s, first_token, draft, virtual_len - 1u);
+            if (!dspark_hybrid_lc_transition_sample(
+                    s, previous, rng, &draft->token[row], &draft->q_n[row],
+                    draft->q_id[row], draft->q_prob[row],
+                    &draft->on_path_q[row])) {
+                break;
+            }
+            draft->source[row] = DS4_HYBRID_SOURCE_TRANSITION;
+            draft->transition_n++;
+        }
+        draft->n++;
+        if (draft->token[row] == eos_token) break;
+    }
+    return draft->n;
+}
+
+static int dspark_hybrid_lc_width_index(uint32_t rows) {
+    static const uint32_t widths[DS4_HYBRID_LC_WIDTHS] = {
+        3u, 6u, 8u, 12u, 16u
+    };
+    for (uint32_t i = 0; i < DS4_HYBRID_LC_WIDTHS; i++) {
+        if (widths[i] == rows) return (int)i;
+    }
+    return -1;
+}
+
+static uint32_t dspark_hybrid_lc_select_rows(
+        ds4_session *s, const ds4_hybrid_draft *draft) {
+    const uint32_t base_rows = draft->neural_n + 1u;
+    const uint32_t available_rows = draft->n + 1u;
+    const char *forced = getenv("DS4_DSPARK_HYBRID_WIDTH");
+    if (forced && forced[0]) {
+        char *end = NULL;
+        const unsigned long parsed = strtoul(forced, &end, 10);
+        if (end != forced && *end == '\0' &&
+            parsed >= base_rows && parsed <= available_rows &&
+            dspark_hybrid_lc_width_index((uint32_t)parsed) >= 0) {
+            return (uint32_t)parsed;
+        }
+    }
+
+    static const uint32_t long_widths[3] = {8u, 12u, 16u};
+    const uint32_t bucket = dspark_context_bucket(s);
+    for (uint32_t p = 0; p < 3u; p++) {
+        const uint32_t probe = (s->hybrid_lc_probe_cursor + p) % 3u;
+        const uint32_t rows = long_widths[probe];
+        const int index = dspark_hybrid_lc_width_index(rows);
+        if (rows >= base_rows && rows <= available_rows &&
+            s->hybrid_lc_width_samples[bucket][index] < 2u) {
+            s->hybrid_lc_probe_cursor = (probe + 1u) % 3u;
+            return rows;
+        }
+    }
+    if (s->dspark_cycles != 0u && (s->dspark_cycles % 256u) == 0u) {
+        for (uint32_t p = 0; p < 3u; p++) {
+            const uint32_t probe = (s->hybrid_lc_probe_cursor + p) % 3u;
+            const uint32_t rows = long_widths[probe];
+            if (rows >= base_rows && rows <= available_rows) {
+                s->hybrid_lc_probe_cursor = (probe + 1u) % 3u;
+                return rows;
+            }
+        }
+    }
+
+    uint32_t best_rows = base_rows;
+    double best_rate = dspark_stable_cycle_rate(s, draft->neural_n);
+    for (uint32_t p = 0; p < 3u; p++) {
+        const uint32_t rows = long_widths[p];
+        const int index = dspark_hybrid_lc_width_index(rows);
+        if (rows < base_rows || rows > available_rows ||
+            s->hybrid_lc_width_samples[bucket][index] == 0u) {
+            continue;
+        }
+        const double rate = s->hybrid_lc_rate_ewma[bucket][index];
+        if (rate > best_rate) {
+            best_rate = rate;
+            best_rows = rows;
+        }
+    }
+    if (best_rate == 0.0) {
+        if (draft->match_len >= 16u && draft->occurrences >= 2u &&
+            available_rows >= 12u) {
+            best_rows = available_rows >= 16u ? 16u : 12u;
+        } else if (available_rows >= 8u) {
+            best_rows = 8u;
+        }
+    }
+    s->hybrid_lc_width_rows = best_rows;
+    return best_rows;
+}
+
+static void dspark_hybrid_lc_note(
+        ds4_session *s, const ds4_hybrid_draft *draft,
+        uint32_t rows, uint32_t committed, uint32_t emitted,
+        double verify_seconds, double total_seconds) {
+    if (!s || !draft || draft->n <= draft->neural_n) return;
+    uint32_t tail_drafted = 0;
+    uint32_t tail_committed = 0;
+    uint32_t suffix_drafted = 0;
+    uint32_t suffix_committed = 0;
+    uint32_t transition_drafted = 0;
+    uint32_t transition_committed = 0;
+    for (uint32_t i = draft->neural_n; i < draft->n; i++) {
+        tail_drafted++;
+        const bool accepted = committed > i;
+        if (accepted) tail_committed++;
+        if (draft->source[i] == DS4_HYBRID_SOURCE_SUFFIX) {
+            suffix_drafted++;
+            if (accepted) suffix_committed++;
+        } else if (draft->source[i] == DS4_HYBRID_SOURCE_TRANSITION) {
+            transition_drafted++;
+            if (accepted) transition_committed++;
+        }
+    }
+    const double ratio = tail_drafted != 0u
+        ? (double)tail_committed / (double)tail_drafted : 0.0;
+    s->hybrid_lc_accept_ewma = s->hybrid_lc_attempts == 0u
+        ? ratio : s->hybrid_lc_accept_ewma * 0.85 + ratio * 0.15;
+    if (suffix_drafted != 0u) {
+        const double suffix_ratio =
+            (double)suffix_committed / (double)suffix_drafted;
+        s->hybrid_lc_suffix_accept_ewma =
+            s->hybrid_lc_suffix_accept_ewma == 0.0
+                ? suffix_ratio
+                : s->hybrid_lc_suffix_accept_ewma * 0.85 +
+                  suffix_ratio * 0.15;
+    }
+    if (transition_drafted != 0u) {
+        const double transition_ratio =
+            (double)transition_committed / (double)transition_drafted;
+        s->hybrid_lc_transition_accept_ewma =
+            s->hybrid_lc_transition_accept_ewma == 0.0
+                ? transition_ratio
+                : s->hybrid_lc_transition_accept_ewma * 0.85 +
+                  transition_ratio * 0.15;
+    }
+    s->hybrid_lc_attempts++;
+    s->hybrid_lc_drafted += tail_drafted;
+    s->hybrid_lc_committed += tail_committed;
+    const int width_index = dspark_hybrid_lc_width_index(rows);
+    if (width_index >= 0 && verify_seconds > 0.0 && total_seconds > 0.0) {
+        const uint32_t bucket = dspark_context_bucket(s);
+        const uint64_t samples =
+            ++s->hybrid_lc_width_samples[bucket][width_index];
+        const double alpha = samples <= 2u ? 1.0 : 0.20;
+        const double rate = (double)emitted / total_seconds;
+        s->hybrid_lc_verify_ewma[bucket][width_index] =
+            samples == 1u ? verify_seconds
+                : s->hybrid_lc_verify_ewma[bucket][width_index] *
+                      (1.0 - alpha) + verify_seconds * alpha;
+        s->hybrid_lc_rate_ewma[bucket][width_index] =
+            samples == 1u ? rate
+                : s->hybrid_lc_rate_ewma[bucket][width_index] *
+                      (1.0 - alpha) + rate * alpha;
+    }
+    if (tail_committed == 0u && s->hybrid_lc_attempts >= 8u &&
+        s->hybrid_lc_accept_ewma < 0.20) {
+        s->hybrid_lc_cooldown = 64;
+    }
+}
+
+static void dspark_hybrid_lc_shadow_observe(
+        ds4_session *s, const int *tokens, uint32_t n) {
+    if (!s || !tokens || n == 0u || s->hybrid_lc_shadow_n == 0u) return;
+    for (uint32_t i = 0; i < n &&
+         s->hybrid_lc_shadow_pos < s->hybrid_lc_shadow_n; i++) {
+        s->hybrid_lc_shadow_tokens++;
+        if (tokens[i] ==
+            s->hybrid_lc_shadow_tokens_buf[s->hybrid_lc_shadow_pos]) {
+            s->hybrid_lc_shadow_matches++;
+            s->hybrid_lc_shadow_pos++;
+        } else {
+            s->hybrid_lc_shadow_failed = true;
+            s->hybrid_lc_shadow_pos = s->hybrid_lc_shadow_n;
+        }
+    }
+    if (s->hybrid_lc_shadow_pos >= s->hybrid_lc_shadow_n) {
+        if (!s->hybrid_lc_shadow_failed) {
+            s->hybrid_lc_shadow_full_matches++;
+        }
+        s->hybrid_lc_shadow_n = 0u;
+        s->hybrid_lc_shadow_pos = 0u;
+        s->hybrid_lc_shadow_failed = false;
+    }
+}
+
+static void dspark_hybrid_lc_shadow_arm(
+        ds4_session *s, const ds4_hybrid_draft *draft) {
+    if (!s || !draft || draft->n <= draft->neural_n ||
+        s->hybrid_lc_shadow_n != 0u) {
+        return;
+    }
+    s->hybrid_lc_shadow_attempts++;
+    s->hybrid_lc_shadow_n = draft->n - draft->neural_n;
+    s->hybrid_lc_shadow_pos = 0u;
+    s->hybrid_lc_shadow_failed = false;
+    memcpy(s->hybrid_lc_shadow_tokens_buf,
+           draft->token + draft->neural_n,
+           (size_t)s->hybrid_lc_shadow_n *
+               sizeof(s->hybrid_lc_shadow_tokens_buf[0]));
+}
+
+static bool dspark_hybrid_lc_self_check_fail(
+        ds4_session *s, const char *reason) {
+    if (!s) return false;
+    s->hybrid_lc_self_check_failures++;
+    s->hybrid_lc_disabled = true;
+    s->hybrid_lc_shadow_n = 0u;
+    s->hybrid_lc_shadow_pos = 0u;
+    s->hybrid_lc_shadow_failed = false;
+    fprintf(stderr,
+            "ds4: HybridLC self-check failed (%s); "
+            "disabled for this session\n",
+            reason ? reason : "unknown error");
+    return false;
+}
+
+/* Periodically recompute only BlockV's prefix decisions on the CPU.  This is
+ * deliberately outside the hot path except for the first cycle and the chosen
+ * interval.  A discrepancy disables HybridLC for this session before any
+ * speculative frontier is committed; the caller then restores the snapshot
+ * and runs ordinary target decode. */
+static bool dspark_hybrid_lc_self_check(
+        ds4_session *s,
+        uint32_t n_rows,
+        float temperature,
+        float min_p,
+        const float *accept_uniforms,
+        uint32_t gpu_committed) {
+    if (!s || n_rows == 0u || n_rows > DS4_HYBRID_LC_MAX_DRAFT ||
+        !accept_uniforms || !s->dspark_target_probs_host ||
+        !s->dspark_draft_probs_host) {
+        return dspark_hybrid_lc_self_check_fail(
+                s, "invalid reference-check state");
+    }
+    const char *setting =
+        getenv("DS4_DSPARK_HYBRID_SELF_CHECK_INTERVAL");
+    uint64_t interval = 1024u;
+    if (setting && setting[0]) {
+        char *end = NULL;
+        const unsigned long long parsed = strtoull(setting, &end, 10);
+        if (end != setting && *end == '\0') interval = parsed;
+    }
+    if (interval == 0u ||
+        (s->hybrid_lc_self_checks != 0u &&
+         s->hybrid_lc_blockv_cycles % interval != 0u)) {
+        return true;
+    }
+    s->hybrid_lc_self_checks++;
+
+    float prefix_accept = 1.0f;
+    uint32_t expected = 0u;
+    bool boundary_case = false;
+    for (uint32_t prefix = 1u; prefix <= n_rows; prefix++) {
+        const uint32_t draft_row = prefix - 1u;
+        const uint64_t row_bytes =
+            (uint64_t)DS4_N_VOCAB * sizeof(float);
+        if (!ds4_gpu_tensor_read(
+                    s->graph.spec_logits,
+                    (uint64_t)draft_row * row_bytes,
+                    s->dspark_target_probs_host,
+                    row_bytes) ||
+            !ds4_gpu_tensor_read(
+                    s->graph.dspark_draft_probs,
+                    (uint64_t)draft_row * row_bytes,
+                    s->dspark_draft_probs_host,
+                    row_bytes) ||
+            !sample_full_vocab_min_p_probs(
+                    s->dspark_target_probs_host,
+                    DS4_N_VOCAB,
+                    temperature,
+                    min_p,
+                    s->dspark_target_probs_host)) {
+            return dspark_hybrid_lc_self_check_fail(
+                    s, "target/q readback or normalization");
+        }
+        int32_t proposed = -1;
+        if (!ds4_gpu_tensor_read(
+                    s->graph.dspark_tokens,
+                    (uint64_t)prefix * sizeof(proposed),
+                    &proposed,
+                    sizeof(proposed)) ||
+            proposed < 0 || proposed >= (int32_t)DS4_N_VOCAB) {
+            return dspark_hybrid_lc_self_check_fail(
+                    s, "invalid proposed-token readback");
+        }
+        const float q_token = s->dspark_draft_probs_host[proposed];
+        const float p_token = s->dspark_target_probs_host[proposed];
+        float a = q_token > 0.0f
+            ? prefix_accept * p_token / q_token : 0.0f;
+        if (!isfinite(a) || a < 0.0f) a = 0.0f;
+        if (a > 1.0f) a = 1.0f;
+        prefix_accept = a;
+
+        float threshold = a;
+        if (prefix < n_rows) {
+            if (!ds4_gpu_tensor_read(
+                        s->graph.spec_logits,
+                        (uint64_t)prefix * row_bytes,
+                        s->dspark_target_probs_host,
+                        row_bytes) ||
+                !ds4_gpu_tensor_read(
+                        s->graph.dspark_draft_probs,
+                        (uint64_t)prefix * row_bytes,
+                        s->dspark_draft_probs_host,
+                        row_bytes) ||
+                !sample_full_vocab_min_p_probs(
+                        s->dspark_target_probs_host,
+                        DS4_N_VOCAB,
+                        temperature,
+                        min_p,
+                        s->dspark_target_probs_host)) {
+                return dspark_hybrid_lc_self_check_fail(
+                        s, "next-row readback or normalization");
+            }
+            double residual = 0.0;
+            for (uint32_t i = 0; i < DS4_N_VOCAB; i++) {
+                const double mass =
+                    (double)a * s->dspark_target_probs_host[i] -
+                    s->dspark_draft_probs_host[i];
+                if (mass > 0.0) residual += mass;
+            }
+            const double denom = residual + 1.0 - (double)a;
+            threshold = denom > 0.0 ? (float)(residual / denom) : 1.0f;
+        }
+        const float uniform = accept_uniforms[draft_row];
+        if (fabsf(uniform - threshold) < 2.0e-5f) {
+            boundary_case = true;
+        }
+        if (uniform <= threshold) expected = prefix;
+    }
+    if (!boundary_case && expected != gpu_committed) {
+        fprintf(stderr,
+                "ds4: HybridLC self-check mismatch cpu=%u gpu=%u\n",
+                expected, gpu_committed);
+        return dspark_hybrid_lc_self_check_fail(
+                s, "CPU/GPU accepted-prefix mismatch");
+    }
+    return true;
+}
+#endif
 
 /* =========================================================================
  * Session Snapshot Payloads.
@@ -27171,7 +28132,8 @@ static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
  * cheap partial-accept path: copy a few small per-layer frontiers instead of
  * restoring the whole prefix and replaying a one-token target decode. */
 static bool spec_frontier_commit_prefix(ds4_session *s, uint32_t prefix_tokens) {
-    if (prefix_tokens == 0 || prefix_tokens > DS4_SPEC_PREFIX_MAX) return false;
+    if (prefix_tokens == 0 ||
+        prefix_tokens > s->graph.spec_prefix_cap) return false;
     const uint32_t p = prefix_tokens - 1u;
     ds4_gpu_graph *g = &s->graph;
     bool ok = ds4_gpu_begin_commands() != 0;
@@ -29361,6 +30323,23 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->dspark_target_probs_host = xmalloc(
                 (size_t)DS4_N_VOCAB *
                 sizeof(s->dspark_target_probs_host[0]));
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (dspark_hybrid_lc_store_requested()) {
+            s->hybrid_lc_store = dspark_hybrid_lc_store_create();
+            s->hybrid_lc_rng = UINT64_C(0x6879627269644c43);
+            s->hybrid_lc_shadow_rng = UINT64_C(0x736861646f774c43);
+            fprintf(stderr,
+                    "ds4: HybridLC host oracle allocated "
+                    "(indexed suffix + sparse top-8 transitions, %.2f MiB)\n",
+                    ((double)DS4_HYBRID_LC_SUFFIX_SLOTS *
+                         sizeof(ds4_hybrid_suffix_slot) +
+                     (double)DS4_N_VOCAB *
+                         DS4_HYBRID_LC_TRANSITION_TOP_K *
+                         (sizeof(int32_t) + sizeof(uint16_t)) +
+                     (double)DS4_N_VOCAB * sizeof(uint32_t)) /
+                        (1024.0 * 1024.0));
+        }
+#endif
     }
     if (e->mtp_ready) {
         s->mtp_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->mtp_logits[0]));
@@ -29383,6 +30362,9 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             free(s->mtp_logits);
             free(s->dspark_draft_probs_host);
             free(s->dspark_target_probs_host);
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+            dspark_hybrid_lc_store_free(s->hybrid_lc_store);
+#endif
             free(s);
             return 1;
         }
@@ -29414,6 +30396,9 @@ void ds4_session_free(ds4_session *s) {
     free(s->mtp_logits);
     free(s->dspark_draft_probs_host);
     free(s->dspark_target_probs_host);
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    dspark_hybrid_lc_store_free(s->hybrid_lc_store);
+#endif
     free(s);
 }
 
@@ -30467,6 +31452,7 @@ int ds4_session_frontier_restore(ds4_session *s, const ds4_tokens *prompt,
     g->token_graph_prepared.valid = false;
     memset(g->spec_prefix_gvr_hint_valid, 0,
            sizeof(g->spec_prefix_gvr_hint_valid));
+    dspark_hybrid_lc_oracle_reset(s);
     frontier_snapshots_invalidate_after(s, pos, f->id);
     return 1;
 #endif
@@ -31288,7 +32274,7 @@ static void dspark_note_suffix_rate(
 
 static bool dspark_spec_ring_save(
         ds4_gpu_graph *g, uint32_t pos0, uint32_t n_rows) {
-    if (!g || n_rows == 0 || n_rows > DS4_DSPARK_VERIFY_ROWS) return false;
+    if (!g || n_rows == 0 || n_rows > g->dspark_verify_cap) return false;
     for (uint32_t i = 0; i < DS4_DSPARK_N_BLOCK; i++) {
         if (!ds4_gpu_ring_rows_save_tensor(g->dspark_spec_ring_backup[i],
                                             g->dspark_raw_cache[i],
@@ -31303,7 +32289,7 @@ static bool dspark_spec_ring_save(
 static bool dspark_spec_ring_restore(
         ds4_gpu_graph *g, uint32_t pos0, uint32_t restore_from,
         uint32_t n_rows) {
-    if (!g || n_rows == 0 || n_rows > DS4_DSPARK_VERIFY_ROWS ||
+    if (!g || n_rows == 0 || n_rows > g->dspark_verify_cap ||
         restore_from > n_rows) return false;
     for (uint32_t i = 0; i < DS4_DSPARK_N_BLOCK; i++) {
         if (!ds4_gpu_ring_rows_restore_tensor(g->dspark_raw_cache[i],
@@ -31799,6 +32785,11 @@ static int ds4_session_eval_dspark_cycle(
     const bool log = getenv("DS4_DSPARK_LOG") != NULL;
     const double t0 = now_sec();
     s->dspark_pending_valid = false;
+    const bool hybrid_lc = dspark_hybrid_lc_enabled(s);
+    const bool hybrid_shadow = dspark_hybrid_lc_shadow_enabled(s);
+    if (hybrid_lc && s->hybrid_lc_cooldown != 0) {
+        s->hybrid_lc_cooldown--;
+    }
 
     const int room = s->ctx_size - s->checkpoint.len;
     if (max_tokens <= 1 || accepted_cap <= 1 || room <= 1) {
@@ -31899,9 +32890,9 @@ static int ds4_session_eval_dspark_cycle(
                 "fallback for this sampling policy\n");
     }
 
-    float draft_uniforms[DS4_DSPARK_BLOCK_SIZE] = {0};
-    float accept_uniforms[DS4_DSPARK_BLOCK_SIZE] = {0};
-    float residual_uniforms[DS4_DSPARK_BLOCK_SIZE] = {0};
+    float draft_uniforms[DS4_HYBRID_LC_MAX_DRAFT] = {0};
+    float accept_uniforms[DS4_HYBRID_LC_MAX_DRAFT] = {0};
+    float residual_uniforms[DS4_HYBRID_LC_MAX_DRAFT] = {0};
     float *draft_probs = NULL;
     if (use_rejection_sampling) {
         for (int i = 0; i < proposal_cap; i++) {
@@ -31911,7 +32902,7 @@ static int ds4_session_eval_dspark_cycle(
         }
     }
 
-    int drafts[DS4_DSPARK_BLOCK_SIZE];
+    int drafts[DS4_HYBRID_LC_MAX_DRAFT];
     float confidence[DS4_DSPARK_BLOCK_SIZE] = {0};
     const bool decode_nvtx = cuda_prefill_nvtx_enabled();
     if (decode_nvtx) {
@@ -32113,12 +33104,137 @@ static int ds4_session_eval_dspark_cycle(
         return rc;
     }
 
+    const int neural_draft_n = draft_n;
+    int retrieval_n = 0;
+    ds4_hybrid_draft hybrid_draft;
+    memset(&hybrid_draft, 0, sizeof(hybrid_draft));
+    uint32_t hybrid_rows = (uint32_t)neural_draft_n + 1u;
+    if ((hybrid_lc || hybrid_shadow) && s->hybrid_lc_store &&
+        s->hybrid_lc_cooldown == 0u) {
+        uint32_t total_cap = (uint32_t)(max_tokens - 1);
+        if (total_cap > (uint32_t)(accepted_cap - 1)) {
+            total_cap = (uint32_t)(accepted_cap - 1);
+        }
+        if (total_cap > (uint32_t)(room - 1)) {
+            total_cap = (uint32_t)(room - 1);
+        }
+        if (total_cap > DS4_HYBRID_LC_MAX_DRAFT) {
+            total_cap = DS4_HYBRID_LC_MAX_DRAFT;
+        }
+        dspark_hybrid_lc_build_draft(
+                s,
+                first_token,
+                drafts,
+                (uint32_t)neural_draft_n,
+                total_cap,
+                eos_token,
+                use_rejection_sampling
+                    ? (hybrid_lc
+                       ? &s->hybrid_lc_rng
+                       : &s->hybrid_lc_shadow_rng)
+                    : NULL,
+                &hybrid_draft);
+        if (hybrid_shadow) {
+            s->hybrid_lc_shadow_queries++;
+            if (hybrid_draft.match_len >= 8u) {
+                s->hybrid_lc_shadow_match8++;
+            }
+            if (hybrid_draft.match_len >= 16u) {
+                s->hybrid_lc_shadow_match16++;
+            }
+        }
+    } else {
+        hybrid_draft.n = (uint32_t)neural_draft_n;
+        hybrid_draft.neural_n = (uint32_t)neural_draft_n;
+        for (int i = 0; i < neural_draft_n; i++) {
+            hybrid_draft.token[i] = drafts[i];
+            hybrid_draft.source[i] = DS4_HYBRID_SOURCE_NEURAL;
+        }
+    }
+
+    if (hybrid_lc && hybrid_draft.n > (uint32_t)neural_draft_n) {
+        hybrid_rows = dspark_hybrid_lc_select_rows(s, &hybrid_draft);
+        if (hybrid_rows > hybrid_draft.n + 1u) {
+            hybrid_rows = hybrid_draft.n + 1u;
+        }
+        draft_n = (int)hybrid_rows - 1;
+        retrieval_n = draft_n - neural_draft_n;
+        for (int i = 0; i < draft_n; i++) {
+            drafts[i] = hybrid_draft.token[i];
+        }
+        hybrid_draft.n = (uint32_t)draft_n;
+        hybrid_draft.suffix_n = 0u;
+        hybrid_draft.transition_n = 0u;
+        for (uint32_t i = hybrid_draft.neural_n;
+             i < hybrid_draft.n; i++) {
+            if (hybrid_draft.source[i] == DS4_HYBRID_SOURCE_SUFFIX) {
+                hybrid_draft.suffix_n++;
+            } else if (hybrid_draft.source[i] ==
+                       DS4_HYBRID_SOURCE_TRANSITION) {
+                hybrid_draft.transition_n++;
+            }
+        }
+        if (retrieval_n != 0 && use_rejection_sampling) {
+            for (int i = neural_draft_n; i < draft_n; i++) {
+                accept_uniforms[i] = sample_rng_f32(rng);
+                residual_uniforms[i] = sample_rng_f32(rng);
+            }
+        }
+
+        int32_t token_ids[DS4_HYBRID_LC_MAX_ROWS];
+        token_ids[0] = first_token;
+        for (int i = 0; i < draft_n; i++) token_ids[i + 1] = drafts[i];
+        bool hybrid_ok = ds4_gpu_tensor_write(
+                s->graph.dspark_tokens,
+                0,
+                token_ids,
+                (uint64_t)(draft_n + 1) * sizeof(token_ids[0])) != 0;
+        if (hybrid_ok && retrieval_n != 0 && use_rejection_sampling) {
+            hybrid_ok = ds4_gpu_dspark_sparse_draft_rows_tensor(
+                    s->graph.dspark_draft_probs,
+                    (uint32_t)neural_draft_n,
+                    (uint32_t)retrieval_n,
+                    DS4_N_VOCAB,
+                    hybrid_draft.q_n + neural_draft_n,
+                    &hybrid_draft.q_id[neural_draft_n][0],
+                    &hybrid_draft.q_prob[neural_draft_n][0],
+                    token_ids + neural_draft_n + 1,
+                    DS4_HYBRID_LC_TRANSITION_TOP_K) != 0;
+        }
+        if (!hybrid_ok) {
+            if (log) {
+                fprintf(stderr,
+                        "ds4: HybridLC tail setup failed; retaining neural "
+                        "DSpark prefix\n");
+            }
+            retrieval_n = 0;
+            draft_n = neural_draft_n;
+            hybrid_rows = (uint32_t)draft_n + 1u;
+            hybrid_draft.n = (uint32_t)draft_n;
+        } else if (log) {
+            fprintf(stderr,
+                    "ds4: HybridLC neural=%d suffix=%u transition=%u "
+                    "rows=%d width=%u match=%u occurrences=%u "
+                    "accept_ewma=%.3f cooldown=%u\n",
+                    neural_draft_n,
+                    hybrid_draft.suffix_n,
+                    hybrid_draft.transition_n,
+                    draft_n + 1,
+                    hybrid_rows,
+                    hybrid_draft.match_len,
+                    hybrid_draft.occurrences,
+                    s->hybrid_lc_accept_ewma,
+                    s->hybrid_lc_cooldown);
+        }
+    }
+
     const uint32_t verify_rows = (uint32_t)draft_n + 1u;
+    const bool use_blockv = hybrid_lc && use_rejection_sampling;
     const int start = s->checkpoint.len;
     const uint32_t dspark_raw_start = s->graph.dspark_n_raw;
     ds4_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
-    int row_tops[DS4_DSPARK_BLOCK_SIZE] = {0};
+    int row_tops[DS4_HYBRID_LC_MAX_DRAFT] = {0};
     float *continuation_logits = xmalloc(
             (size_t)DS4_N_VOCAB * sizeof(continuation_logits[0]));
     float *verify_logits = temperature > 0.0f && !use_rejection_sampling
@@ -32158,8 +33274,8 @@ static int ds4_session_eval_dspark_cycle(
     int committed = 0;
     int mismatch = -1;
     if (ok && use_rejection_sampling) {
-        int verify_tokens[DS4_DSPARK_BLOCK_SIZE] = {0};
-        int verify_accept[DS4_DSPARK_BLOCK_SIZE] = {0};
+        int verify_tokens[DS4_HYBRID_LC_MAX_DRAFT] = {0};
+        int verify_accept[DS4_HYBRID_LC_MAX_DRAFT] = {0};
         if (decode_nvtx) {
             ds4_gpu_nvtx_range_push(
                     "ds4/decode/dspark/rejection",
@@ -32174,7 +33290,8 @@ static int ds4_session_eval_dspark_cycle(
                                   0,
                                   residual_uniforms,
                                   (uint64_t)draft_n * sizeof(float)) != 0 &&
-             ds4_gpu_dspark_rejection_verify_tensor(
+             (use_blockv
+              ? ds4_gpu_dspark_block_verify_tensor(
                                   s->graph.dspark_verify_tokens,
                                   s->graph.dspark_verify_accept,
                                   s->graph.spec_logits,
@@ -32185,7 +33302,19 @@ static int ds4_session_eval_dspark_cycle(
                                   (uint32_t)draft_n,
                                   DS4_N_VOCAB,
                                   temperature,
-                                  min_p) != 0 &&
+                                  min_p)
+              : ds4_gpu_dspark_rejection_verify_tensor(
+                                  s->graph.dspark_verify_tokens,
+                                  s->graph.dspark_verify_accept,
+                                  s->graph.spec_logits,
+                                  s->graph.dspark_draft_probs,
+                                  s->graph.dspark_tokens,
+                                  s->graph.dspark_accept_uniforms,
+                                  s->graph.dspark_residual_uniforms,
+                                  (uint32_t)draft_n,
+                                  DS4_N_VOCAB,
+                                  temperature,
+                                  min_p)) != 0 &&
              ds4_gpu_tensor_read(s->graph.dspark_verify_tokens,
                                   0,
                                   verify_tokens,
@@ -32201,6 +33330,19 @@ static int ds4_session_eval_dspark_cycle(
                 break;
             }
             committed++;
+        }
+        if (ok && use_blockv) {
+            s->hybrid_lc_blockv_cycles++;
+        }
+        if (ok && use_blockv &&
+            !dspark_hybrid_lc_self_check(
+                    s,
+                    (uint32_t)draft_n,
+                    temperature,
+                    min_p,
+                    accept_uniforms,
+                    (uint32_t)committed)) {
+            ok = false;
         }
     }
     for (int i = 0; ok && !use_rejection_sampling && i < draft_n; i++) {
@@ -32254,8 +33396,31 @@ static int ds4_session_eval_dspark_cycle(
 
     if (ok) {
         const int n_accept = 1 + committed;
+        const int neural_committed = committed < neural_draft_n
+            ? committed : neural_draft_n;
+        const int retrieval_committed = committed > neural_draft_n
+            ? committed - neural_draft_n : 0;
+        int suffix_committed = 0;
+        int transition_committed = 0;
+        for (int i = neural_draft_n; i < committed; i++) {
+            if (hybrid_draft.source[i] == DS4_HYBRID_SOURCE_SUFFIX) {
+                suffix_committed++;
+            } else if (hybrid_draft.source[i] ==
+                       DS4_HYBRID_SOURCE_TRANSITION) {
+                transition_committed++;
+            }
+        }
         accepted[0] = first_token;
         for (int i = 0; i < committed; i++) accepted[i + 1] = drafts[i];
+        if (hybrid_shadow) {
+            dspark_hybrid_lc_shadow_observe(
+                    s, accepted, (uint32_t)n_accept);
+            if (committed == neural_draft_n &&
+                s->hybrid_lc_shadow_n == 0u &&
+                hybrid_draft.n > hybrid_draft.neural_n) {
+                dspark_hybrid_lc_shadow_arm(s, &hybrid_draft);
+            }
+        }
         memcpy(s->logits,
                continuation_logits,
                (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
@@ -32270,16 +33435,26 @@ static int ds4_session_eval_dspark_cycle(
         }
 
         const double done = now_sec();
-        dspark_note_verify_time(s, (uint32_t)draft_n,
+        dspark_note_verify_time(s, (uint32_t)neural_draft_n,
                                 done - draft_done);
-        dspark_note_cycle_rate(s, (uint32_t)draft_n,
+        dspark_note_cycle_rate(s, (uint32_t)neural_draft_n,
                                (uint32_t)n_accept, done - t0);
-        dspark_note_sts(s, confidence, (uint32_t)draft_n,
-                        (uint32_t)committed);
-        dspark_note_acceptance(s, (uint32_t)draft_n,
-                               (uint32_t)committed);
-        dspark_note_suffix_rate(s, (uint32_t)draft_n,
+        dspark_note_sts(s, confidence, (uint32_t)neural_draft_n,
+                        (uint32_t)neural_committed);
+        dspark_note_acceptance(s, (uint32_t)neural_draft_n,
+                               (uint32_t)neural_committed);
+        dspark_note_suffix_rate(s, (uint32_t)neural_draft_n,
                                 (uint32_t)n_accept, done - t0);
+        if (retrieval_n != 0) {
+            dspark_hybrid_lc_note(
+                    s,
+                    &hybrid_draft,
+                    verify_rows,
+                    (uint32_t)committed,
+                    (uint32_t)n_accept,
+                    done - draft_done,
+                    done - t0);
+        }
         if (committed == 0 && log) {
             fprintf(stderr,
                     "ds4: dspark first-draft miss proposal=%d correction=%d "
@@ -32292,7 +33467,16 @@ static int ds4_session_eval_dspark_cycle(
             fprintf(stderr,
                     "ds4: dspark timing drafted=%d target_rows=%u "
                     "committed=%d emitted=%d draft=%.3f ms verify=%.3f ms "
-                    "total=%.3f ms fused=1 noreplay=1 rejection=%d residual=%d\n",
+                    "total=%.3f ms fused=1 noreplay=1 rejection=%d residual=%d "
+                    "hybrid=%d neural=%d retrieval=%d retrieval_committed=%d "
+                    "suffix=%u suffix_committed=%d transition=%u "
+                    "transition_committed=%d width=%u match=%u occurrences=%u "
+                    "hybrid_enabled=%d "
+                    "shadow=%d shadow_queries=%llu shadow_attempts=%llu "
+                    "shadow_match8=%llu shadow_match16=%llu "
+                    "shadow_full=%llu shadow_matches=%llu "
+                    "shadow_tokens=%llu oracle_rebuilds=%llu "
+                    "blockv=%d self_checks=%llu self_check_failures=%llu\n",
                     draft_n,
                     verify_rows,
                     committed,
@@ -32301,7 +33485,33 @@ static int ds4_session_eval_dspark_cycle(
                     (done - draft_done) * 1000.0,
                     (done - t0) * 1000.0,
                     use_rejection_sampling ? 1 : 0,
-                    use_rejection_sampling && committed < draft_n ? 1 : 0);
+                    use_rejection_sampling && committed < draft_n ? 1 : 0,
+                    retrieval_n != 0 ? 1 : 0,
+                    neural_draft_n,
+                    retrieval_n,
+                    retrieval_committed,
+                    retrieval_n != 0 ? hybrid_draft.suffix_n : 0u,
+                    suffix_committed,
+                    retrieval_n != 0 ? hybrid_draft.transition_n : 0u,
+                    transition_committed,
+                    verify_rows,
+                    retrieval_n != 0 ? hybrid_draft.match_len : 0u,
+                    retrieval_n != 0 ? hybrid_draft.occurrences : 0u,
+                    hybrid_lc ? 1 : 0,
+                    hybrid_shadow ? 1 : 0,
+                    (unsigned long long)s->hybrid_lc_shadow_queries,
+                    (unsigned long long)s->hybrid_lc_shadow_attempts,
+                    (unsigned long long)s->hybrid_lc_shadow_match8,
+                    (unsigned long long)s->hybrid_lc_shadow_match16,
+                    (unsigned long long)s->hybrid_lc_shadow_full_matches,
+                    (unsigned long long)s->hybrid_lc_shadow_matches,
+                    (unsigned long long)s->hybrid_lc_shadow_tokens,
+                    (unsigned long long)(
+                        s->hybrid_lc_store
+                            ? s->hybrid_lc_store->rebuilds : 0u),
+                    use_blockv ? 1 : 0,
+                    (unsigned long long)s->hybrid_lc_self_checks,
+                    (unsigned long long)s->hybrid_lc_self_check_failures);
         }
         spec_frontier_free(&frontier);
         free(verify_logits);
@@ -32342,7 +33552,7 @@ static int ds4_session_eval_dspark_cycle(
     return dspark_eval_current_only(s,
                                     first_token,
                                     accepted,
-                                    (uint32_t)draft_n,
+                                    (uint32_t)neural_draft_n,
                                     draft_seconds,
                                     t0,
                                     "verifier-failed",
@@ -33058,6 +34268,7 @@ void ds4_session_invalidate(ds4_session *s) {
     if (!s->distributed && !ds4_session_is_cpu(s)) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         frontier_snapshots_invalidate_all(s);
+        dspark_hybrid_lc_oracle_reset(s);
 #endif
         s->graph.token_graph_prepared.valid = false;
         s->graph.dspark_n_raw = 0;
@@ -33075,6 +34286,7 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     if (!s->distributed && !ds4_session_is_cpu(s)) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         frontier_snapshots_invalidate_all(s);
+        dspark_hybrid_lc_oracle_reset(s);
 #endif
         s->graph.token_graph_prepared.valid = false;
         s->graph.dspark_n_raw = pos < DS4_DSPARK_WINDOW

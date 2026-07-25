@@ -334,6 +334,47 @@ int ds4_gpu_dspark_rejection_verify_tensor(
         float                   temperature,
         float                   min_p);
 
+/* Materialize deterministic retrieval rows in the DSpark q matrix.  Existing
+ * neural rows before row_offset are untouched; each new row is exactly a
+ * one-hot distribution at dspark_tokens[row_offset + row + 1]. */
+int ds4_gpu_dspark_one_hot_draft_rows_tensor(
+        ds4_gpu_tensor       *draft_probs,
+        const ds4_gpu_tensor *dspark_tokens,
+        uint32_t                row_offset,
+        uint32_t                n_rows,
+        uint32_t                n_vocab);
+
+/* Materialize sparse retrieval/transition q rows.  Host rows use a fixed
+ * stride of at most eight entries; each row must be normalized and contain
+ * the token actually proposed in dspark_tokens. */
+int ds4_gpu_dspark_sparse_draft_rows_tensor(
+        ds4_gpu_tensor       *draft_probs,
+        uint32_t                row_offset,
+        uint32_t                n_rows,
+        uint32_t                n_vocab,
+        const uint8_t          *row_sizes,
+        const int32_t          *token_ids,
+        const float            *token_probs,
+        const int32_t          *proposed_tokens,
+        uint32_t                row_stride);
+
+/* Lossless Block Verification for one linear draft path.  It preserves the
+ * target distribution while selecting the longest independently accepted
+ * prefix.  Outputs use the same prefix flags/correction-token contract as the
+ * tokenwise verifier. */
+int ds4_gpu_dspark_block_verify_tensor(
+        ds4_gpu_tensor       *out_tokens,
+        ds4_gpu_tensor       *out_accept,
+        const ds4_gpu_tensor *spec_logits,
+        const ds4_gpu_tensor *draft_probs,
+        const ds4_gpu_tensor *dspark_tokens,
+        const ds4_gpu_tensor *accept_uniforms,
+        const ds4_gpu_tensor *residual_uniforms,
+        uint32_t                n_rows,
+        uint32_t                n_vocab,
+        float                   temperature,
+        float                   min_p);
+
 int ds4_gpu_dsv4_topk_mask_tensor(
         ds4_gpu_tensor       *mask,
         const ds4_gpu_tensor *topk,

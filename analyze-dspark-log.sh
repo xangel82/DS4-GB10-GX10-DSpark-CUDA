@@ -63,8 +63,69 @@ function text_value(prefix,    i,a) {
   total = value("total")
   rejection = value("rejection")
   residual = value("residual")
+  hybrid = value("hybrid")
+  hybrid_enabled = value("hybrid_enabled")
+  blockv = value("blockv")
+  retrieval = value("retrieval")
+  retrieval_committed = value("retrieval_committed")
+  suffix = value("suffix")
+  suffix_committed = value("suffix_committed")
+  transition = value("transition")
+  transition_committed = value("transition_committed")
+  width = value("width")
+  match_len = value("match")
+  occurrences = value("occurrences")
+  shadow = value("shadow")
+  shadow_queries = value("shadow_queries")
+  shadow_attempts = value("shadow_attempts")
+  shadow_match8 = value("shadow_match8")
+  shadow_match16 = value("shadow_match16")
+  shadow_full = value("shadow_full")
+  shadow_matches = value("shadow_matches")
+  shadow_tokens = value("shadow_tokens")
+  oracle_rebuilds = value("oracle_rebuilds")
+  self_checks = value("self_checks")
+  self_check_failures = value("self_check_failures")
   if (rejection == 1) rejection_cycles++
   if (residual == 1) residual_cycles++
+  if (hybrid == 1) hybrid_cycles++
+  if (hybrid_enabled == 1) hybrid_production_cycles++
+  if (blockv == 1) blockv_cycles++
+  if (retrieval > 0) {
+    retrieval_cycles++
+    retrieval_drafted += retrieval
+    if (retrieval_committed > 0) {
+      retrieval_committed_total += retrieval_committed
+    }
+  }
+  if (suffix > 0) {
+    suffix_drafted += suffix
+    if (suffix_committed > 0) suffix_committed_total += suffix_committed
+  }
+  if (transition > 0) {
+    transition_drafted += transition
+    if (transition_committed > 0) transition_committed_total += transition_committed
+  }
+  if (match_len > 0) { match_sum += match_len; match_n++ }
+  if (occurrences > 0) { occurrence_sum += occurrences; occurrence_n++ }
+  if (shadow == 1) shadow_cycles++
+  if (shadow_queries >= 0) last_shadow_queries = shadow_queries
+  if (shadow_attempts >= 0) last_shadow_attempts = shadow_attempts
+  if (shadow_match8 >= 0) last_shadow_match8 = shadow_match8
+  if (shadow_match16 >= 0) last_shadow_match16 = shadow_match16
+  if (shadow_full >= 0) last_shadow_full = shadow_full
+  if (shadow_matches >= 0) last_shadow_matches = shadow_matches
+  if (shadow_tokens >= 0) last_shadow_tokens = shadow_tokens
+  if (oracle_rebuilds >= 0) last_oracle_rebuilds = oracle_rebuilds
+  if (self_checks >= 0) last_self_checks = self_checks
+  if (self_check_failures >= 0) last_self_check_failures = self_check_failures
+  if (hybrid == 1 && (width == 8 || width == 12 || width == 16)) {
+    hwn[width]++
+    hwc[width] += c
+    hwe[width] += e
+    hwverify[width] += vr
+    hwtotal[width] += total
+  }
   if (e >= 0) emitted += e
   if (dr >= 0) draft_ms += dr
   if (vr >= 0) verify_ms += vr
@@ -132,6 +193,69 @@ END {
   if (rejection_cycles > 0) {
     printf "P/Q rejection cycles:      %d\n", rejection_cycles
     printf "Residual corrections:      %d\n", residual_cycles
+  }
+  if (hybrid_production_cycles > 0 || hybrid_cycles > 0) {
+    printf "HybridLC production cycles: %d\n", hybrid_production_cycles
+    printf "HybridLC tail / BlockV:    %d / %d\n", hybrid_cycles, blockv_cycles
+    printf "Retrieval-hit cycles:      %d\n", retrieval_cycles
+    printf "Retrieval draft/committed: %d / %d\n", retrieval_drafted, retrieval_committed_total
+    if (retrieval_drafted > 0) {
+      printf "Retrieval acceptance:      %.2f%%\n", 100.0 * retrieval_committed_total / retrieval_drafted
+    }
+    if (suffix_drafted > 0) {
+      printf "Suffix draft/committed:    %d / %d (%.2f%%)\n",
+             suffix_drafted, suffix_committed_total,
+             100.0 * suffix_committed_total / suffix_drafted
+    }
+    if (transition_drafted > 0) {
+      printf "Transition draft/commit:   %d / %d (%.2f%%)\n",
+             transition_drafted, transition_committed_total,
+             100.0 * transition_committed_total / transition_drafted
+    }
+    if (match_n > 0) printf "Mean exact suffix match:   %.2f tokens\n", match_sum / match_n
+    if (occurrence_n > 0) printf "Mean suffix occurrences:   %.2f\n", occurrence_sum / occurrence_n
+    for (w = 8; w <= 16; w += 4) if (hwn[w] > 0) {
+      width_rate = 0.0
+      if (hwtotal[w] > 0) width_rate = 1000.0 * hwe[w] / hwtotal[w]
+      printf "  N=%d n=%d emitted=%.3f target=%.3fms total=%.3fms rate=%.3ft/s\n",
+             w, hwn[w], hwe[w] / hwn[w], hwverify[w] / hwn[w],
+             hwtotal[w] / hwn[w], width_rate
+    }
+  }
+  if (shadow_cycles > 0 || last_shadow_tokens > 0) {
+    shadow_hit_rate = 0.0
+    shadow_match8_rate = 0.0
+    shadow_match16_rate = 0.0
+    shadow_full_rate = 0.0
+    shadow_token_rate = 0.0
+    if (last_shadow_queries > 0) {
+      shadow_hit_rate = 100.0 * last_shadow_attempts / last_shadow_queries
+      shadow_match8_rate = 100.0 * last_shadow_match8 / last_shadow_queries
+      shadow_match16_rate = 100.0 * last_shadow_match16 / last_shadow_queries
+    }
+    if (last_shadow_attempts > 0) {
+      shadow_full_rate = 100.0 * last_shadow_full / last_shadow_attempts
+    }
+    if (last_shadow_tokens > 0) {
+      shadow_token_rate = 100.0 * last_shadow_matches / last_shadow_tokens
+    }
+    printf "HybridLC shadow cycles:    %d\n", shadow_cycles
+    printf "Shadow oracle query/hit:   %d / %d (%.2f%%)\n",
+           last_shadow_queries, last_shadow_attempts, shadow_hit_rate
+    printf "Shadow match >=8 / >=16:  %d / %d (%.2f%% / %.2f%%)\n",
+           last_shadow_match8, last_shadow_match16,
+           shadow_match8_rate, shadow_match16_rate
+    printf "Shadow full-tail matches:  %d / %d (%.2f%%)\n",
+           last_shadow_full, last_shadow_attempts, shadow_full_rate
+    printf "Shadow token matches:      %d / %d (%.2f%%)\n",
+           last_shadow_matches, last_shadow_tokens, shadow_token_rate
+  }
+  if (last_oracle_rebuilds > 0) {
+    printf "HybridLC oracle rebuilds:  %d\n", last_oracle_rebuilds
+  }
+  if (last_self_checks > 0) {
+    printf "HybridLC self-checks:      %d (failures=%d)\n",
+           last_self_checks, last_self_check_failures
   }
   if (fused_cycles > 0) {
     printf "Verified draft tokens:     %d\n", verifier_drafted

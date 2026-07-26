@@ -8,6 +8,32 @@ conservare il throughput DSpark sui contesti lunghi.
 La sezione **Avvio rapido** è la procedura operativa aggiornata. Le sezioni
 successive conservano la cronologia tecnica, comprese prove scartate e rollback.
 
+## Esperimento HybridLC-2.1 scartato - 26 luglio 2026
+
+Dopo `3ef444b` e' stata provata una revisione piu' complessa di HybridLC:
+suffix a ordine variabile `16/12/8/6/4`, splice sulle frontier K/K-1,
+distribuzione `q` sparse lossless, scratch host pinned, una sola readback del
+verifier, restore D2D asincrono e dispatch BlockV differenziato per larghezza.
+Erano inoltre disponibili, ma disattivati per default, semantic retrieval e un
+local head causale.
+
+La regressione CUDA e i self-check sono passati senza errori o fallback, ma il
+test end-to-end non ha prodotto un miglioramento stabile:
+
+- 1.476 cicli DSpark, acceptance verifier del 70,85% e 163,04 ms per ciclo;
+- solo 21 cicli retrieval-hit; 185 token di coda proposti, 55 raggiunti e 40
+  accettati, quindi coverage del 29,73% e acceptance condizionale del 72,73%;
+- `N=8` ha raggiunto 27,39 t/s, mentre il costo del verifier largo ha ridotto
+  `N=12` a 18,18 t/s e `N=16` a 13,48 t/s;
+- il prefill e' rimasto forte, con 936 t/s sul segmento da 49K token e circa
+  866 t/s a 147K, ma la risposta finale lunga ha chiuso a 15,69 t/s.
+
+La conclusione e' che l'hardening era corretto, ma coverage rara e verifier
+`N=12/16` troppo costoso annullavano il beneficio end-to-end. L'esperimento e'
+stato archiviato integralmente fuori dal worktree e il codice e' tornato a
+`3ef444b`. Eventuali sviluppi futuri devono preferire una strategia piu'
+semplice, con beneficio misurabile prima di introdurre nuove larghezze target.
+
 ## HybridLC predefinito: DSpark + retrieval + BlockV - 26 luglio 2026
 
 La versione stabile descritta in questa sezione è il commit `98c71c0`

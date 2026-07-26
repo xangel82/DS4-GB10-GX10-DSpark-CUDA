@@ -8,6 +8,13 @@ GPU-side verification and reproducible GB10 benchmarks.
 Repository:
 [xangel82/DS4-GB10-GX10-DSpark-CUDA](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA)
 
+Release commit `98c71c0` reaches **up to 35 decode tokens/s** with lossless
+HybridLC on covered regions, while substantial long-context prefill remains
+around 851-907 tokens/s. HybridLC learns from exact sequences already present
+in the verified context, extends the neural DSpark draft when a reliable suffix
+is available, and always leaves the target model in control of acceptance and
+sampling.
+
 ## Results at a glance
 
 Measured on Athena, a single NVIDIA GB10, using the recommended
@@ -20,6 +27,8 @@ DeepSeek-V4-Flash Q2/imatrix target:
 | Long append, 27.7k to 95.1k context | 913.15 t/s |
 | Deep append, 127.8k to 180.8k context | 836.16 t/s |
 | DSpark tool-call decode | commonly 24-26 t/s |
+| HybridLC covered decode | up to 34.97 t/s, approximately 35 t/s |
+| HybridLC retrieval acceptance | 70.68%, 1022 / 1446 draft tokens |
 | Clean mixed coding session with compact Q2 sidecar | 20.88 t/s weighted |
 | Physical context enabled by default | 262144 tokens |
 | Experimental physical context | 1M tokens |
@@ -35,11 +44,20 @@ temperature, cooling, clocks and workload can change it. Long test sessions did
 not show progressive memory growth, and the compact Q2 sidecar provides about
 5.06 GiB more UMA headroom than Q4.
 
+The 35 t/s result is not a fixed request-wide rate. Repetitive code, tool
+protocols and structured output provide more reusable suffixes and benefit the
+most; novel free-form text falls back naturally to neural DSpark. In the
+measured long final answer, retrieval covered only 6.1% of cycles and cumulative
+decode was 16.37 t/s. No approximate token is committed: both paths preserve
+the target sampling distribution.
+
 ![Measured DS4 GB10 prefill and decode performance](docs/gb10-performance.svg)
 
 ## What this fork delivers
 
 - Lossless DSpark speculative decoding with GPU-side p/q rejection sampling.
+- Lossless HybridLC suffix retrieval with Block Verification and exact residual
+  correction.
 - Exact Top-512 compressed sparse attention with Blackwell SM121a kernels.
 - Routed-MoE D2R/MMQ prefill for IQ2_XXS gate/up and Q2_K down weights.
 - Token-tile HMMA attention and native MXFP4 indexer scoring.
@@ -96,6 +114,7 @@ The major measured milestones on the same GB10 were:
 | Raw-GGUF routed-MoE MMQ | 404.46 t/s | 23.00 t/s at 83k |
 | Token-tile HMMA attention | 509.14 t/s | unchanged |
 | Fused HC/RMS/RoPE/MoE pipeline | 902-953 t/s | commonly 23-26 t/s on tool turns |
+| Lossless HybridLC (`98c71c0`) | 851-907 t/s append | 26.89-34.97 t/s on covered retrieval widths |
 | Direct-F16 sparse attention beyond 131k | 836.16 t/s at 127.8k-180.8k | 19.89 t/s after 180.8k |
 
 The HMMA transition improved a position-matched 57,344-token interval by
@@ -104,7 +123,8 @@ The HMMA transition improved a position-matched 57,344-token interval by
 adding a score matrix or persistent F32 KV mirror.
 
 Detailed profiler reports, rejected experiments, numerical tolerances and
-rollback history are maintained in [README-GB10.md](README-GB10.md).
+rollback history, including the complete HybridLC validation, are maintained in
+[README-GB10.md](README-GB10.md).
 
 ## Install on GB10/GX10
 

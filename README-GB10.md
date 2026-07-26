@@ -10,6 +10,12 @@ successive conservano la cronologia tecnica, comprese prove scartate e rollback.
 
 ## HybridLC predefinito: DSpark + retrieval + BlockV - 26 luglio 2026
 
+La versione stabile descritta in questa sezione è il commit `98c71c0`
+(`Add lossless HybridLC speculative decoding`). I risultati riportati sotto
+sono la caratterizzazione di rilascio eseguita su Athena; non includono le
+successive prove variable-order/MoE-aware, archiviate e poi rimosse perché
+riducevano l'acceptance del retriever.
+
 Il launcher abilita per default HybridLC, che estende la catena neurale DSpark
 con una coda recuperata dal contesto già verificato. Il percorso resta lossless:
 il target verifica ogni proposta e BlockV applica la correzione dalla
@@ -109,13 +115,15 @@ produzione, `hybrid=1` soltanto quelli che hanno realmente aggiunto una coda
 retrieval e `blockv=1` quelli verificati con BlockV. Questa separazione evita di
 confondere un miss del retriever con un fallback o con una feature disattivata.
 
-La validazione GB10 del 25-26 luglio ha superato il gate del report:
+La validazione GB10 del commit `98c71c0`, eseguita il 25-26 luglio, ha superato
+il gate del report:
 
 - 1.406 cicli production, di cui 1.315 verificati con BlockV;
 - 183 cicli retrieval, con 1.022 token accettati su 1.446 (`70,68%`);
 - acceptance suffix `70,96%`, match esatto medio di 34,66 token;
 - N=8 a 26,89 t/s, N=12 a 34,15 t/s e N=16 a 34,97 t/s;
 - due self-check CPU/GPU superati, nessun errore, OOM o swap del processo;
+- throughput interno dei cicli verifier 20,52 t/s su 1.406 cicli;
 - decode telemetrico 20,48 t/s contro 20,06 t/s baseline; il run silenzioso ha
   misurato 21,30 t/s. Tra 25K e 100K i turni operativi sono rimasti fra 25,84
   e 26,73 t/s, con picchi superiori a 30 t/s;

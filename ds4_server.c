@@ -11764,6 +11764,19 @@ typedef struct {
     size_t body_len;
 } http_request;
 
+typedef enum {
+    HTTP_READ_OK = 0,
+    HTTP_READ_TRANSPORT_CLOSED,
+    HTTP_READ_MALFORMED,
+} http_read_result;
+
+typedef struct {
+    const char *stage;
+    size_t received;
+    size_t expected;
+    int error_number;
+} http_read_diagnostic;
+
 static void http_request_free(http_request *r) {
     free(r->body);
     memset(r, 0, sizeof(*r));
@@ -11796,21 +11809,34 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
-static bool read_http_request(int fd, http_request *r) {
+static http_read_result read_http_request(int fd, http_request *r,
+                                          http_read_diagnostic *diag) {
     buf b = {0};
     ssize_t hend = -1;
     const size_t max_header = 64 * 1024;
     const size_t max_body = 64 * 1024 * 1024;
 
+    memset(diag, 0, sizeof(*diag));
     while (hend < 0 && b.len < max_header) {
         char tmp[4096];
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) goto fail;
+        if (n <= 0) {
+            diag->stage = "headers";
+            diag->received = b.len;
+            diag->error_number = n < 0 ? errno : 0;
+            buf_free(&b);
+            return HTTP_READ_TRANSPORT_CLOSED;
+        }
         buf_append(&b, tmp, (size_t)n);
         hend = header_end(b.ptr, b.len);
     }
-    if (hend < 0) goto fail;
+    if (hend < 0) {
+        diag->stage = "headers-too-large";
+        diag->received = b.len;
+        buf_free(&b);
+        return HTTP_READ_MALFORMED;
+    }
 
     char line[512];
     size_t i = 0;
@@ -11819,17 +11845,35 @@ static bool read_http_request(int fd, http_request *r) {
         i++;
     }
     line[i] = '\0';
-    if (sscanf(line, "%7s %255s", r->method, r->path) != 2) goto fail;
+    if (sscanf(line, "%7s %255s", r->method, r->path) != 2) {
+        diag->stage = "request-line";
+        diag->received = b.len;
+        buf_free(&b);
+        return HTTP_READ_MALFORMED;
+    }
     char *q = strchr(r->path, '?');
     if (q) *q = '\0';
 
     long clen = content_length(b.ptr, (size_t)hend);
-    if (clen < 0 || (size_t)clen > max_body) goto fail;
+    if (clen < 0 || (size_t)clen > max_body) {
+        diag->stage = "content-length";
+        diag->received = b.len;
+        diag->expected = clen > 0 ? (size_t)clen : 0;
+        buf_free(&b);
+        return HTTP_READ_MALFORMED;
+    }
     while (b.len < (size_t)hend + (size_t)clen) {
         char tmp[8192];
         ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
         if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) goto fail;
+        if (n <= 0) {
+            diag->stage = "body";
+            diag->received = b.len > (size_t)hend ? b.len - (size_t)hend : 0;
+            diag->expected = (size_t)clen;
+            diag->error_number = n < 0 ? errno : 0;
+            buf_free(&b);
+            return HTTP_READ_TRANSPORT_CLOSED;
+        }
         buf_append(&b, tmp, (size_t)n);
     }
 
@@ -11838,10 +11882,7 @@ static bool read_http_request(int fd, http_request *r) {
     memcpy(r->body, b.ptr + hend, r->body_len);
     r->body[r->body_len] = '\0';
     buf_free(&b);
-    return true;
-fail:
-    buf_free(&b);
-    return false;
+    return HTTP_READ_OK;
 }
 
 typedef struct {
@@ -11941,7 +11982,23 @@ static void *client_main(void *arg) {
     free(ca);
 
     http_request hr = {0};
-    if (!read_http_request(fd, &hr)) {
+    http_read_diagnostic read_diag;
+    const http_read_result read_result = read_http_request(fd, &hr, &read_diag);
+    if (read_result == HTTP_READ_TRANSPORT_CLOSED) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: HTTP request transport closed stage=%s received=%zu expected=%zu error=%s",
+                   read_diag.stage ? read_diag.stage : "unknown",
+                   read_diag.received,
+                   read_diag.expected,
+                   read_diag.error_number ? strerror(read_diag.error_number) : "EOF");
+        goto done;
+    }
+    if (read_result != HTTP_READ_OK) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: malformed HTTP request stage=%s received=%zu expected=%zu",
+                   read_diag.stage ? read_diag.stage : "unknown",
+                   read_diag.received,
+                   read_diag.expected);
         http_error(fd, s->enable_cors, 400, "bad HTTP request");
         goto done;
     }
@@ -12860,6 +12917,67 @@ static char *read_socket_text(int fd) {
         buf_append(&b, tmp, (size_t)n);
     }
     return buf_take(&b);
+}
+
+static void test_http_reader_distinguishes_truncation_from_malformed_input(void) {
+    int sv[2];
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        const char *partial =
+            "POST /v1/chat/completions HTTP/1.1\r\n"
+            "Content-Length: 10\r\n"
+            "\r\n"
+            "abc";
+        TEST_ASSERT(write(sv[0], partial, strlen(partial)) == (ssize_t)strlen(partial));
+        shutdown(sv[0], SHUT_WR);
+
+        http_request r = {0};
+        http_read_diagnostic diag;
+        TEST_ASSERT(read_http_request(sv[1], &r, &diag) == HTTP_READ_TRANSPORT_CLOSED);
+        TEST_ASSERT(diag.stage && !strcmp(diag.stage, "body"));
+        TEST_ASSERT(diag.received == 3);
+        TEST_ASSERT(diag.expected == 10);
+        http_request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        const char *malformed = "invalid\r\n\r\n";
+        TEST_ASSERT(write(sv[0], malformed, strlen(malformed)) == (ssize_t)strlen(malformed));
+        shutdown(sv[0], SHUT_WR);
+
+        http_request r = {0};
+        http_read_diagnostic diag;
+        TEST_ASSERT(read_http_request(sv[1], &r, &diag) == HTTP_READ_MALFORMED);
+        TEST_ASSERT(diag.stage && !strcmp(diag.stage, "request-line"));
+        http_request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
+
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] >= 0 && sv[1] >= 0) {
+        const char *complete =
+            "POST /v1/chat/completions HTTP/1.1\r\n"
+            "Content-Length: 2\r\n"
+            "\r\n"
+            "{}";
+        TEST_ASSERT(write(sv[0], complete, strlen(complete)) == (ssize_t)strlen(complete));
+        shutdown(sv[0], SHUT_WR);
+
+        http_request r = {0};
+        http_read_diagnostic diag;
+        TEST_ASSERT(read_http_request(sv[1], &r, &diag) == HTTP_READ_OK);
+        TEST_ASSERT(!strcmp(r.method, "POST"));
+        TEST_ASSERT(!strcmp(r.path, "/v1/chat/completions"));
+        TEST_ASSERT(r.body_len == 2);
+        TEST_ASSERT(!strcmp(r.body, "{}"));
+        http_request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
 }
 
 static void test_context_length_error_uses_protocol_standard_shape(void) {
@@ -16840,6 +16958,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_skip_has_nesting_limit();
     test_json_parser_handles_tool_heavy_requests();
     test_json_string_handles_surrogates();
+    test_http_reader_distinguishes_truncation_from_malformed_input();
     test_model_metadata_clamps_completion_to_context();
     test_advertised_context_pct();
     test_long_cold_anchor_defaults_scale_with_context();

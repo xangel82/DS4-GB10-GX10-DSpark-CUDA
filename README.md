@@ -44,6 +44,13 @@ measured long final answer, retrieval covered only 6.1% of cycles and cumulative
 decode was 16.37 t/s. No approximate token is committed: both paths preserve
 the target sampling distribution.
 
+The current release combines the compact Q2 DSpark and lossless HybridLC work
+validated on 26 July 2026 with the exact fused-D2R dispatch fix validated on
+27 July 2026. Q2 remains the default sidecar and HybridLC remains
+target-verified; the D2R fix only corrects the logical scratch span passed by
+the shared prefill arena. It does not change weights, routing, kernels,
+sampling, verifier behavior or persistent memory.
+
 ![Measured DS4 GB10 prefill and decode performance](docs/gb10-performance.svg)
 
 ## What this fork delivers
@@ -109,11 +116,16 @@ The major measured milestones on the same GB10 were:
 | Fused HC/RMS/RoPE/MoE pipeline | 902-953 t/s | commonly 23-26 t/s on tool turns |
 | Lossless HybridLC (`98c71c0`) | 851-907 t/s append | 26.89-34.97 t/s on covered retrieval widths |
 | Direct-F16 sparse attention beyond 131k | 836.16 t/s at 127.8k-180.8k | 19.89 t/s after 180.8k |
+| Shared-arena fused-D2R fix (`fb11333`) | 1001.94 t/s at 0-8k, 1006.61 t/s at 8k-16k | DSpark verifier unchanged |
 
 The HMMA transition improved a position-matched 57,344-token interval by
 25.88%. The direct-F16 capacity fix improved the measured deep append by
 33.80% and removed the artificial performance cliff beyond 131k without
-adding a score matrix or persistent F32 KV mirror.
+adding a score matrix or persistent F32 KV mirror. The fused-D2R fix recovered
+4.27% on the first 8192-token block by passing the arena's logical gate segment
+to the overlap guard instead of its full 1920 MiB owner capacity. Greedy hashes
+were unchanged, CUDA parity remained bit-exact and no persistent allocation was
+added.
 
 Detailed profiler reports, rejected experiments, numerical tolerances and
 rollback history, including the complete HybridLC validation, are maintained in

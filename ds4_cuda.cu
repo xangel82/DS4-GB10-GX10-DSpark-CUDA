@@ -212,6 +212,7 @@ static int g_moe_aligned_ready;
 static int g_moe_aligned_notice;
 static int g_moe_aligned_small_batch_notice;
 static int g_moe_complete_fused_notice;
+static int g_moe_complete_fused_fallback_notice;
 static constexpr uint32_t DS4_MMQ_PREFILL_MIN_TOKENS = 1024u;
 static void *g_cublas_workspace;
 static uint64_t g_cublas_workspace_bytes;
@@ -575,6 +576,7 @@ static void cuda_moe_aligned_clear(void) {
     g_moe_aligned_notice = 0;
     g_moe_aligned_small_batch_notice = 0;
     g_moe_complete_fused_notice = 0;
+    g_moe_complete_fused_fallback_notice = 0;
 }
 
 static const cuda_moe_aligned_range *cuda_moe_aligned_find(
@@ -20483,11 +20485,19 @@ static int routed_moe_aligned_launch(
         const bool materialize_intermediates =
             getenv("DS4_METAL_GRAPH_DUMP_PREFIX") != NULL;
         if (!materialize_intermediates) {
+            /*
+             * batch_routed_gate can own the complete aliased prefill arena.
+             * Only its leading logical gate segment is scratch for direct D2R;
+             * advertising the owner's full capacity makes the overlap guard
+             * falsely cover the adjacent up/mid/down views.
+             */
+            const uint64_t gate_scratch_bytes =
+                (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float);
             rc = ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
                     gate_art->device_ptr, up_art->device_ptr,
                     down_art->device_ptr, x, selected, weights,
                     up->ptr, (size_t)up->bytes,
-                    gate->ptr, (size_t)gate->bytes,
+                    gate->ptr, (size_t)gate_scratch_bytes,
                     mid->ptr, (size_t)mid->bytes, (float *)down->ptr,
                     (int)expert_mid_dim, (int)expert_in_dim, (int)out_dim,
                     (int)n_tokens, (int)n_total_expert, (int)n_expert,
@@ -20498,6 +20508,19 @@ static int routed_moe_aligned_launch(
                         "ds4: CUDA complete fused MoE D2R prefill enabled "
                         "(tail-aware 8/16/32 gate-up, 8/16/32/64 down, "
                         "preallocated workspace)\n");
+            } else if (rc != 0 && !g_moe_complete_fused_fallback_notice) {
+                g_moe_complete_fused_fallback_notice = 1;
+                fprintf(stderr,
+                        "ds4: CUDA complete fused MoE D2R prefill unavailable "
+                        "(rc=%d tokens=%u input/downq/work/out="
+                        "%.2f/%.2f/%.2f/%.2f MiB); "
+                        "using materialized D2R fallback\n",
+                        rc,
+                        n_tokens,
+                        (double)up->bytes / 1048576.0,
+                        (double)gate_scratch_bytes / 1048576.0,
+                        (double)mid->bytes / 1048576.0,
+                        (double)down->bytes / 1048576.0);
             }
         } else {
             rc = -1;

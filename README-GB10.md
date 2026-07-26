@@ -8,6 +8,102 @@ conservare il throughput DSpark sui contesti lunghi.
 La sezione **Avvio rapido** è la procedura operativa aggiornata. Le sezioni
 successive conservano la cronologia tecnica, comprese prove scartate e rollback.
 
+## Esperimento Adaptive IndexCache scartato - 27 luglio 2026
+
+Adaptive IndexCache e' stato implementato e misurato come tentativo di ridurre
+il costo del selettore CSA nei 21 layer ratio-4. Il prototipo calcolava un
+Top-512 exact in cinque layer Full (`2,12,22,32,42`) e permetteva ai sedici
+layer Shared intermedi di riusarne gli indici. Query dell'attenzione, KV,
+compressor e stati del layer target restavano locali; soltanto il set di righe
+sparse veniva condiviso.
+
+L'implementazione comprendeva tre modalita':
+
+- `off`, identica al percorso exact stabile;
+- `shadow`, che calcolava comunque il Top-512 exact e misurava su GPU
+  l'intersezione con il set riusato, senza modificare l'output;
+- `reuse`, zero-copy e senza memoria permanente aggiuntiva, che saltava
+  selector-Q, scorer e Top-K nei layer Shared.
+
+Il lifecycle invalidava la cache a ogni cambio di chunk, restore o reset; le
+KV disk cache sperimentali erano separate per maschera. Un controllo `reuse`
+con tutti i 21 layer Full ha conservato gli hash greedy del baseline, quindi
+planner, allocazioni e invalidazioni non alteravano da soli il risultato.
+
+### Profilo e limite teorico
+
+Il profilo Nsight su Athena, chunk 8192 e contesto fisico 262144, ha misurato:
+
+| `pos0` | Chunk GPU ms | Selector-Q ms | Score ms | Top-K ms | Quota selettore | Ceiling ideale 5F |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8192 | 8423,725 | 155,566 | 91,185 | 132,514 | 4,50% | 1,036x |
+| 32768 | 8555,033 | 154,753 | 186,607 | 66,939 | 4,77% | 1,038x |
+| 65536 | 8818,657 | 155,610 | 317,908 | 79,202 | 6,27% | 1,050x |
+| 98304 | 9199,001 | 155,818 | 566,291 | 93,130 | 8,86% | 1,072x |
+| 131072 | 9395,929 | 156,938 | 585,943 | 111,192 | 9,09% | 1,074x |
+
+Il gate Amdahl originale richiedeva una quota del 26,25% per ottenere `1,25x`.
+Nessuna profondita' lo ha superato: il massimo realistico misurato era circa
+`+7,4%`, non `+25%`.
+
+Il benchmark end-to-end ha confermato che il prototipo eliminava il lavoro
+previsto:
+
+| Frontiera | Exact `off` | 5 Full `reuse` | Delta | Hash greedy |
+|---:|---:|---:|---:|---|
+| 65536 | 989,59 t/s | 1018,81 t/s | +2,95% | diverso |
+| 98304 | 944,90 t/s | 992,52 t/s | +5,04% | diverso |
+| 131072 | 910,96 t/s | 972,15 t/s | +6,72% | diverso |
+
+Rispetto al controllo all-F eseguito nello stesso ciclo, il guadagno a 131K
+era `+7,58%`. Il risultato prestazionale era quindi reale e vicino al ceiling,
+ma ottenuto cambiando il Top-512 accessibile al modello.
+
+### Gate di qualita'
+
+Lo shadow ha mostrato overlap medio fra circa 13% e 49% a seconda della coppia
+source/target, con minimi per-token vicini a zero. Il riuso uniforme non era
+quindi una cache exact: poteva escludere righe che il selettore del layer
+target avrebbe scelto.
+
+Il test qualitativo usato per la decisione e' stato
+`tool-eval-bench --hardmode --seed 42 --temperature 0.95 --parallel 2`.
+Il confronto pulito, senza pressione artificiale sul contesto, ha prodotto:
+
+| Versione | Risultato | Tempo | Mediana turn | Errori HTTP |
+|---|---:|---:|---:|---:|
+| Fork stabile, IndexCache `off` | 77/100 | 399,2 s | 6,3 s | 0 |
+| Antirez `80ebbc396aee40eedc1d829222f3362d10fa4c6c` | 77/100 | 803,1 s | 11,2 s | 0 |
+| Prototipo 5 Full `reuse` | 60/100 | 640,9 s | 8,4 s | 0 |
+
+Fork stabile e Antirez hanno avuto lo stesso esito in tutti i 15 scenari:
+nove `PASS`, cinque `PARTIAL` e un `FAIL`. Il fork ha completato lo stesso test
+in circa meta' tempo; il log server ha misurato 23,432 t/s di decode pesato su
+8248 token generati.
+
+Il candidato `reuse` ha invece degradato casi gia' superati, in particolare
+TC73 e TC82 nel run completo. Le ripetizioni mirate hanno confermato che la
+traiettoria e' sensibile al contesto, ma anche che la perdita non era soltanto
+rumore: senza pressione sul contesto, `off` ha superato entrambi i casi mentre
+il candidato ha ancora fallito TC73. Un precedente risultato `off` da 70/100
+non viene usato come baseline, perche' includeva circa 15107 token filler per
+scenario e quindi misurava anche la pressione del contesto.
+
+### Decisione e archivio
+
+Adaptive IndexCache offre un guadagno crescente sui contesti lunghi, ma la
+maschera uniforme a cinque layer Full non preserva la selezione sparse e non ha
+superato il gate qualitativo. Tutto il runtime, le API, la telemetria e i test
+IndexCache sono stati rimossi dalla versione di produzione; non restano flag o
+allocazioni inattive.
+
+Il prototipo completo e' conservato localmente fuori dal repository in
+`../ds4-gb10-indexcache-prototype-20260727/`. L'archivio contiene la patch
+binaria ripristinabile, lo snapshot dei file modificati, i due tool non
+tracciati, lo stato Git e il commit base. Una futura ripresa deve partire da
+una maschera calibrata con NLL/top-1 agreement per layer, non dal solo overlap
+Top-K o dal throughput.
+
 ## Esperimento HybridLC-2.1 scartato - 26 luglio 2026
 
 Dopo `3ef444b` e' stata provata una revisione piu' complessa di HybridLC:
@@ -1097,6 +1193,37 @@ confrontabili fra 24.576 e 57.344 token migliorano in media del `+3,0%`; il
 chunk 73.728..81.920 passa da 727,01 a 757,28 t/s (`+4,16%`). Il decode resta
 sopra il target, con 22,68 t/s a 64K e 21,97 t/s a 91K, e i context buffer
 restano invariati a 2.453,90 MiB.
+
+### Ripristino del fast path D2R con arena condivisa
+
+L'audit del 26 luglio 2026 ha trovato una regressione di dispatch introdotta
+dall'arena condivisa usata per estendere il contesto oltre 131K. Il tensor
+`batch_routed_gate` possiede l'intera arena da 1920 MiB, ma il segmento gate
+logico di un chunk da 8192 token occupa soltanto 384 MiB. Passare alla guardia
+di overlap la capienza del proprietario faceva apparire gate sovrapposto alle
+view adiacenti `up`, `mid` e `down`; il complete fused D2R veniva rifiutato e
+tutti i layer usavano il fallback materializzato.
+
+Il dispatcher passa ora la capienza logica del solo segmento gate. Non cambia
+puntatore, allocazione, kernel o ordine numerico: viene soltanto resa corretta
+la guardia fra quattro regioni gia' disgiunte. Codici di ritorno distinti e un
+messaggio una tantum rendono immediatamente visibile l'eventuale causa di un
+fallback senza aggiungere telemetria al percorso caldo.
+
+La regressione Athena `sm_121a` e' rimasta bit-exact:
+
+```text
+cuda-regression: complete fused D2R MoE parity final=0.00000000 max=0 bad=0
+cuda long-context regression: OK
+```
+
+Con contesto fisico 262144, chunk 8192 e sidecar DSpark Q2, un A/B controllato
+ha portato il primo blocco da 960,94 a 1001,94 t/s medi (`+4,27%`) e il blocco
+8192..16384 a 1006,61 t/s. I singoli run sono stati
+1002,75/1001,12 t/s a 8K e 1006,52/1006,69 t/s a 16K. Gli hash greedy sono
+rimasti rispettivamente `1fb5af6f4176aaee` ed `e860341538aa8276`; non viene
+aggiunta memoria persistente e il verifier DSpark da 1-6 righe non e'
+modificato.
 
 ## Requisiti
 

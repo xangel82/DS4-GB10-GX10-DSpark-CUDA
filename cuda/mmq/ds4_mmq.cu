@@ -1016,14 +1016,14 @@ int ds4_mmq_moe_pair_impl(
                 ne_get_rows, n_experts);
         const size_t down_work_bytes =
             ds4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
-        if (fused_down->input_q8_scratch_bytes < nbytes_src1_q8_1 ||
-            fused_down->q8_scratch_bytes < direct_down_q8_bytes ||
-            gateup_work_bytes == 0 || down_work_bytes == 0 ||
-            !d2r_enabled() || !d2r_iq2_enabled() ||
-            ne_get_rows < d2r_min_cols() ||
-            !ds4_mmq_iq2_xxs_moe_d2r_available(cc) ||
+        if (fused_down->input_q8_scratch_bytes < nbytes_src1_q8_1) return -91;
+        if (fused_down->q8_scratch_bytes < direct_down_q8_bytes) return -92;
+        if (gateup_work_bytes == 0 || down_work_bytes == 0) return -93;
+        if (!d2r_enabled() || !d2r_iq2_enabled()) return -94;
+        if (ne_get_rows < d2r_min_cols()) return -95;
+        if (!ds4_mmq_iq2_xxs_moe_d2r_available(cc) ||
             !ds4_mmq_q2_K_moe_d2r_available(cc)) {
-            return -9;
+            return -96;
         }
 
         size_t offset = 0;
@@ -1047,7 +1047,7 @@ int ds4_mmq_moe_pair_impl(
             !ds4_mmq_take_scratch(
                 fused_down->work_scratch, fused_down->work_scratch_bytes,
                 &offset, direct_work_bytes, 256, &direct_work)) {
-            return -9;
+            return -97;
         }
         ids_src1 = (int32_t *)ids_src1_raw;
         ids_dst = (int32_t *)ids_dst_raw;

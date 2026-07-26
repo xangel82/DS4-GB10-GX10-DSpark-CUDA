@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="700" viewBox="0 0 1200 700" role="img" aria-labelledby="title desc">
   <title id="title">DS4 GB10 measured performance progress</title>
-  <desc id="desc">Horizontal bar charts showing measured prefill progress from 404 to 1010 tokens per second and decode progress from 13 to 25 tokens per second.</desc>
-  <rect width="1200" height="620" fill="#0d1117"/>
+  <desc id="desc">Horizontal bar charts showing measured prefill progress from 404 to 1010 tokens per second and decode progress from 13 to 34.97 tokens per second with lossless HybridLC.</desc>
+  <rect width="1200" height="700" fill="#0d1117"/>
 
   <text x="60" y="62" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="30" font-weight="700">DS4 GB10 measured performance progress</text>
   <text x="60" y="94" fill="#8b949e" font-family="Arial, Helvetica, sans-serif" font-size="16">DeepSeek-V4-Flash + DSpark on one NVIDIA GB10</text>
@@ -29,32 +29,45 @@
   <rect x="220" y="346" width="384" height="24" rx="4" fill="#3fb950"/>
   <text x="616" y="364" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700">1010</text>
 
-  <line x1="650" y1="133" x2="650" y2="486" stroke="#30363d" stroke-width="1"/>
+  <line x1="650" y1="133" x2="650" y2="500" stroke="#30363d" stroke-width="1"/>
 
   <text x="700" y="145" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="700">Decode throughput</text>
   <text x="1135" y="145" fill="#8b949e" font-family="Arial, Helvetica, sans-serif" font-size="15" text-anchor="end">tokens/s</text>
 
-  <text x="700" y="194" fill="#c9d1d9" font-family="Arial, Helvetica, sans-serif" font-size="15">Original CUDA</text>
-  <rect x="860" y="176" width="143" height="24" rx="4" fill="#d29922"/>
-  <text x="1015" y="194" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700">13.0</text>
+  <text x="700" y="184" fill="#c9d1d9" font-family="Arial, Helvetica, sans-serif" font-size="15">Original CUDA</text>
+  <rect x="860" y="166" width="102" height="24" rx="4" fill="#d29922"/>
+  <text x="974" y="184" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700">13.0</text>
 
-  <text x="700" y="249" fill="#c9d1d9" font-family="Arial, Helvetica, sans-serif" font-size="15">Non-spec baseline</text>
-  <rect x="860" y="231" width="161" height="24" rx="4" fill="#e3b341"/>
-  <text x="1033" y="249" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700">14.6</text>
+  <text x="700" y="229" fill="#c9d1d9" font-family="Arial, Helvetica, sans-serif" font-size="15">Non-spec baseline</text>
+  <rect x="860" y="211" width="115" height="24" rx="4" fill="#e3b341"/>
+  <text x="987" y="229" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700">14.6</text>
 
-  <text x="700" y="304" fill="#c9d1d9" font-family="Arial, Helvetica, sans-serif" font-size="15">Q2 clean session</text>
-  <rect x="860" y="286" width="230" height="24" rx="4" fill="#a371f7"/>
-  <text x="1102" y="304" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700">20.88</text>
+  <text x="700" y="274" fill="#c9d1d9" font-family="Arial, Helvetica, sans-serif" font-size="15">Q2 clean session</text>
+  <rect x="860" y="256" width="164" height="24" rx="4" fill="#a371f7"/>
+  <text x="1036" y="274" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700">20.88</text>
 
-  <text x="700" y="359" fill="#c9d1d9" font-family="Arial, Helvetica, sans-serif" font-size="15">Q2 tool-call turns</text>
-  <rect x="860" y="341" width="275" height="24" rx="4" fill="#bc8cff"/>
-  <text x="1123" y="399" fill="#8b949e" font-family="Arial, Helvetica, sans-serif" font-size="14" text-anchor="end">observed range</text>
-  <text x="1147" y="359" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" text-anchor="end">24-26</text>
+  <text x="700" y="319" fill="#c9d1d9" font-family="Arial, Helvetica, sans-serif" font-size="15">Q2 tool-call turns</text>
+  <rect x="860" y="301" width="196" height="24" rx="4" fill="#bc8cff"/>
+  <text x="1068" y="319" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700">24-26</text>
 
-  <rect x="60" y="437" width="1075" height="1" fill="#30363d"/>
-  <text x="60" y="478" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="700">Current operating profile</text>
-  <text x="60" y="510" fill="#c9d1d9" font-family="Arial, Helvetica, sans-serif" font-size="15">256k physical context  |  85% advertised guard  |  8192-token prefill chunks  |  lossless p/q verification</text>
-  <text x="60" y="538" fill="#c9d1d9" font-family="Arial, Helvetica, sans-serif" font-size="15">Observed around 75 C in sustained runs  |  stable UMA use  |  compact Q2 sidecar saves about 5.06 GiB vs Q4</text>
-  <text x="60" y="570" fill="#8b949e" font-family="Arial, Helvetica, sans-serif" font-size="14">Measured on Athena. Results vary with context, prompt shape, sampling, cooling and DSpark acceptance.</text>
-  <text x="1140" y="598" fill="#58a6ff" font-family="Arial, Helvetica, sans-serif" font-size="14" text-anchor="end">github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA</text>
+  <text x="700" y="364" fill="#c9d1d9" font-family="Arial, Helvetica, sans-serif" font-size="15">HybridLC N=8</text>
+  <rect x="860" y="346" width="211" height="24" rx="4" fill="#39c5cf"/>
+  <text x="1083" y="364" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700">26.89</text>
+
+  <text x="700" y="409" fill="#c9d1d9" font-family="Arial, Helvetica, sans-serif" font-size="15">HybridLC N=12</text>
+  <rect x="860" y="391" width="268" height="24" rx="4" fill="#20b2aa"/>
+  <text x="1140" y="409" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700">34.15</text>
+
+  <text x="700" y="454" fill="#c9d1d9" font-family="Arial, Helvetica, sans-serif" font-size="15">HybridLC N=16</text>
+  <rect x="860" y="436" width="275" height="24" rx="4" fill="#3fb950"/>
+  <text x="1147" y="454" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700">34.97</text>
+
+  <text x="1135" y="486" fill="#8b949e" font-family="Arial, Helvetica, sans-serif" font-size="14" text-anchor="end">covered retrieval widths; target-verified</text>
+
+  <rect x="60" y="520" width="1075" height="1" fill="#30363d"/>
+  <text x="60" y="561" fill="#f0f6fc" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="700">Current operating profile</text>
+  <text x="60" y="593" fill="#c9d1d9" font-family="Arial, Helvetica, sans-serif" font-size="15">256k physical context  |  85% advertised guard  |  8192-token prefill chunks  |  lossless p/q verification</text>
+  <text x="60" y="621" fill="#c9d1d9" font-family="Arial, Helvetica, sans-serif" font-size="15">Observed around 75 C in sustained runs  |  stable UMA use  |  compact Q2 sidecar saves about 5.06 GiB vs Q4</text>
+  <text x="60" y="653" fill="#8b949e" font-family="Arial, Helvetica, sans-serif" font-size="14">Measured on Athena. Results vary with context, prompt shape, sampling, cooling and DSpark acceptance.</text>
+  <text x="1140" y="681" fill="#58a6ff" font-family="Arial, Helvetica, sans-serif" font-size="14" text-anchor="end">github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA</text>
 </svg>

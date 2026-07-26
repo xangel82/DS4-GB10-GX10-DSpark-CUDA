@@ -8,13 +8,6 @@ GPU-side verification and reproducible GB10 benchmarks.
 Repository:
 [xangel82/DS4-GB10-GX10-DSpark-CUDA](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA)
 
-Release commit `98c71c0` reaches **up to 35 decode tokens/s** with lossless
-HybridLC on covered regions, while substantial long-context prefill remains
-around 851-907 tokens/s. HybridLC learns from exact sequences already present
-in the verified context, extends the neural DSpark draft when a reliable suffix
-is available, and always leaves the target model in control of acceptance and
-sampling.
-
 ## Results at a glance
 
 Measured on Athena, a single NVIDIA GB10, using the recommended

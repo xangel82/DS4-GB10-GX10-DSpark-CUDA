@@ -50,7 +50,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-spark-graph cuda-spark-mtp-tc cuda-spark-graph-sm121 cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-dspark-analyzer cpu cuda cuda-spark cuda-spark-graph cuda-spark-mtp-tc cuda-spark-graph-sm121 cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -290,10 +290,13 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-dspark-analyzer
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
+
+test-dspark-analyzer:
+	./tests/test_analyze_dspark_log.sh
 
 q4k-dot-test: tests/test_q4k_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread

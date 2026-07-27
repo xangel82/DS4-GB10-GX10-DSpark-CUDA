@@ -32,10 +32,38 @@ function text_value(prefix,    i,a) {
   h = value("history"); if (h == 1) history_active++
   k = value("selected")
   if (k >= 0 && k <= 5) selected[k]++
+  deterministic = value("deterministic")
+  legacy = value("legacy")
+  if (deterministic == 1) {
+    deterministic_cycles++
+    if (legacy >= 0 && legacy != k) deterministic_overrides++
+  }
   k = value("early_stop")
   if (k >= 1 && k <= 5) early_stop[k]++
   k = value("champion")
   if (k >= 1 && k <= 5) champion[k]++
+  sk = value("shadow_k")
+  sr = value("shadow_ready")
+  if (sk >= 1 && sk <= 5) {
+    shadow_selected[sk]++
+    shadow_decisions++
+    if (sk == value("selected")) shadow_agree++
+  }
+  if (sr == 1) shadow_ready++
+  slr = value("shadow_local_ready")
+  if (slr == 1) shadow_local_ready++
+  pk = value("probe_k")
+  if (pk >= 1 && pk <= 5) {
+    scheduler_probes++
+    scheduler_probe_k[pk]++
+  }
+  v = value("shadow_rate")
+  if (v > 0) {
+    shadow_rate_sum += v
+    shadow_rate_n++
+  }
+  v = value("shadow_stop")
+  if (v >= 1 && v <= 5) shadow_stop[v]++
 }
 /dspark scheduler bypass/ { bypass++ }
 /dspark pre-draft bypass/ { predraft_bypass++ }
@@ -271,6 +299,33 @@ END {
   printf "Scheduler K=0..5:          %d %d %d %d %d %d\n", selected[0], selected[1], selected[2], selected[3], selected[4], selected[5]
   printf "Causal stops K=1..5:       %d %d %d %d %d\n", early_stop[1], early_stop[2], early_stop[3], early_stop[4], early_stop[5]
   printf "Champion K=1..5:           %d %d %d %d %d\n", champion[1], champion[2], champion[3], champion[4], champion[5]
+  if (deterministic_cycles > 0) {
+    printf "Deterministic cycles/overrides: %d / %d\n",
+           deterministic_cycles, deterministic_overrides
+  }
+  if (shadow_decisions > 0) {
+    printf "Shadow K=1..5:             %d %d %d %d %d\n",
+           shadow_selected[1], shadow_selected[2], shadow_selected[3],
+           shadow_selected[4], shadow_selected[5]
+    printf "Shadow ready/agreement:    %d / %d (%.2f%% agreement)\n",
+           shadow_ready, shadow_agree, 100.0 * shadow_agree / shadow_decisions
+    if (scheduler_probes > 0) {
+      printf "Deterministic probes K=1..5: %d %d %d %d %d (total=%d)\n",
+             scheduler_probe_k[1], scheduler_probe_k[2],
+             scheduler_probe_k[3], scheduler_probe_k[4],
+             scheduler_probe_k[5], scheduler_probes
+      printf "Shadow local-profile ready: %d / %d (%.2f%%)\n",
+             shadow_local_ready, shadow_decisions,
+             100.0 * shadow_local_ready / shadow_decisions
+    }
+    printf "Shadow causal stops:       %d %d %d %d %d\n",
+           shadow_stop[1], shadow_stop[2], shadow_stop[3],
+           shadow_stop[4], shadow_stop[5]
+    if (shadow_rate_n > 0) {
+      printf "Mean shadow predicted rate: %.3f t/s\n",
+             shadow_rate_sum / shadow_rate_n
+    }
+  }
   if (block_n > 0) printf "Mean DSpark block/proposed: %.3f / %.3f\n", block_sum / block_n, proposed_sum / proposed_n
   printf "History-latched cycles:    %d\n", history_active
   printf "K0 cooldown activations:   %d\n", k0_cooldowns

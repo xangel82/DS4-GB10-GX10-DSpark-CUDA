@@ -373,6 +373,54 @@ superato la regressione, ma K=1 e' passato da 122,5 a 125,3 ms nel confronto
 end-to-end. L'estensione multi-riga e' stata quindi rimossa; resta soltanto il
 GVR exact a token singolo gia' validato.
 
+## Scheduler DSpark deterministico in shadow - 27 luglio 2026
+
+E' disponibile un secondo scheduler osservazionale che separa il modello di
+acceptance dal costo hardware. Per ogni `K=1..5` conserva una finestra robusta
+di nove misure del verifier, scarta i primi due warm-up e usa mediana e MAD.
+Le misure sono locali alle fasce di contesto da 32K token, con fallback globale
+quando una nuova fascia non ha ancora campioni sufficienti. Anche il costo
+fisso del draft usa una mediana separata.
+
+Con `DS4_TELEMETRY=1` il launcher abilita automaticamente
+`DS4_DSPARK_SCHEDULER_SHADOW=1`. In questa modalità il nuovo criterio calcola
+il K causale più conveniente e lo scrive nel log, ma il K effettivo continua a
+essere scelto dallo scheduler di produzione. Non cambiano verifier, logits,
+rejection sampling, RNG o token emessi. `analyze-dspark-log.sh` riporta
+distribuzione K shadow, copertura del profilo, accordo con il percorso corrente
+e numero di causal stop.
+
+La modalità canary si abilita esplicitamente:
+
+```bash
+DS4_TELEMETRY=1 DS4_DSPARK_SCHEDULER_DETERMINISTIC=1 ./run-dspark-server.sh
+```
+
+Il canary usa il nuovo K soltanto dopo almeno tre misure robuste per tutte le
+ampiezze disponibili. Il target resta autoritativo e il percorso p/q lossless
+non cambia. Nel confronto greedy fra il commit stabile `9814007` e il canary,
+cinque risposte su cinque sono risultate identiche, inclusi reasoning e
+`finish_reason`; baseline e shadow puro hanno inoltre prodotto esattamente
+`81` cicli, `229` token draft e `150` commit.
+
+Sul medesimo output deterministico da 600 token, lo shadow puro ha misurato
+`17,701 t/s`; il canary prevalentemente K=3 ha misurato `17,977 t/s`
+(`+1,56%`) con risposta byte-identica e 230 cicli invece di 242. Il beneficio è
+reale ma ancora troppo piccolo e basato su un solo carico per diventare il
+default. Il launcher normale mantiene quindi lo scheduler stabile; shadow e
+canary servono alla raccolta dati e alla validazione progressiva.
+
+Un successivo carico reale da 1.863 cicli ha evidenziato un lock-in del canary
+su `K=2`: il costo robusto di `K=3` incorporava saltuariamente il verifier
+HybridLC esteso `N=8` e, una volta scelto `K=2`, le altre forme non ricevevano
+piu' campioni freschi. La correzione mantiene separati i costi neural-only,
+ispeziona tutte le forme perche' sul GB10 il costo non e' monotono e usa un
+challenger probe deterministico ogni 32 cicli. Il probe copre prima le forme
+non calibrate nella fascia di contesto corrente, poi il candidato legacy o la
+forma plausibile meno recente. Frequenza e soglia sono regolabili con
+`DS4_DSPARK_DETERMINISTIC_PROBE_INTERVAL` e
+`DS4_DSPARK_DETERMINISTIC_PROBE_FLOOR`; restano opzioni canary, non default.
+
 ## Sidecar DSpark Q2 compatto promosso - 24 luglio 2026
 
 Il launcher e il builder supportano ora due sidecar DSpark. Il Q2 e' il

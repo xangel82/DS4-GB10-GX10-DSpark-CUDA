@@ -76,6 +76,7 @@ def fixture_environment(dspark: bool) -> dict[str, str]:
             "DS4_DSPARK_ALWAYS_DRAFT": "1",
             "DS4_DSPARK_NO_CIRCUIT_BREAKER": "1",
             "DS4_DSPARK_TIMING": "1",
+            "DS4_DSPARK_SCHEDULER_SHADOW": "1",
         })
     for key, value in defaults.items():
         env.setdefault(key, value)
@@ -194,7 +195,7 @@ def dspark_stats(log_path: Path) -> dict[str, int]:
     drafted = sum(int(value) for value in
                   re.findall(r"dspark timing drafted=(\d+)", text))
     committed = sum(int(value) for value in
-                    re.findall(r"dspark timing drafted=\d+[^\n]*committed=(\d+)",
+                    re.findall(r"dspark timing drafted=\d+[^\n]*? committed=(\d+)",
                                text))
     return {
         "cycles": len(re.findall(r"dspark timing drafted=", text)),

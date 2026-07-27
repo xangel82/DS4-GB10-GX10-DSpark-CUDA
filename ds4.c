@@ -26061,6 +26061,14 @@ static void ds4_acquire_instance_lock(void) {
 }
 
 #define DS4_DSPARK_CONTEXT_BUCKETS 8u
+#define DS4_DSPARK_COST_WINDOW 9u
+
+typedef struct {
+    double value[DS4_DSPARK_COST_WINDOW];
+    uint32_t seen;
+    uint32_t count;
+    uint32_t next;
+} ds4_dspark_cost_window;
 
 typedef enum {
     DS4_HYBRID_SOURCE_NEURAL = 0,
@@ -26156,6 +26164,13 @@ struct ds4_session {
                                    [DS4_DSPARK_BLOCK_SIZE + 1];
     uint64_t dspark_bucket_rate_samples[DS4_DSPARK_CONTEXT_BUCKETS]
                                         [DS4_DSPARK_BLOCK_SIZE + 1];
+    ds4_dspark_cost_window dspark_verify_cost_window
+        [DS4_DSPARK_CONTEXT_BUCKETS][DS4_DSPARK_BLOCK_SIZE + 1];
+    ds4_dspark_cost_window dspark_global_verify_cost_window
+        [DS4_DSPARK_BLOCK_SIZE + 1];
+    ds4_dspark_cost_window dspark_draft_cost_window;
+    uint64_t dspark_verify_cost_last_cycle
+        [DS4_DSPARK_CONTEXT_BUCKETS][DS4_DSPARK_BLOCK_SIZE + 1];
     double dspark_accept_success[DS4_DSPARK_BLOCK_SIZE];
     double dspark_accept_trials[DS4_DSPARK_BLOCK_SIZE];
     double dspark_recent_accept_ewma[DS4_DSPARK_BLOCK_SIZE];
@@ -26205,6 +26220,8 @@ struct ds4_session {
     uint32_t dspark_k0_streak;
     uint32_t dspark_bypass_left;
     bool dspark_history_active;
+    bool dspark_scheduler_shadow;
+    bool dspark_scheduler_deterministic;
     uint64_t dspark_cycles;
     /* On a stochastic partial accept the verifier has already consumed the
      * RNG draw for the mismatch position.  Return it once on the next public
@@ -30317,6 +30334,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     }
     s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
     if (e->dspark_ready) {
+        s->dspark_scheduler_deterministic =
+            getenv("DS4_DSPARK_SCHEDULER_DETERMINISTIC") != NULL;
+        s->dspark_scheduler_shadow =
+            s->dspark_scheduler_deterministic ||
+            getenv("DS4_DSPARK_SCHEDULER_SHADOW") != NULL;
         s->dspark_draft_probs_host = xmalloc(
                 (size_t)DS4_DSPARK_BLOCK_SIZE * DS4_N_VOCAB *
                 sizeof(s->dspark_draft_probs_host[0]));
@@ -31789,6 +31811,58 @@ static double dspark_sigmoid(double x) {
     return z / (1.0 + z);
 }
 
+static void dspark_cost_window_note(
+        ds4_dspark_cost_window *window, double value) {
+    if (!window || value <= 0.0 || !isfinite(value)) return;
+    window->seen++;
+    if (window->seen <= 2u) return;
+    window->value[window->next] = value;
+    window->next = (window->next + 1u) % DS4_DSPARK_COST_WINDOW;
+    if (window->count < DS4_DSPARK_COST_WINDOW) window->count++;
+}
+
+static double dspark_cost_window_median(
+        const ds4_dspark_cost_window *window, double *mad_out) {
+    if (mad_out) *mad_out = 0.0;
+    if (!window || window->count == 0u) return 0.0;
+    double sorted[DS4_DSPARK_COST_WINDOW];
+    for (uint32_t i = 0; i < window->count; i++) {
+        sorted[i] = window->value[i];
+    }
+    for (uint32_t i = 1; i < window->count; i++) {
+        const double value = sorted[i];
+        uint32_t j = i;
+        while (j != 0u && sorted[j - 1u] > value) {
+            sorted[j] = sorted[j - 1u];
+            j--;
+        }
+        sorted[j] = value;
+    }
+    const uint32_t middle = window->count / 2u;
+    const double median = (window->count & 1u) != 0u
+        ? sorted[middle]
+        : 0.5 * (sorted[middle - 1u] + sorted[middle]);
+    if (mad_out && window->count >= 3u) {
+        double deviation[DS4_DSPARK_COST_WINDOW];
+        for (uint32_t i = 0; i < window->count; i++) {
+            deviation[i] = fabs(window->value[i] - median);
+        }
+        for (uint32_t i = 1; i < window->count; i++) {
+            const double value = deviation[i];
+            uint32_t j = i;
+            while (j != 0u && deviation[j - 1u] > value) {
+                deviation[j] = deviation[j - 1u];
+                j--;
+            }
+            deviation[j] = value;
+        }
+        *mad_out = (window->count & 1u) != 0u
+            ? deviation[middle]
+            : 0.5 * (deviation[middle - 1u] + deviation[middle]);
+    }
+    return median;
+}
+
 static uint32_t dspark_context_bucket(const ds4_session *s) {
     uint64_t pos = s && s->checkpoint.len > 0
         ? (uint64_t)s->checkpoint.len : 0u;
@@ -31921,6 +31995,190 @@ static double dspark_verify_cost_estimate(const ds4_session *s, uint32_t k) {
         }
     }
     return estimate;
+}
+
+typedef struct {
+    uint32_t selected;
+    uint32_t probe;
+    uint32_t early_stop;
+    uint32_t selected_cost_samples;
+    double predicted_rate;
+    double candidate_rate[DS4_DSPARK_BLOCK_SIZE + 1];
+    double expected_tokens;
+    double selected_verify_seconds;
+    double selected_verify_mad;
+    double draft_seconds;
+    double draft_mad;
+    uint32_t draft_samples;
+    bool profile_ready;
+    bool local_profile_ready;
+} dspark_shadow_decision;
+
+static double dspark_robust_verify_cost(
+        const ds4_session *s, uint32_t k,
+        uint32_t *samples_out, double *mad_out) {
+    if (samples_out) *samples_out = 0u;
+    if (mad_out) *mad_out = 0.0;
+    if (!s || k == 0u || k > DS4_DSPARK_BLOCK_SIZE) return 0.0;
+    const uint32_t bucket = dspark_context_bucket(s);
+    const ds4_dspark_cost_window *window =
+        &s->dspark_verify_cost_window[bucket][k];
+    if (window->count >= 3u) {
+        if (samples_out) *samples_out = window->count;
+        return dspark_cost_window_median(window, mad_out);
+    }
+    window = &s->dspark_global_verify_cost_window[k];
+    if (window->count >= 3u) {
+        if (samples_out) *samples_out = window->count;
+        return dspark_cost_window_median(window, mad_out);
+    }
+    if (samples_out) *samples_out = window->count;
+    return dspark_verify_cost_estimate(s, k);
+}
+
+/* DSpark/SpecDec++ causal prefix rule over a robust hardware-cost profile.
+ * The function itself is read-only.  Shadow mode only logs its decision;
+ * deterministic canary mode may apply it after every K has enough samples. */
+static dspark_shadow_decision dspark_choose_verify_len_shadow(
+        const ds4_session *s,
+        const float confidence_logits[DS4_DSPARK_BLOCK_SIZE],
+        uint32_t max_k,
+        double draft_seconds) {
+    dspark_shadow_decision decision;
+    memset(&decision, 0, sizeof(decision));
+    if (!s || max_k == 0u) return decision;
+    if (max_k > DS4_DSPARK_BLOCK_SIZE) max_k = DS4_DSPARK_BLOCK_SIZE;
+
+    decision.profile_ready = true;
+    decision.local_profile_ready = true;
+    const uint32_t bucket = dspark_context_bucket(s);
+    for (uint32_t k = 1u; k <= max_k; k++) {
+        uint32_t samples = 0u;
+        (void)dspark_robust_verify_cost(s, k, &samples, NULL);
+        if (samples < 3u) {
+            decision.profile_ready = false;
+        }
+        if (s->dspark_verify_cost_window[bucket][k].count < 3u) {
+            decision.local_profile_ready = false;
+        }
+    }
+    decision.draft_seconds = draft_seconds;
+    if (s->dspark_draft_cost_window.count >= 3u) {
+        decision.draft_samples = s->dspark_draft_cost_window.count;
+        decision.draft_seconds = dspark_cost_window_median(
+                &s->dspark_draft_cost_window, &decision.draft_mad);
+    }
+    double survival = 1.0;
+    double expected_tokens = 1.0;
+    double best_rate = 0.0;
+    uint32_t best_k = 1u;
+    uint32_t causal_min_k = (uint32_t)dspark_env_double(
+            "DS4_DSPARK_CAUSAL_MIN_K", 2.0, 1.0,
+            (double)DS4_DSPARK_BLOCK_SIZE);
+    if (causal_min_k > max_k) causal_min_k = max_k;
+    const double switch_margin = dspark_env_double(
+            "DS4_DSPARK_SHADOW_SWITCH_MARGIN", 1.02, 1.0, 1.25);
+    double previous_rate = -1.0;
+
+    for (uint32_t k = 1u; k <= max_k; k++) {
+        const double conditional = dspark_calibrated_confidence(
+                s, confidence_logits, k - 1u);
+        survival *= conditional;
+        expected_tokens += survival;
+
+        uint32_t samples = 0u;
+        double verify_mad = 0.0;
+        const double verify_seconds = dspark_robust_verify_cost(
+                s, k, &samples, &verify_mad);
+        const double seconds = decision.draft_seconds + verify_seconds;
+        const double rate = seconds > 0.0 ? expected_tokens / seconds : 0.0;
+        decision.candidate_rate[k] = rate;
+
+        /* Record the first causal turn for diagnostics, but keep scanning.
+         * GB10 verifier widths are not monotonic: graph topology and padded
+         * Tensor Core shapes can make K=4 cheaper than K=3.  Stopping at the
+         * first decline made those profitable widths permanently invisible. */
+        if (decision.early_stop == 0u && k > causal_min_k &&
+            previous_rate > 0.0 && rate <= previous_rate) {
+            decision.early_stop = k;
+        }
+        if (best_rate == 0.0 || rate > best_rate * switch_margin) {
+            best_rate = rate;
+            best_k = k;
+            decision.expected_tokens = expected_tokens;
+            decision.selected_verify_seconds = verify_seconds;
+            decision.selected_verify_mad = verify_mad;
+            decision.selected_cost_samples = samples;
+        }
+        previous_rate = rate;
+    }
+    decision.selected = best_k;
+    decision.predicted_rate = best_rate;
+    return decision;
+}
+
+/* Deterministic bounded exploration prevents a selected width from freezing
+ * every other hardware-cost and conditional-acceptance estimate.  During a
+ * new context band, probe widths with the fewest local observations first.
+ * Afterwards prefer the legacy scheduler as an independent challenger, then
+ * the stalest candidate whose predicted rate remains plausibly competitive. */
+static uint32_t dspark_choose_scheduler_probe(
+        const ds4_session *s,
+        const dspark_shadow_decision *decision,
+        uint32_t legacy_k,
+        uint32_t max_k) {
+    if (!s || !decision || max_k < 2u || !decision->profile_ready) return 0u;
+    if (max_k > DS4_DSPARK_BLOCK_SIZE) max_k = DS4_DSPARK_BLOCK_SIZE;
+    const uint64_t interval = (uint64_t)dspark_env_double(
+            "DS4_DSPARK_DETERMINISTIC_PROBE_INTERVAL",
+            32.0, 8.0, 4096.0);
+    if (interval == 0u || s->dspark_cycles == 0u ||
+        (s->dspark_cycles % interval) != 0u) return 0u;
+
+    const uint32_t bucket = dspark_context_bucket(s);
+    uint32_t probe = 0u;
+    uint32_t fewest_seen = UINT32_MAX;
+    uint64_t oldest_age = 0u;
+    for (uint32_t k = 1u; k <= max_k; k++) {
+        if (k == decision->selected) continue;
+        const ds4_dspark_cost_window *window =
+            &s->dspark_verify_cost_window[bucket][k];
+        if (window->count >= 3u) continue;
+        const uint64_t last = s->dspark_verify_cost_last_cycle[bucket][k];
+        const uint64_t age = window->seen == 0u || last > s->dspark_cycles
+            ? UINT64_MAX : s->dspark_cycles - last;
+        if (probe == 0u || window->seen < fewest_seen ||
+            (window->seen == fewest_seen && age > oldest_age)) {
+            probe = k;
+            fewest_seen = window->seen;
+            oldest_age = age;
+        }
+    }
+    if (probe != 0u) return probe;
+
+    const double floor = dspark_env_double(
+            "DS4_DSPARK_DETERMINISTIC_PROBE_FLOOR",
+            0.75, 0.25, 1.0);
+    const double min_rate = decision->predicted_rate * floor;
+    if (legacy_k >= 1u && legacy_k <= max_k &&
+        legacy_k != decision->selected &&
+        decision->candidate_rate[legacy_k] >= min_rate) {
+        return legacy_k;
+    }
+
+    oldest_age = 0u;
+    for (uint32_t k = 1u; k <= max_k; k++) {
+        if (k == decision->selected ||
+            decision->candidate_rate[k] < min_rate) continue;
+        const uint64_t last = s->dspark_verify_cost_last_cycle[bucket][k];
+        const uint64_t age = last == 0u || last > s->dspark_cycles
+            ? UINT64_MAX : s->dspark_cycles - last;
+        if (probe == 0u || age > oldest_age) {
+            probe = k;
+            oldest_age = age;
+        }
+    }
+    return probe;
 }
 
 static bool dspark_scheduler_calibrated(
@@ -32181,6 +32439,18 @@ static void dspark_note_verify_time(ds4_session *s, uint32_t k, double seconds) 
               (1.0 - bucket_alpha) +
           seconds * bucket_alpha;
     s->dspark_bucket_verify_samples[bucket][k]++;
+}
+
+static void dspark_note_robust_verify_time(
+        ds4_session *s, uint32_t k, double seconds) {
+    if (!s || !s->dspark_scheduler_shadow || k == 0u ||
+        k > DS4_DSPARK_BLOCK_SIZE || seconds <= 0.0) return;
+    const uint32_t bucket = dspark_context_bucket(s);
+    dspark_cost_window_note(
+            &s->dspark_verify_cost_window[bucket][k], seconds);
+    dspark_cost_window_note(
+            &s->dspark_global_verify_cost_window[k], seconds);
+    s->dspark_verify_cost_last_cycle[bucket][k] = s->dspark_cycles;
 }
 
 static void dspark_note_cycle_rate(
@@ -32940,6 +33210,9 @@ static int ds4_session_eval_dspark_cycle(
     s->dspark_draft_ewma = s->dspark_draft_ewma <= 0.0
         ? draft_seconds
         : s->dspark_draft_ewma * 0.85 + draft_seconds * 0.15;
+    if (s->dspark_scheduler_shadow) {
+        dspark_cost_window_note(&s->dspark_draft_cost_window, draft_seconds);
+    }
 
     /* Nothing after an EOS proposal can be observed by the verifier.  Keep
      * draft_cap unchanged: it records that the complete DSpark block ran. */
@@ -33011,14 +33284,37 @@ static int ds4_session_eval_dspark_cycle(
         return n_accept;
     }
 
-    int draft_n = (int)dspark_choose_verify_len(s,
-                                                 confidence,
-                                                 (uint32_t)verify_cap,
-                                                 draft_seconds);
+    const int legacy_draft_n = (int)dspark_choose_verify_len(
+            s, confidence, (uint32_t)verify_cap, draft_seconds);
+    int draft_n = legacy_draft_n;
+    dspark_shadow_decision shadow_decision;
+    memset(&shadow_decision, 0, sizeof(shadow_decision));
+    if (s->dspark_scheduler_shadow) {
+        shadow_decision = dspark_choose_verify_len_shadow(
+                s, confidence, (uint32_t)verify_cap, draft_seconds);
+        if (s->dspark_scheduler_deterministic &&
+            shadow_decision.profile_ready &&
+            shadow_decision.selected <= (uint32_t)verify_cap) {
+            draft_n = (int)shadow_decision.selected;
+            shadow_decision.probe = dspark_choose_scheduler_probe(
+                    s, &shadow_decision, (uint32_t)legacy_draft_n,
+                    (uint32_t)verify_cap);
+            if (shadow_decision.probe != 0u) {
+                draft_n = (int)shadow_decision.probe;
+            }
+        }
+    }
     if (draft_n > 0) s->dspark_k0_streak = 0;
     if (log) {
+        uint32_t robust_samples[DS4_DSPARK_BLOCK_SIZE + 1] = {0};
+        double robust_cost[DS4_DSPARK_BLOCK_SIZE + 1] = {0};
+        for (uint32_t k = 1u; k <= DS4_DSPARK_BLOCK_SIZE; k++) {
+            robust_cost[k] = dspark_robust_verify_cost(
+                    s, k, &robust_samples[k], NULL);
+        }
         fprintf(stderr,
-                "ds4: dspark scheduler selected=%d block=%d proposed=%d configured=%d "
+                "ds4: dspark scheduler selected=%d legacy=%d deterministic=%d "
+                "block=%d proposed=%d configured=%d "
                 "pos=%d bucket=%u "
                 "conf=[%.3f %.3f %.3f %.3f %.3f] "
                 "recent=[%.3f %.3f %.3f %.3f %.3f] "
@@ -33026,9 +33322,19 @@ static int ds4_session_eval_dspark_cycle(
                 "rate_tps=[%.2f %.2f %.2f %.2f %.2f] "
                 "stable_tps=[%.2f %.2f %.2f %.2f %.2f] "
                 "sts=[%.2f %.2f %.2f %.2f %.2f] "
+                "shadow_k=%u shadow_ready=%d shadow_rate=%.2f "
+                "shadow_local_ready=%d probe_k=%u "
+                "shadow_expected=%.3f shadow_verify=%.1f "
+                "shadow_mad=%.1f shadow_samples=%u shadow_stop=%u "
+                "shadow_draft=%.1f shadow_draft_mad=%.1f "
+                "shadow_draft_samples=%u "
+                "robust_n=[%u %u %u %u %u] "
+                "robust_ms=[%.1f %.1f %.1f %.1f %.1f] "
                 "early_stop=%u champion=%u history=%d "
                 "anchor=%.1f draft=%.1f fused=1\n",
                 draft_n,
+                legacy_draft_n,
+                s->dspark_scheduler_deterministic ? 1 : 0,
                 draft_cap,
                 proposal_cap,
                 configured_cap,
@@ -33064,6 +33370,29 @@ static int ds4_session_eval_dspark_cycle(
                 dspark_sts_temperature(s, 2),
                 dspark_sts_temperature(s, 3),
                 dspark_sts_temperature(s, 4),
+                shadow_decision.selected,
+                shadow_decision.profile_ready ? 1 : 0,
+                shadow_decision.predicted_rate,
+                shadow_decision.local_profile_ready ? 1 : 0,
+                shadow_decision.probe,
+                shadow_decision.expected_tokens,
+                shadow_decision.selected_verify_seconds * 1000.0,
+                shadow_decision.selected_verify_mad * 1000.0,
+                shadow_decision.selected_cost_samples,
+                shadow_decision.early_stop,
+                shadow_decision.draft_seconds * 1000.0,
+                shadow_decision.draft_mad * 1000.0,
+                shadow_decision.draft_samples,
+                robust_samples[1],
+                robust_samples[2],
+                robust_samples[3],
+                robust_samples[4],
+                robust_samples[5],
+                robust_cost[1] * 1000.0,
+                robust_cost[2] * 1000.0,
+                robust_cost[3] * 1000.0,
+                robust_cost[4] * 1000.0,
+                robust_cost[5] * 1000.0,
                 s->dspark_last_early_stop,
                 s->dspark_last_champion,
                 s->dspark_history_active ? 1 : 0,
@@ -33437,6 +33766,13 @@ static int ds4_session_eval_dspark_cycle(
         const double done = now_sec();
         dspark_note_verify_time(s, (uint32_t)neural_draft_n,
                                 done - draft_done);
+        /* A HybridLC tail changes the target row count and graph family.  Its
+         * cost belongs to the HybridLC width profile, not to neural K; mixing
+         * the two made a rare N=8 cycle poison the K=3 robust median. */
+        if (retrieval_n == 0) {
+            dspark_note_robust_verify_time(
+                    s, (uint32_t)neural_draft_n, done - draft_done);
+        }
         dspark_note_cycle_rate(s, (uint32_t)neural_draft_n,
                                (uint32_t)n_accept, done - t0);
         dspark_note_sts(s, confidence, (uint32_t)neural_draft_n,

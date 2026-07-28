@@ -379,8 +379,9 @@ Il canary implementa ora direttamente l'Algoritmo 1 del paper
 [DSpark](https://arxiv.org/html/2607.05147v1), separato dal runtime CUDA in un
 modulo C puro e testabile. L'interfaccia accetta gia' `R` richieste identificate
 stabilmente, confidence condizionali diverse e una curva hardware `SPS(B)`
-comune. Il server corrente gli passa una coorte di una richiesta: la policy e'
-`R=n`, ma l'executor CUDA multi-sessione non e' ancora attivo.
+comune. L'executor CUDA multi-sessione e' ora attivo nel backend fino a `R=3`;
+il server HTTP corrente continua a passargli una coorte di una richiesta finche'
+il loop di generazione non verra' trasformato in un coordinatore di coorte.
 
 Per ogni richiesta vengono calcolate le probabilita' di sopravvivenza cumulative
 `a[r,j] = product(c[r,1..j])`. Tutte le estensioni `(r,j)` vengono ordinate
@@ -424,9 +425,110 @@ richiesta contiene identita', offset, numero di righe e posizione assoluta; per
 ogni riga contiene marker di richiesta, posizione e indice del prefisso
 (`0` per il pending target, `1..K` per il draft). Il piano e' request-major,
 senza padding, e verifica che la somma delle righe coincida con il batch scelto.
-Questo prepara index-attention e compressor al futuro batching `R=n`, ma non
-duplica oggi KV o graph workspace: collegare i marker ai kernel prima di avere
-KV persistenti per sessione sarebbe un batching incompleto e non sicuro.
+Il contratto include ora anche token fisici contigui, stato RNG indipendente per
+richiesta e scatter del prefisso accettato verso la corretta continuation row.
+I test coprono coorti eterogenee (`K=2,0,1`), assenza di padding e rifiuto di un
+commit che attraversi il confine fra richieste.
+
+Il percorso CUDA reale condivide modello e workspace transiente, mantiene KV,
+compressor, ring DSpark e distribuzioni `q` privati per sessione, appiattisce le
+righe request-major senza padding e lancia una sola pipeline target. La
+transazione conserva le frontier pre-verifica, applica rejection sampling p/q
+direttamente alle slice di logits sul device e committa un prefisso indipendente
+per lane senza rieseguire il verifier. Su GB10, sidecar Q2 e tre richieste da tre
+righe, il confronto con tre verifiche sequenziali ha dato parita' numerica e
+decisionale esatta con contesto fisico allocato a 262K e frontiera di prova a
+4.096 token. Due run indipendenti hanno misurato
+`375,273-381,547 ms -> 308,031-311,680 ms`, cioe' `1,218-1,224x` e
+`28,88-29,22` righe target/s aggregate. Le due lane aggiuntive usano `3,17 GiB`
+complessivi di stato privato; non aumentano la memoria permanente del normale
+serving `R=1`. La preparazione valida prima l'intera coorte e, in caso di errore
+CUDA, ripristina gli RNG di tutte le lane. `R=3` e' il limite operativo scelto
+sul profilo da 128 GiB; `R=4` non lascia un margine RAM accettabile.
+
+Un canary `R=2` separato, sulla stessa allocazione 262K e frontiera 4.096, ha
+confermato logits, Top-1, rejection p/q e commit indipendente esatti
+(`rel-rmse=0`). Il verifier e' passato da `249,518 ms` sequenziali a
+`212,170 ms` fisici, cioe' `1,176x` e `28,28` righe target/s aggregate; la
+seconda lane ha richiesto `2.246,36 MiB` di stato privato.
+
+Il test operativo con due client HTTP indipendenti ha poi mantenuto due socket
+contemporanei, ma il server ha eseguito le richieste in alternanza strettamente
+seriale. Fra `chatcmpl-9` e `chatcmpl-26` sono stati generati 7.953 token in
+368,2 secondi di decode (`21,60 t/s` ponderati); includendo prefill e attese in
+coda, il throughput wall-clock e' stato circa `17,36 t/s`. Le tool call si sono
+mosse prevalentemente fra 21 e 30 t/s, mentre le due risposte finali lunghe
+hanno chiuso a `17,17 t/s` (2.200 token) e `19,86 t/s` (940 token). Gli append
+prefill sostanziali sono rimasti circa fra 949 e 987 t/s. Il processo ha
+raggiunto 3,62 GiB RSS senza swap; durante l'osservazione il GB10 e' rimasto
+entro 65 C. E' stato osservato un `openai role chunk failed` dopo la chiusura di
+una risposta, senza arresto del server.
+
+Questo test non viene presentato come batching fisico: dimostra invece che il
+backend e' pronto e quantifica la baseline prima del coordinatore HTTP che
+interlacera' i cicli di generazione.
+
+### STS offline autentico
+
+Il paper richiede temperature immutabili calibrate su un held-out set, da
+sinistra a destra. Il runtime supporta ora un artefatto versionato
+`DS4_DSPARK_STS_V1`. Quando e' caricato, la confidence del planner e'
+esattamente `sigmoid(logit/T[k])`: non vengono applicati bias, prior, EWMA o
+aggiornamenti online. La trasformazione resta order-preserving e modifica solo
+la lunghezza proposta al verifier; target logits, rejection sampling, RNG, KV e
+qualita' restano invariati.
+
+Raccolta held-out, in un run dedicato:
+
+```bash
+DS4_DSPARK_STS_CAPTURE=/tmp/dspark-sts-heldout.csv \
+DS4_TELEMETRY=1 ./run-dspark-server.sh
+```
+
+La capture forza la verifica del blocco neural completo `K=5` soltanto nel run
+di calibrazione, ignora gate e circuit breaker del serving e registra una riga
+solo quando sono disponibili tutte le cinque label cumulative tramite
+rejection sampling lossless (`temperature > 0`, `top_k=0`, `top_p=1`). Le altre
+policy non contaminano il CSV. Non va usata come modalita' benchmark. Terminato
+il corpus held-out, con almeno 512 cicli validi:
+
+```bash
+python3 tools/calibrate_dspark_sts.py \
+  --input /tmp/dspark-sts-heldout-grouped.csv \
+  --output /tmp/dspark-sts-q2-candidate.conf \
+  --report /tmp/dspark-sts-q2-validation.json
+```
+
+Il calibratore esegue cinque grid search 1D consecutive. A posizione `k`
+minimizza l'ECE del prodotto cumulativo, tenendo fisse le temperature gia'
+scelte per `1..k-1`, come nella sezione 3.2.1 del paper. Il launcher cerca prima
+`dspark-sts-q2.conf` o `dspark-sts-q4.conf` nella model directory e poi il
+profilo versionato in `profiles/`; un percorso esplicito usa
+`DS4_DSPARK_STS_PROFILE=/path/file.conf`.
+Un artefatto mancante o malformato interrompe l'avvio invece di ricadere
+silenziosamente su una calibrazione diversa.
+
+Per evitare leakage, il calibratore raggruppa tutte le varianti della stessa
+famiglia di prompt ed esegue una cross-validation deterministica a cinque fold:
+una famiglia non compare mai sia nel fit sia nella sua valutazione. Il gate di
+promozione usa esclusivamente l'ECE out-of-fold; solo dopo il superamento viene
+eseguito il fit finale su tutto il corpus per produrre l'artefatto immutabile.
+Per CSV non raggruppati rimane disponibile il vecchio split 80/20. Il corpus
+riproducibile incluso si ferma sul numero di cicli K=5 realmente catturati:
+
+```bash
+python3 tools/capture_dspark_sts.py \
+  --capture /tmp/dspark-sts-heldout.csv \
+  --grouped-capture /tmp/dspark-sts-heldout-grouped.csv \
+  --target-samples 2500
+```
+
+Il profilo Q2 incluso e' stato promosso su `2.535` cicli lossless, `26` prompt e
+`16` famiglie. La ECE cumulativa media out-of-fold e' passata da `0,03867` a
+`0,03477` (`-10,1%`), con temperature
+`[0,98219, 0,98809, 0,67947, 0,99105, 0,75007]`. Questo risultato misura la
+calibrazione della confidence, non un guadagno t/s: il throughput va ancora
+validato end-to-end sul carico operativo.
 
 Con `DS4_TELEMETRY=1` il launcher abilita automaticamente lo shadow:
 
@@ -3237,8 +3339,10 @@ DS4_DSPARK_AUTOTUNE_SAMPLES=... campioni iniziali per K (default 8)
 DS4_DSPARK_PROBE_INTERVAL=...   cicli target tra due probe DSpark (default 64)
 DS4_DSPARK_EXACT_VERIFY=1       oracle sequenziale target, solo A/B qualità
 DS4_DSPARK_CONF_TEMPERATURE=... calibrazione logit confidence
-DS4_DSPARK_STS_TEMPERATURES=... cinque temperature iniziali, separate da virgole
-DS4_DSPARK_STS_DISABLE=1        disabilita l'adattamento STS online
+DS4_DSPARK_STS_PROFILE=...      profilo STS offline versionato e immutabile
+DS4_DSPARK_STS_CAPTURE=...      CSV held-out; forza K=5 nel solo run di raccolta
+DS4_DSPARK_STS_TEMPERATURES=... fallback online: cinque temperature iniziali
+DS4_DSPARK_STS_DISABLE=1        disabilita il vecchio adattamento online
 DS4_DSPARK_CONF_BIAS=...        bias della sigmoid confidence
 DS4_DSPARK_CONF_THRESHOLD=...   interrompe K quando confidence scende sotto soglia
 DS4_DSPARK_CAUSAL_MIN_K=...     minimo K dello scheduler stabile precedente (default 2)

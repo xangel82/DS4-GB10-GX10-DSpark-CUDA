@@ -58,6 +58,13 @@ int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, uint64_t dst_offset,
 int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
+/* Upload a stable device-pointer table for request-owned tensors. The table
+ * lets physical R=n kernels address independent allocations directly, without
+ * copying persistent KV caches into a temporary contiguous arena. */
+int ds4_gpu_tensor_pointer_table_write(
+        ds4_gpu_tensor             *table,
+        const ds4_gpu_tensor *const *tensors,
+        uint32_t                    count);
 
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
@@ -280,6 +287,48 @@ int ds4_gpu_indexer_scores_packed_tensor(
         uint32_t                ratio,
         float                   scale,
         uint32_t                causal);
+
+/* Request-major packed scorer for a physical R=n verifier batch. The small
+ * request_* arrays are host metadata from ds4_dspark_flatten_plan. The score
+ * scratch is reused request by request, while selected remains row-major in
+ * physical-batch order. Each request reads only its fixed-stride cache slice. */
+int ds4_gpu_indexer_packed_topk_rn_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *score_scratch,
+        const ds4_gpu_tensor *q_packed,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp_arena,
+        const uint32_t       *request_offset,
+        const uint32_t       *request_rows,
+        const uint32_t       *request_position,
+        const uint32_t       *request_n_comp,
+        uint32_t                request_count,
+        uint32_t                row_count,
+        uint32_t                comp_stride,
+        uint32_t                n_head,
+        uint32_t                ratio,
+        float                   scale,
+        uint32_t                top_k);
+
+/* Same request-major scorer for independently allocated session caches.
+ * index_comp_cache contains host-side tensor handles; only their device
+ * pointers are consumed by the queued CUDA work. */
+int ds4_gpu_indexer_packed_topk_rn_ptrs_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *score_scratch,
+        const ds4_gpu_tensor *q_packed,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *const *index_comp_cache,
+        const uint32_t       *request_offset,
+        const uint32_t       *request_rows,
+        const uint32_t       *request_position,
+        const uint32_t       *request_n_comp,
+        uint32_t                request_count,
+        uint32_t                row_count,
+        uint32_t                n_head,
+        uint32_t                ratio,
+        float                   scale,
+        uint32_t                top_k);
 
 int ds4_gpu_indexer_topk_tensor(
         ds4_gpu_tensor       *selected,
@@ -620,6 +669,24 @@ int ds4_gpu_rope_tail_tensor(
         float             beta_fast,
         float             beta_slow);
 
+/* RoPE for flattened independent sequences. positions contains one absolute
+ * position per physical row, so no request is forced to share pos0. */
+int ds4_gpu_rope_tail_positions_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *positions,
+        uint32_t                n_tok,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        bool                    inverse,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow);
+
 /* Release decode fused KV finalizer: after the standalone RoPE kernel, this
  * performs DS4's FP8 non-RoPE KV round trip and writes the F16-rounded raw
  * attention cache row in one dispatch. */
@@ -647,6 +714,29 @@ int ds4_gpu_store_raw_kv_batch_tensor(
         uint32_t                raw_cap,
         uint32_t                pos0,
         uint32_t                n_tokens,
+        uint32_t                head_dim);
+
+/* Store flattened rows into request-owned fixed-stride raw-ring slices. */
+int ds4_gpu_store_raw_kv_rn_tensor(
+        ds4_gpu_tensor       *raw_cache_arena,
+        const ds4_gpu_tensor *kv,
+        const ds4_gpu_tensor *row_request,
+        const ds4_gpu_tensor *row_position,
+        uint32_t                row_count,
+        uint32_t                request_count,
+        uint32_t                raw_cap,
+        uint32_t                raw_stride,
+        uint32_t                head_dim);
+
+/* Pointer-table form for independently allocated session rings. */
+int ds4_gpu_store_raw_kv_rn_ptrs_tensor(
+        const ds4_gpu_tensor *raw_cache_table,
+        const ds4_gpu_tensor *kv,
+        const ds4_gpu_tensor *row_request,
+        const ds4_gpu_tensor *row_position,
+        uint32_t                row_count,
+        uint32_t                request_count,
+        uint32_t                raw_cap,
         uint32_t                head_dim);
 
 /* Save/restore a short absolute-positioned slice of a circular KV ring.  The
@@ -693,6 +783,40 @@ int ds4_gpu_compressor_update_tensor(
         uint32_t                ratio,
         uint32_t                pos,
         uint32_t                comp_row,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   rms_eps);
+
+/* Advance independently allocated compressor frontiers from one flattened
+ * request-major row batch. No host synchronization occurs between requests.
+ * request_n_comp_after receives the exact append frontier after all rows. */
+int ds4_gpu_compressor_update_rn_tensor(
+        const ds4_gpu_tensor *kv,
+        const ds4_gpu_tensor *sc,
+        ds4_gpu_tensor *const *state_kv,
+        ds4_gpu_tensor *const *state_score,
+        ds4_gpu_tensor *const *comp_cache,
+        const uint32_t       *request_offset,
+        const uint32_t       *request_rows,
+        const uint32_t       *request_position,
+        const uint32_t       *request_n_comp,
+        uint32_t             *request_n_comp_after,
+        uint32_t                request_count,
+        uint32_t                row_count,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint64_t                norm_offset,
+        uint32_t                norm_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
         uint32_t                n_rot,
         uint32_t                n_ctx_orig,
         float                   freq_base,
@@ -904,6 +1028,67 @@ int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                raw_cap,
         uint32_t                raw_start,
         uint32_t                n_comp,
+        uint32_t                top_k,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
+/* Marker-aware indexed attention for a physical multi-session batch.
+ * Cache tensors are fixed-stride arenas; every row selects its request-owned
+ * slice through row_request. Positions and cache counters remain independent,
+ * so no row can attend across a request boundary. */
+int ds4_gpu_attention_indexed_mixed_rn_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_arena,
+        const ds4_gpu_tensor *comp_kv_arena,
+        uint32_t                comp_kv_f16,
+        const ds4_gpu_tensor *topk,
+        const ds4_gpu_tensor *row_request,
+        const ds4_gpu_tensor *row_position,
+        const ds4_gpu_tensor *request_position,
+        const ds4_gpu_tensor *request_rows,
+        const ds4_gpu_tensor *request_n_raw,
+        const ds4_gpu_tensor *request_raw_start,
+        const ds4_gpu_tensor *request_n_comp,
+        uint32_t                row_count,
+        uint32_t                request_count,
+        uint32_t                raw_cap,
+        uint32_t                raw_stride,
+        uint32_t                comp_stride,
+        uint32_t                top_k,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
+/* Same marker-aware arithmetic as the fixed-stride form, but cache_table
+ * contains device pointers to independently allocated session caches. */
+int ds4_gpu_attention_indexed_mixed_rn_ptrs_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_cache_table,
+        const ds4_gpu_tensor *comp_cache_table,
+        uint32_t                comp_kv_f16,
+        const ds4_gpu_tensor *topk,
+        const ds4_gpu_tensor *row_request,
+        const ds4_gpu_tensor *row_position,
+        const ds4_gpu_tensor *request_position,
+        const ds4_gpu_tensor *request_rows,
+        const ds4_gpu_tensor *request_n_raw,
+        const ds4_gpu_tensor *request_raw_start,
+        const ds4_gpu_tensor *request_n_comp,
+        uint32_t                row_count,
+        uint32_t                request_count,
+        uint32_t                raw_cap,
+        uint32_t                comp_cap,
         uint32_t                top_k,
         uint32_t                window,
         uint32_t                ratio,

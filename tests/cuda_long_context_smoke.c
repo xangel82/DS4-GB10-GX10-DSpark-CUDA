@@ -622,6 +622,464 @@ static int check_decode_attention_overflow_path(void) {
     return rc;
 }
 
+static int check_physical_rn_indexed_attention(void) {
+    enum {
+        REQUESTS = 2,
+        ROWS = 3,
+        N_HEAD = 2,
+        HEAD_DIM = 8,
+        RAW_CAP = 4,
+        RAW_STRIDE = 4,
+        COMP_STRIDE = 3,
+        TOP_K = 2,
+    };
+    const uint64_t q_count = (uint64_t)ROWS * N_HEAD * HEAD_DIM;
+    const uint64_t raw_count =
+        (uint64_t)REQUESTS * RAW_STRIDE * HEAD_DIM;
+    const uint64_t comp_count =
+        (uint64_t)REQUESTS * COMP_STRIDE * HEAD_DIM;
+    /* The CUDA backend maps model ranges read-only. Keep the synthetic
+     * model-map on its own page so it cannot cover D2H result buffers that
+     * happen to share this function's stack page. */
+    static float sinks_page[1024] __attribute__((aligned(4096)));
+    float *sinks = sinks_page;
+    sinks[0] = -0.25f;
+    sinks[1] = 0.125f;
+    float q_host[q_count];
+    float raw_host[raw_count];
+    float comp_host[comp_count];
+    float rn_host[q_count];
+    float ptr_host[q_count];
+    float ref_host[q_count];
+    const int32_t topk_host[ROWS * TOP_K] = {
+        0, 1,
+        2, 0,
+        1, 0,
+    };
+    const uint32_t row_request_host[ROWS] = {0, 0, 1};
+    const uint32_t row_position_host[ROWS] = {4, 5, 10};
+    const uint32_t request_position_host[REQUESTS] = {4, 10};
+    const uint32_t request_rows_host[REQUESTS] = {2, 1};
+    const uint32_t request_n_raw_host[REQUESTS] = {4, 3};
+    const uint32_t request_raw_start_host[REQUESTS] = {1, 0};
+    const uint32_t request_n_comp_host[REQUESTS] = {3, 2};
+    for (uint64_t i = 0; i < q_count; i++) {
+        q_host[i] = ((float)((i * 17u) % 29u) - 14.0f) / 19.0f;
+    }
+    for (uint64_t i = 0; i < raw_count; i++) {
+        raw_host[i] = ((float)((i * 11u) % 31u) - 15.0f) / 23.0f;
+    }
+    for (uint64_t i = 0; i < comp_count; i++) {
+        comp_host[i] = ((float)((i * 7u) % 37u) - 18.0f) / 29.0f;
+    }
+    memset(rn_host, 0, sizeof(rn_host));
+    memset(ref_host, 0, sizeof(ref_host));
+
+    ds4_gpu_tensor *heads_rn =
+        ds4_gpu_tensor_alloc(sizeof(rn_host));
+    ds4_gpu_tensor *heads_ref =
+        ds4_gpu_tensor_alloc(sizeof(ref_host));
+    ds4_gpu_tensor *heads_ptr =
+        ds4_gpu_tensor_alloc(sizeof(ptr_host));
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(sizeof(q_host));
+    ds4_gpu_tensor *raw = ds4_gpu_tensor_alloc(sizeof(raw_host));
+    ds4_gpu_tensor *comp = ds4_gpu_tensor_alloc(sizeof(comp_host));
+    ds4_gpu_tensor *topk = ds4_gpu_tensor_alloc(sizeof(topk_host));
+    ds4_gpu_tensor *row_request =
+        ds4_gpu_tensor_alloc(sizeof(row_request_host));
+    ds4_gpu_tensor *row_position =
+        ds4_gpu_tensor_alloc(sizeof(row_position_host));
+    ds4_gpu_tensor *request_position =
+        ds4_gpu_tensor_alloc(sizeof(request_position_host));
+    ds4_gpu_tensor *request_rows =
+        ds4_gpu_tensor_alloc(sizeof(request_rows_host));
+    ds4_gpu_tensor *request_n_raw =
+        ds4_gpu_tensor_alloc(sizeof(request_n_raw_host));
+    ds4_gpu_tensor *request_raw_start =
+        ds4_gpu_tensor_alloc(sizeof(request_raw_start_host));
+    ds4_gpu_tensor *request_n_comp =
+        ds4_gpu_tensor_alloc(sizeof(request_n_comp_host));
+    ds4_gpu_tensor *heads_ref0 = NULL;
+    ds4_gpu_tensor *heads_ref1 = NULL;
+    ds4_gpu_tensor *q0 = NULL;
+    ds4_gpu_tensor *q1 = NULL;
+    ds4_gpu_tensor *raw0 = NULL;
+    ds4_gpu_tensor *raw1 = NULL;
+    ds4_gpu_tensor *comp0 = NULL;
+    ds4_gpu_tensor *comp1 = NULL;
+    ds4_gpu_tensor *topk0 = NULL;
+    ds4_gpu_tensor *topk1 = NULL;
+    ds4_gpu_tensor *raw_ptr0 = NULL;
+    ds4_gpu_tensor *raw_ptr1 = NULL;
+    ds4_gpu_tensor *comp_ptr0 = NULL;
+    ds4_gpu_tensor *comp_ptr1 = NULL;
+    ds4_gpu_tensor *raw_table = NULL;
+    ds4_gpu_tensor *comp_table = NULL;
+    int rc = 1;
+    const uint64_t row_bytes =
+        (uint64_t)N_HEAD * HEAD_DIM * sizeof(float);
+    if (!heads_rn || !heads_ref || !heads_ptr ||
+        !q || !raw || !comp || !topk ||
+        !row_request || !row_position || !request_position ||
+        !request_rows || !request_n_raw || !request_raw_start ||
+        !request_n_comp ||
+        !ds4_gpu_tensor_write(q, 0, q_host, sizeof(q_host)) ||
+        !ds4_gpu_tensor_write(raw, 0, raw_host, sizeof(raw_host)) ||
+        !ds4_gpu_tensor_write(comp, 0, comp_host, sizeof(comp_host)) ||
+        !ds4_gpu_tensor_write(topk, 0, topk_host, sizeof(topk_host)) ||
+        !ds4_gpu_tensor_write(row_request, 0, row_request_host,
+                              sizeof(row_request_host)) ||
+        !ds4_gpu_tensor_write(row_position, 0, row_position_host,
+                              sizeof(row_position_host)) ||
+        !ds4_gpu_tensor_write(request_position, 0, request_position_host,
+                              sizeof(request_position_host)) ||
+        !ds4_gpu_tensor_write(request_rows, 0, request_rows_host,
+                              sizeof(request_rows_host)) ||
+        !ds4_gpu_tensor_write(request_n_raw, 0, request_n_raw_host,
+                              sizeof(request_n_raw_host)) ||
+        !ds4_gpu_tensor_write(request_raw_start, 0,
+                              request_raw_start_host,
+                              sizeof(request_raw_start_host)) ||
+        !ds4_gpu_tensor_write(request_n_comp, 0, request_n_comp_host,
+                              sizeof(request_n_comp_host))) {
+        goto cleanup;
+    }
+
+    heads_ref0 = ds4_gpu_tensor_view(heads_ref, 0, 2u * row_bytes);
+    heads_ref1 = ds4_gpu_tensor_view(heads_ref, 2u * row_bytes, row_bytes);
+    q0 = ds4_gpu_tensor_view(q, 0, 2u * row_bytes);
+    q1 = ds4_gpu_tensor_view(q, 2u * row_bytes, row_bytes);
+    raw0 = ds4_gpu_tensor_view(
+        raw, 0, (uint64_t)RAW_STRIDE * HEAD_DIM * sizeof(float));
+    raw1 = ds4_gpu_tensor_view(
+        raw,
+        (uint64_t)RAW_STRIDE * HEAD_DIM * sizeof(float),
+        (uint64_t)RAW_STRIDE * HEAD_DIM * sizeof(float));
+    comp0 = ds4_gpu_tensor_view(
+        comp, 0, (uint64_t)COMP_STRIDE * HEAD_DIM * sizeof(float));
+    comp1 = ds4_gpu_tensor_view(
+        comp,
+        (uint64_t)COMP_STRIDE * HEAD_DIM * sizeof(float),
+        (uint64_t)COMP_STRIDE * HEAD_DIM * sizeof(float));
+    topk0 = ds4_gpu_tensor_view(
+        topk, 0, 2u * TOP_K * sizeof(int32_t));
+    topk1 = ds4_gpu_tensor_view(
+        topk, 2u * TOP_K * sizeof(int32_t),
+        TOP_K * sizeof(int32_t));
+    raw_ptr0 = ds4_gpu_tensor_alloc(
+        (uint64_t)RAW_STRIDE * HEAD_DIM * sizeof(float));
+    raw_ptr1 = ds4_gpu_tensor_alloc(
+        (uint64_t)RAW_STRIDE * HEAD_DIM * sizeof(float));
+    comp_ptr0 = ds4_gpu_tensor_alloc(
+        (uint64_t)COMP_STRIDE * HEAD_DIM * sizeof(float));
+    comp_ptr1 = ds4_gpu_tensor_alloc(
+        (uint64_t)COMP_STRIDE * HEAD_DIM * sizeof(float));
+    raw_table = ds4_gpu_tensor_alloc(
+        REQUESTS * sizeof(void *));
+    comp_table = ds4_gpu_tensor_alloc(
+        REQUESTS * sizeof(void *));
+    const ds4_gpu_tensor *raw_ptrs[REQUESTS] = {
+        raw_ptr0, raw_ptr1
+    };
+    const ds4_gpu_tensor *comp_ptrs[REQUESTS] = {
+        comp_ptr0, comp_ptr1
+    };
+    if (!heads_ref0 || !heads_ref1 || !q0 || !q1 || !raw0 || !raw1 ||
+        !comp0 || !comp1 || !topk0 || !topk1 ||
+        !raw_ptr0 || !raw_ptr1 || !comp_ptr0 || !comp_ptr1 ||
+        !raw_table || !comp_table ||
+        !ds4_gpu_tensor_write(
+            raw_ptr0, 0, raw_host,
+            (uint64_t)RAW_STRIDE * HEAD_DIM * sizeof(float)) ||
+        !ds4_gpu_tensor_write(
+            raw_ptr1, 0,
+            raw_host + (uint64_t)RAW_STRIDE * HEAD_DIM,
+            (uint64_t)RAW_STRIDE * HEAD_DIM * sizeof(float)) ||
+        !ds4_gpu_tensor_write(
+            comp_ptr0, 0, comp_host,
+            (uint64_t)COMP_STRIDE * HEAD_DIM * sizeof(float)) ||
+        !ds4_gpu_tensor_write(
+            comp_ptr1, 0,
+            comp_host + (uint64_t)COMP_STRIDE * HEAD_DIM,
+            (uint64_t)COMP_STRIDE * HEAD_DIM * sizeof(float)) ||
+        !ds4_gpu_tensor_pointer_table_write(
+            raw_table, raw_ptrs, REQUESTS) ||
+        !ds4_gpu_tensor_pointer_table_write(
+            comp_table, comp_ptrs, REQUESTS) ||
+        !ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+            heads_ref0, sinks, N_HEAD * sizeof(float), 0,
+            q0, raw0, comp0, 0,
+            topk0, 2, 4, 4, RAW_CAP, 1, 3, TOP_K, 4, 2,
+            N_HEAD, HEAD_DIM) ||
+        !ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+            heads_ref1, sinks, N_HEAD * sizeof(float), 0,
+            q1, raw1, comp1, 0,
+            topk1, 1, 10, 3, RAW_CAP, 0, 2, TOP_K, 4, 2,
+            N_HEAD, HEAD_DIM) ||
+        !ds4_gpu_attention_indexed_mixed_rn_heads_tensor(
+            heads_rn, sinks, N_HEAD * sizeof(float), 0,
+            q, raw, comp, 0, topk,
+            row_request, row_position, request_position, request_rows,
+            request_n_raw, request_raw_start, request_n_comp,
+            ROWS, REQUESTS, RAW_CAP, RAW_STRIDE, COMP_STRIDE, TOP_K,
+            4, 2, N_HEAD, HEAD_DIM) ||
+        !ds4_gpu_attention_indexed_mixed_rn_ptrs_heads_tensor(
+            heads_ptr, sinks, N_HEAD * sizeof(float), 0, q,
+            raw_table, comp_table, 0, topk,
+            row_request, row_position, request_position, request_rows,
+            request_n_raw, request_raw_start, request_n_comp,
+            ROWS, REQUESTS, RAW_CAP, COMP_STRIDE, TOP_K,
+            4, 2, N_HEAD, HEAD_DIM) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(heads_ref, 0, ref_host, sizeof(ref_host)) ||
+        !ds4_gpu_tensor_read(heads_rn, 0, rn_host, sizeof(rn_host)) ||
+        !ds4_gpu_tensor_read(heads_ptr, 0, ptr_host, sizeof(ptr_host))) {
+        goto cleanup;
+    }
+    for (uint64_t i = 0; i < q_count; i++) {
+        if (fabsf(ref_host[i] - rn_host[i]) > 1.0e-6f ||
+            fabsf(ref_host[i] - ptr_host[i]) > 1.0e-6f) {
+            fprintf(stderr,
+                    "physical R=n attention mismatch at=%llu "
+                    "arena=%g ptr=%g ref=%g\n",
+                    (unsigned long long)i,
+                    (double)rn_host[i],
+                    (double)ptr_host[i],
+                    (double)ref_host[i]);
+            goto cleanup;
+        }
+    }
+    fprintf(stderr,
+            "cuda-regression: physical R=2 indexed attention matches "
+            "independent R=1 frontiers (arena + pointer table)\n");
+    rc = 0;
+
+cleanup:
+    ds4_gpu_tensor_free(comp_table);
+    ds4_gpu_tensor_free(raw_table);
+    ds4_gpu_tensor_free(comp_ptr1);
+    ds4_gpu_tensor_free(comp_ptr0);
+    ds4_gpu_tensor_free(raw_ptr1);
+    ds4_gpu_tensor_free(raw_ptr0);
+    ds4_gpu_tensor_free(topk1);
+    ds4_gpu_tensor_free(topk0);
+    ds4_gpu_tensor_free(comp1);
+    ds4_gpu_tensor_free(comp0);
+    ds4_gpu_tensor_free(raw1);
+    ds4_gpu_tensor_free(raw0);
+    ds4_gpu_tensor_free(q1);
+    ds4_gpu_tensor_free(q0);
+    ds4_gpu_tensor_free(heads_ref1);
+    ds4_gpu_tensor_free(heads_ref0);
+    ds4_gpu_tensor_free(request_n_comp);
+    ds4_gpu_tensor_free(request_raw_start);
+    ds4_gpu_tensor_free(request_n_raw);
+    ds4_gpu_tensor_free(request_rows);
+    ds4_gpu_tensor_free(request_position);
+    ds4_gpu_tensor_free(row_position);
+    ds4_gpu_tensor_free(row_request);
+    ds4_gpu_tensor_free(topk);
+    ds4_gpu_tensor_free(comp);
+    ds4_gpu_tensor_free(raw);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(heads_ref);
+    ds4_gpu_tensor_free(heads_ptr);
+    ds4_gpu_tensor_free(heads_rn);
+    return rc;
+}
+
+static int check_physical_rn_layout_primitives(void) {
+    enum {
+        REQUESTS = 2,
+        ROWS = 3,
+        N_HEAD = 2,
+        HEAD_DIM = 8,
+        N_ROT = 4,
+        RAW_CAP = 4,
+        RAW_STRIDE = 4,
+    };
+    const uint32_t row_request_host[ROWS] = {0, 0, 1};
+    const uint32_t row_position_host[ROWS] = {3, 4, 11};
+    const uint64_t rope_count =
+        (uint64_t)ROWS * N_HEAD * HEAD_DIM;
+    const uint64_t raw_count =
+        (uint64_t)REQUESTS * RAW_STRIDE * HEAD_DIM;
+    const uint64_t raw_slice_bytes =
+        (uint64_t)RAW_STRIDE * HEAD_DIM * sizeof(float);
+    float rope_input[rope_count];
+    float rope_rn_host[rope_count];
+    float rope_ref_host[rope_count];
+    float kv_host[(uint64_t)ROWS * HEAD_DIM];
+    float raw_rn_host[raw_count];
+    float raw_ptr_host[raw_count];
+    float raw_ref_host[raw_count];
+    for (uint64_t i = 0; i < rope_count; i++) {
+        rope_input[i] =
+            ((float)((i * 13u) % 41u) - 20.0f) / 17.0f;
+    }
+    for (uint64_t i = 0; i < (uint64_t)ROWS * HEAD_DIM; i++) {
+        kv_host[i] =
+            ((float)((i * 19u) % 43u) - 21.0f) / 23.0f;
+    }
+    memset(raw_rn_host, 0, sizeof(raw_rn_host));
+    memset(raw_ptr_host, 0, sizeof(raw_ptr_host));
+    memset(raw_ref_host, 0, sizeof(raw_ref_host));
+
+    ds4_gpu_tensor *rope_rn =
+        ds4_gpu_tensor_alloc(sizeof(rope_input));
+    ds4_gpu_tensor *rope_ref =
+        ds4_gpu_tensor_alloc(sizeof(rope_input));
+    ds4_gpu_tensor *positions =
+        ds4_gpu_tensor_alloc(sizeof(row_position_host));
+    ds4_gpu_tensor *row_request =
+        ds4_gpu_tensor_alloc(sizeof(row_request_host));
+    ds4_gpu_tensor *kv = ds4_gpu_tensor_alloc(sizeof(kv_host));
+    ds4_gpu_tensor *raw_rn =
+        ds4_gpu_tensor_alloc(sizeof(raw_rn_host));
+    ds4_gpu_tensor *raw_ref =
+        ds4_gpu_tensor_alloc(sizeof(raw_ref_host));
+    ds4_gpu_tensor *raw_ptr0 =
+        ds4_gpu_tensor_alloc(raw_slice_bytes);
+    ds4_gpu_tensor *raw_ptr1 =
+        ds4_gpu_tensor_alloc(raw_slice_bytes);
+    ds4_gpu_tensor *raw_table =
+        ds4_gpu_tensor_alloc(REQUESTS * sizeof(void *));
+    ds4_gpu_tensor *rope_ref0 = NULL;
+    ds4_gpu_tensor *rope_ref1 = NULL;
+    ds4_gpu_tensor *kv0 = NULL;
+    ds4_gpu_tensor *kv1 = NULL;
+    ds4_gpu_tensor *raw_ref0 = NULL;
+    ds4_gpu_tensor *raw_ref1 = NULL;
+    int rc = 1;
+    const uint64_t rope_row_bytes =
+        (uint64_t)N_HEAD * HEAD_DIM * sizeof(float);
+    const uint64_t kv_row_bytes =
+        (uint64_t)HEAD_DIM * sizeof(float);
+    const ds4_gpu_tensor *raw_ptrs[REQUESTS] = {
+        raw_ptr0, raw_ptr1
+    };
+    if (!rope_rn || !rope_ref || !positions || !row_request ||
+        !kv || !raw_rn || !raw_ref ||
+        !raw_ptr0 || !raw_ptr1 || !raw_table ||
+        !ds4_gpu_tensor_write(rope_rn, 0, rope_input,
+                              sizeof(rope_input)) ||
+        !ds4_gpu_tensor_write(rope_ref, 0, rope_input,
+                              sizeof(rope_input)) ||
+        !ds4_gpu_tensor_write(positions, 0, row_position_host,
+                              sizeof(row_position_host)) ||
+        !ds4_gpu_tensor_write(row_request, 0, row_request_host,
+                              sizeof(row_request_host)) ||
+        !ds4_gpu_tensor_write(kv, 0, kv_host, sizeof(kv_host)) ||
+        !ds4_gpu_tensor_write(raw_rn, 0, raw_rn_host,
+                              sizeof(raw_rn_host)) ||
+        !ds4_gpu_tensor_write(raw_ref, 0, raw_ref_host,
+                              sizeof(raw_ref_host)) ||
+        !ds4_gpu_tensor_write(raw_ptr0, 0, raw_ref_host,
+                              raw_slice_bytes) ||
+        !ds4_gpu_tensor_write(raw_ptr1, 0,
+                              raw_ref_host + RAW_STRIDE * HEAD_DIM,
+                              raw_slice_bytes) ||
+        !ds4_gpu_tensor_pointer_table_write(
+            raw_table, raw_ptrs, REQUESTS)) {
+        goto cleanup;
+    }
+    rope_ref0 = ds4_gpu_tensor_view(
+        rope_ref, 0, 2u * rope_row_bytes);
+    rope_ref1 = ds4_gpu_tensor_view(
+        rope_ref, 2u * rope_row_bytes, rope_row_bytes);
+    kv0 = ds4_gpu_tensor_view(kv, 0, 2u * kv_row_bytes);
+    kv1 = ds4_gpu_tensor_view(kv, 2u * kv_row_bytes, kv_row_bytes);
+    raw_ref0 = ds4_gpu_tensor_view(raw_ref, 0, raw_slice_bytes);
+    raw_ref1 = ds4_gpu_tensor_view(
+        raw_ref, raw_slice_bytes, raw_slice_bytes);
+    if (!rope_ref0 || !rope_ref1 || !kv0 || !kv1 ||
+        !raw_ref0 || !raw_ref1 ||
+        !ds4_gpu_rope_tail_tensor(
+            rope_ref0, 2, N_HEAD, HEAD_DIM, N_ROT, 3, 0, false,
+            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f) ||
+        !ds4_gpu_rope_tail_tensor(
+            rope_ref1, 1, N_HEAD, HEAD_DIM, N_ROT, 11, 0, false,
+            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f) ||
+        !ds4_gpu_rope_tail_positions_tensor(
+            rope_rn, positions, ROWS, N_HEAD, HEAD_DIM, N_ROT, 0,
+            false, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f) ||
+        !ds4_gpu_store_raw_kv_batch_tensor(
+            raw_ref0, kv0, RAW_CAP, 3, 2, HEAD_DIM) ||
+        !ds4_gpu_store_raw_kv_batch_tensor(
+            raw_ref1, kv1, RAW_CAP, 11, 1, HEAD_DIM) ||
+        !ds4_gpu_store_raw_kv_rn_tensor(
+            raw_rn, kv, row_request, positions, ROWS, REQUESTS,
+            RAW_CAP, RAW_STRIDE, HEAD_DIM) ||
+        !ds4_gpu_store_raw_kv_rn_ptrs_tensor(
+            raw_table, kv, row_request, positions, ROWS, REQUESTS,
+            RAW_CAP, HEAD_DIM) ||
+        !ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(
+            rope_rn, 0, rope_rn_host, sizeof(rope_rn_host)) ||
+        !ds4_gpu_tensor_read(
+            rope_ref, 0, rope_ref_host, sizeof(rope_ref_host)) ||
+        !ds4_gpu_tensor_read(
+            raw_rn, 0, raw_rn_host, sizeof(raw_rn_host)) ||
+        !ds4_gpu_tensor_read(
+            raw_ref, 0, raw_ref_host, sizeof(raw_ref_host))) {
+        goto cleanup;
+    }
+    if (!ds4_gpu_tensor_read(
+            raw_ptr0, 0, raw_ptr_host, raw_slice_bytes) ||
+        !ds4_gpu_tensor_read(
+            raw_ptr1, 0,
+            raw_ptr_host + RAW_STRIDE * HEAD_DIM,
+            raw_slice_bytes)) {
+        goto cleanup;
+    }
+    for (uint64_t i = 0; i < rope_count; i++) {
+        if (fabsf(rope_rn_host[i] - rope_ref_host[i]) > 1.0e-6f) {
+            fprintf(stderr,
+                    "physical R=n RoPE mismatch at=%llu got=%g ref=%g\n",
+                    (unsigned long long)i,
+                    (double)rope_rn_host[i],
+                    (double)rope_ref_host[i]);
+            goto cleanup;
+        }
+    }
+    for (uint64_t i = 0; i < raw_count; i++) {
+        if (raw_rn_host[i] != raw_ref_host[i] ||
+            raw_ptr_host[i] != raw_ref_host[i]) {
+            fprintf(stderr,
+                    "physical R=n raw store mismatch at=%llu "
+                    "arena=%g ptr=%g ref=%g\n",
+                    (unsigned long long)i,
+                    (double)raw_rn_host[i],
+                    (double)raw_ptr_host[i],
+                    (double)raw_ref_host[i]);
+            goto cleanup;
+        }
+    }
+    fprintf(stderr,
+            "cuda-regression: physical R=2 RoPE/raw-ring markers match "
+            "independent R=1 sequences (arena + pointer table)\n");
+    rc = 0;
+
+cleanup:
+    ds4_gpu_tensor_free(raw_table);
+    ds4_gpu_tensor_free(raw_ptr1);
+    ds4_gpu_tensor_free(raw_ptr0);
+    ds4_gpu_tensor_free(raw_ref1);
+    ds4_gpu_tensor_free(raw_ref0);
+    ds4_gpu_tensor_free(kv1);
+    ds4_gpu_tensor_free(kv0);
+    ds4_gpu_tensor_free(rope_ref1);
+    ds4_gpu_tensor_free(rope_ref0);
+    ds4_gpu_tensor_free(raw_ref);
+    ds4_gpu_tensor_free(raw_rn);
+    ds4_gpu_tensor_free(kv);
+    ds4_gpu_tensor_free(row_request);
+    ds4_gpu_tensor_free(positions);
+    ds4_gpu_tensor_free(rope_ref);
+    ds4_gpu_tensor_free(rope_rn);
+    return rc;
+}
+
 static float mxfp4_e2m1_value(uint32_t code) {
     static const float values[8] = {
         0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f
@@ -1125,6 +1583,422 @@ host_cleanup:
     return rc;
 }
 
+static int check_physical_rn_mxfp4_topk(void) {
+    enum {
+        REQUESTS = 2,
+        ROWS = 3,
+        N_HEAD = 4,
+        HEAD_DIM = 128,
+        COMP_STRIDE = 640,
+        TOP_K = 512,
+    };
+    const uint32_t request_offset[REQUESTS] = {0, 2};
+    const uint32_t request_rows[REQUESTS] = {2, 1};
+    const uint32_t request_position[REQUESTS] = {4096, 8192};
+    const uint32_t request_n_comp[REQUESTS] = {640, 576};
+    const uint64_t q_rows = (uint64_t)ROWS * N_HEAD;
+    const uint64_t q_count = q_rows * HEAD_DIM;
+    const uint64_t key_rows = (uint64_t)REQUESTS * COMP_STRIDE;
+    const uint64_t key_count = key_rows * HEAD_DIM;
+    const uint64_t packed_q_bytes =
+        q_rows * DS4_GPU_INDEXER_FP4_ROW_BYTES;
+    const uint64_t packed_key_bytes =
+        key_rows * DS4_GPU_INDEXER_FP4_ROW_BYTES;
+    const uint64_t selected_count = (uint64_t)ROWS * TOP_K;
+    const uint64_t max_score_count =
+        (uint64_t)request_rows[0] * request_n_comp[0];
+    float *q_host = (float *)malloc((size_t)q_count * sizeof(float));
+    float *key_host =
+        (float *)malloc((size_t)key_count * sizeof(float));
+    float weights_host[(uint64_t)ROWS * N_HEAD];
+    uint32_t selected_rn_host[selected_count];
+    uint32_t selected_ptr_host[selected_count];
+    uint32_t selected_ref_host[selected_count];
+    if (!q_host || !key_host) {
+        free(key_host);
+        free(q_host);
+        return 1;
+    }
+    for (uint64_t i = 0; i < q_count; i++) {
+        q_host[i] =
+            ((float)((i * 23u) % 101u) - 50.0f) / 37.0f;
+    }
+    for (uint64_t i = 0; i < key_count; i++) {
+        key_host[i] =
+            ((float)((i * 29u) % 113u) - 56.0f) / 41.0f;
+    }
+    for (uint64_t i = 0; i < (uint64_t)ROWS * N_HEAD; i++) {
+        weights_host[i] = 0.25f + (float)(i % N_HEAD) * 0.125f;
+    }
+    memset(selected_rn_host, 0xff, sizeof(selected_rn_host));
+    memset(selected_ptr_host, 0xff, sizeof(selected_ptr_host));
+    memset(selected_ref_host, 0xff, sizeof(selected_ref_host));
+
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(q_count * sizeof(float));
+    ds4_gpu_tensor *keys =
+        ds4_gpu_tensor_alloc(key_count * sizeof(float));
+    ds4_gpu_tensor *q_packed =
+        ds4_gpu_tensor_alloc(packed_q_bytes);
+    ds4_gpu_tensor *keys_packed =
+        ds4_gpu_tensor_alloc(packed_key_bytes);
+    ds4_gpu_tensor *weights =
+        ds4_gpu_tensor_alloc(sizeof(weights_host));
+    ds4_gpu_tensor *score_rn =
+        ds4_gpu_tensor_alloc(max_score_count * sizeof(float));
+    ds4_gpu_tensor *score_ref =
+        ds4_gpu_tensor_alloc(max_score_count * sizeof(float));
+    ds4_gpu_tensor *selected_rn =
+        ds4_gpu_tensor_alloc(selected_count * sizeof(uint32_t));
+    ds4_gpu_tensor *selected_ptr =
+        ds4_gpu_tensor_alloc(selected_count * sizeof(uint32_t));
+    ds4_gpu_tensor *selected_ref =
+        ds4_gpu_tensor_alloc(selected_count * sizeof(uint32_t));
+    ds4_gpu_tensor *key_ptr0 = NULL;
+    ds4_gpu_tensor *key_ptr1 = NULL;
+    int rc = 1;
+    if (!q || !keys || !q_packed || !keys_packed || !weights ||
+        !score_rn || !score_ref || !selected_rn || !selected_ptr ||
+        !selected_ref ||
+        !ds4_gpu_tensor_write(q, 0, q_host,
+                              q_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(keys, 0, key_host,
+                              key_count * sizeof(float)) ||
+        !ds4_gpu_tensor_write(weights, 0, weights_host,
+                              sizeof(weights_host)) ||
+        !ds4_gpu_dsv4_indexer_pack_tensor(
+            q_packed, q, (uint32_t)q_rows) ||
+        !ds4_gpu_dsv4_indexer_pack_tensor(
+            keys_packed, keys, (uint32_t)key_rows) ||
+        !ds4_gpu_indexer_packed_topk_rn_tensor(
+            selected_rn, score_rn, q_packed, weights, keys_packed,
+            request_offset, request_rows, request_position,
+            request_n_comp, REQUESTS, ROWS, COMP_STRIDE, N_HEAD, 4,
+            1.0f / sqrtf((float)(N_HEAD * HEAD_DIM)), TOP_K)) {
+        goto cleanup;
+    }
+    key_ptr0 = ds4_gpu_tensor_view(
+        keys_packed, 0,
+        (uint64_t)request_n_comp[0] *
+            DS4_GPU_INDEXER_FP4_ROW_BYTES);
+    key_ptr1 = ds4_gpu_tensor_view(
+        keys_packed,
+        (uint64_t)COMP_STRIDE * DS4_GPU_INDEXER_FP4_ROW_BYTES,
+        (uint64_t)request_n_comp[1] *
+            DS4_GPU_INDEXER_FP4_ROW_BYTES);
+    const ds4_gpu_tensor *key_ptrs[REQUESTS] = {
+        key_ptr0, key_ptr1
+    };
+    if (!key_ptr0 || !key_ptr1 ||
+        !ds4_gpu_indexer_packed_topk_rn_ptrs_tensor(
+            selected_ptr, score_rn, q_packed, weights, key_ptrs,
+            request_offset, request_rows, request_position,
+            request_n_comp, REQUESTS, ROWS, N_HEAD, 4,
+            1.0f / sqrtf((float)(N_HEAD * HEAD_DIM)), TOP_K)) {
+        goto cleanup;
+    }
+
+    for (uint32_t request = 0; request < REQUESTS; request++) {
+        const uint32_t offset = request_offset[request];
+        const uint32_t rows = request_rows[request];
+        const uint32_t n_comp = request_n_comp[request];
+        ds4_gpu_tensor *q_view = ds4_gpu_tensor_view(
+            q_packed,
+            (uint64_t)offset * N_HEAD *
+                DS4_GPU_INDEXER_FP4_ROW_BYTES,
+            (uint64_t)rows * N_HEAD *
+                DS4_GPU_INDEXER_FP4_ROW_BYTES);
+        ds4_gpu_tensor *weight_view = ds4_gpu_tensor_view(
+            weights,
+            (uint64_t)offset * N_HEAD * sizeof(float),
+            (uint64_t)rows * N_HEAD * sizeof(float));
+        ds4_gpu_tensor *key_view = ds4_gpu_tensor_view(
+            keys_packed,
+            (uint64_t)request * COMP_STRIDE *
+                DS4_GPU_INDEXER_FP4_ROW_BYTES,
+            (uint64_t)n_comp *
+                DS4_GPU_INDEXER_FP4_ROW_BYTES);
+        ds4_gpu_tensor *selected_view = ds4_gpu_tensor_view(
+            selected_ref,
+            (uint64_t)offset * TOP_K * sizeof(uint32_t),
+            (uint64_t)rows * TOP_K * sizeof(uint32_t));
+        const int ok =
+            q_view && weight_view && key_view && selected_view &&
+            ds4_gpu_indexer_scores_packed_tensor(
+                score_ref, q_view, weight_view, key_view, n_comp, rows,
+                request_position[request], N_HEAD, 4,
+                1.0f / sqrtf((float)(N_HEAD * HEAD_DIM)), 1) &&
+            ds4_gpu_indexer_topk_tensor(
+                selected_view, score_ref, n_comp, rows, TOP_K);
+        ds4_gpu_tensor_free(selected_view);
+        ds4_gpu_tensor_free(key_view);
+        ds4_gpu_tensor_free(weight_view);
+        ds4_gpu_tensor_free(q_view);
+        if (!ok) goto cleanup;
+    }
+    if (!ds4_gpu_synchronize() ||
+        !ds4_gpu_tensor_read(
+            selected_rn, 0, selected_rn_host,
+            sizeof(selected_rn_host)) ||
+        !ds4_gpu_tensor_read(
+            selected_ptr, 0, selected_ptr_host,
+            sizeof(selected_ptr_host)) ||
+        !ds4_gpu_tensor_read(
+            selected_ref, 0, selected_ref_host,
+            sizeof(selected_ref_host))) {
+        goto cleanup;
+    }
+    for (uint64_t i = 0; i < selected_count; i++) {
+        if (selected_rn_host[i] != selected_ref_host[i] ||
+            selected_ptr_host[i] != selected_ref_host[i]) {
+            fprintf(stderr,
+                    "physical R=n MXFP4 Top-K mismatch at=%llu "
+                    "arena=%u ptr=%u ref=%u\n",
+                    (unsigned long long)i,
+                    selected_rn_host[i],
+                    selected_ptr_host[i],
+                    selected_ref_host[i]);
+            goto cleanup;
+        }
+    }
+    fprintf(stderr,
+            "cuda-regression: physical R=2 MXFP4 score+exact Top-K "
+            "matches independent R=1 slices (arena + pointer handles)\n");
+    rc = 0;
+
+cleanup:
+    ds4_gpu_tensor_free(key_ptr1);
+    ds4_gpu_tensor_free(key_ptr0);
+    ds4_gpu_tensor_free(selected_ref);
+    ds4_gpu_tensor_free(selected_ptr);
+    ds4_gpu_tensor_free(selected_rn);
+    ds4_gpu_tensor_free(score_ref);
+    ds4_gpu_tensor_free(score_rn);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(keys_packed);
+    ds4_gpu_tensor_free(q_packed);
+    ds4_gpu_tensor_free(keys);
+    ds4_gpu_tensor_free(q);
+    free(key_host);
+    free(q_host);
+    return rc;
+}
+
+static int check_physical_rn_compressor_frontiers(void) {
+    enum {
+        REQUESTS = 2,
+        ROWS = 3,
+        HEAD_DIM = 8,
+        RATIO = 4,
+        WIDTH = 2 * HEAD_DIM,
+        STATE_ROWS = 2 * RATIO,
+        STATE_VALUES = STATE_ROWS * WIDTH,
+        COMP_CAP = 4,
+    };
+    const uint32_t request_offset[REQUESTS] = {0, 2};
+    const uint32_t request_rows[REQUESTS] = {2, 1};
+    const uint32_t request_position[REQUESTS] = {3, 7};
+    const uint32_t request_n_comp[REQUESTS] = {1, 2};
+    uint32_t request_n_comp_after[REQUESTS] = {0, 0};
+    float kv_host[(uint64_t)ROWS * WIDTH];
+    float sc_host[(uint64_t)ROWS * WIDTH];
+    float state_kv_init[STATE_VALUES];
+    float state_score_init[STATE_VALUES];
+    float comp_init[(uint64_t)COMP_CAP * HEAD_DIM];
+    for (uint64_t i = 0; i < (uint64_t)ROWS * WIDTH; i++) {
+        kv_host[i] =
+            ((float)((i * 17u) % 53u) - 26.0f) / 31.0f;
+        sc_host[i] =
+            ((float)((i * 13u) % 47u) - 23.0f) / 29.0f;
+    }
+    memset(state_kv_init, 0, sizeof(state_kv_init));
+    for (uint32_t i = 0; i < STATE_VALUES; i++) {
+        state_score_init[i] = -INFINITY;
+    }
+    memset(comp_init, 0, sizeof(comp_init));
+
+    static float model_page[1024] __attribute__((aligned(4096)));
+    memset(model_page, 0, sizeof(model_page));
+    const uint64_t ape_offset = 0;
+    const uint64_t norm_offset =
+        (uint64_t)WIDTH * RATIO * sizeof(float);
+    float *norm = (float *)((char *)model_page + norm_offset);
+    for (uint32_t i = 0; i < HEAD_DIM; i++) norm[i] = 1.0f;
+
+    ds4_gpu_tensor *kv =
+        ds4_gpu_tensor_alloc(sizeof(kv_host));
+    ds4_gpu_tensor *sc =
+        ds4_gpu_tensor_alloc(sizeof(sc_host));
+    ds4_gpu_tensor *state_kv_rn[REQUESTS] = {NULL, NULL};
+    ds4_gpu_tensor *state_sc_rn[REQUESTS] = {NULL, NULL};
+    ds4_gpu_tensor *comp_rn[REQUESTS] = {NULL, NULL};
+    ds4_gpu_tensor *state_kv_ref[REQUESTS] = {NULL, NULL};
+    ds4_gpu_tensor *state_sc_ref[REQUESTS] = {NULL, NULL};
+    ds4_gpu_tensor *comp_ref[REQUESTS] = {NULL, NULL};
+    int rc = 1;
+    for (uint32_t request = 0; request < REQUESTS; request++) {
+        state_kv_rn[request] =
+            ds4_gpu_tensor_alloc(sizeof(state_kv_init));
+        state_sc_rn[request] =
+            ds4_gpu_tensor_alloc(sizeof(state_score_init));
+        comp_rn[request] = ds4_gpu_tensor_alloc(sizeof(comp_init));
+        state_kv_ref[request] =
+            ds4_gpu_tensor_alloc(sizeof(state_kv_init));
+        state_sc_ref[request] =
+            ds4_gpu_tensor_alloc(sizeof(state_score_init));
+        comp_ref[request] = ds4_gpu_tensor_alloc(sizeof(comp_init));
+        if (!state_kv_rn[request] || !state_sc_rn[request] ||
+            !comp_rn[request] || !state_kv_ref[request] ||
+            !state_sc_ref[request] || !comp_ref[request] ||
+            !ds4_gpu_tensor_write(
+                state_kv_rn[request], 0, state_kv_init,
+                sizeof(state_kv_init)) ||
+            !ds4_gpu_tensor_write(
+                state_sc_rn[request], 0, state_score_init,
+                sizeof(state_score_init)) ||
+            !ds4_gpu_tensor_write(
+                comp_rn[request], 0, comp_init, sizeof(comp_init)) ||
+            !ds4_gpu_tensor_write(
+                state_kv_ref[request], 0, state_kv_init,
+                sizeof(state_kv_init)) ||
+            !ds4_gpu_tensor_write(
+                state_sc_ref[request], 0, state_score_init,
+                sizeof(state_score_init)) ||
+            !ds4_gpu_tensor_write(
+                comp_ref[request], 0, comp_init, sizeof(comp_init))) {
+            goto cleanup;
+        }
+    }
+    if (!kv || !sc ||
+        !ds4_gpu_tensor_write(kv, 0, kv_host, sizeof(kv_host)) ||
+        !ds4_gpu_tensor_write(sc, 0, sc_host, sizeof(sc_host)) ||
+        !ds4_gpu_compressor_update_rn_tensor(
+            kv, sc,
+            state_kv_rn, state_sc_rn, comp_rn,
+            request_offset, request_rows, request_position,
+            request_n_comp, request_n_comp_after,
+            REQUESTS, ROWS,
+            model_page, sizeof(model_page),
+            ape_offset, 0, norm_offset, 0,
+            HEAD_DIM, RATIO, 4, 0,
+            10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f,
+            1.0e-6f)) {
+        goto cleanup;
+    }
+
+    for (uint32_t request = 0; request < REQUESTS; request++) {
+        uint32_t comp_row = request_n_comp[request];
+        for (uint32_t row = 0; row < request_rows[request]; row++) {
+            const uint32_t physical = request_offset[request] + row;
+            ds4_gpu_tensor *kv_row = ds4_gpu_tensor_view(
+                kv, (uint64_t)physical * WIDTH * sizeof(float),
+                (uint64_t)WIDTH * sizeof(float));
+            ds4_gpu_tensor *sc_row = ds4_gpu_tensor_view(
+                sc, (uint64_t)physical * WIDTH * sizeof(float),
+                (uint64_t)WIDTH * sizeof(float));
+            const uint32_t pos = request_position[request] + row;
+            const int ok = kv_row && sc_row &&
+                ds4_gpu_compressor_update_tensor(
+                    kv_row, sc_row,
+                    state_kv_ref[request], state_sc_ref[request],
+                    comp_ref[request],
+                    model_page, sizeof(model_page),
+                    ape_offset, 0, norm_offset, 0,
+                    HEAD_DIM, RATIO, pos, comp_row, 4, 0,
+                    10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f,
+                    1.0e-6f);
+            ds4_gpu_tensor_free(sc_row);
+            ds4_gpu_tensor_free(kv_row);
+            if (!ok) goto cleanup;
+            if (((pos + 1u) % RATIO) == 0u) comp_row++;
+        }
+        if (request_n_comp_after[request] != comp_row) {
+            fprintf(stderr,
+                    "physical R=n compressor frontier mismatch "
+                    "request=%u got=%u ref=%u\n",
+                    request, request_n_comp_after[request], comp_row);
+            goto cleanup;
+        }
+    }
+    if (!ds4_gpu_synchronize()) goto cleanup;
+
+    for (uint32_t request = 0; request < REQUESTS; request++) {
+        float state_kv_rn_host[STATE_VALUES];
+        float state_sc_rn_host[STATE_VALUES];
+        float state_kv_ref_host[STATE_VALUES];
+        float state_sc_ref_host[STATE_VALUES];
+        float comp_rn_host[(uint64_t)COMP_CAP * HEAD_DIM];
+        float comp_ref_host[(uint64_t)COMP_CAP * HEAD_DIM];
+        if (!ds4_gpu_tensor_read(
+                state_kv_rn[request], 0, state_kv_rn_host,
+                sizeof(state_kv_rn_host)) ||
+            !ds4_gpu_tensor_read(
+                state_sc_rn[request], 0, state_sc_rn_host,
+                sizeof(state_sc_rn_host)) ||
+            !ds4_gpu_tensor_read(
+                state_kv_ref[request], 0, state_kv_ref_host,
+                sizeof(state_kv_ref_host)) ||
+            !ds4_gpu_tensor_read(
+                state_sc_ref[request], 0, state_sc_ref_host,
+                sizeof(state_sc_ref_host)) ||
+            !ds4_gpu_tensor_read(
+                comp_rn[request], 0, comp_rn_host,
+                sizeof(comp_rn_host)) ||
+            !ds4_gpu_tensor_read(
+                comp_ref[request], 0, comp_ref_host,
+                sizeof(comp_ref_host))) {
+            goto cleanup;
+        }
+        for (uint32_t i = 0; i < STATE_VALUES; i++) {
+            const bool kv_equal =
+                state_kv_rn_host[i] == state_kv_ref_host[i] ||
+                fabsf(state_kv_rn_host[i] -
+                      state_kv_ref_host[i]) <= 1.0e-6f;
+            const bool sc_equal =
+                state_sc_rn_host[i] == state_sc_ref_host[i] ||
+                (isinf(state_sc_rn_host[i]) &&
+                 isinf(state_sc_ref_host[i])) ||
+                fabsf(state_sc_rn_host[i] -
+                      state_sc_ref_host[i]) <= 1.0e-6f;
+            if (!kv_equal || !sc_equal) {
+                fprintf(stderr,
+                        "physical R=n compressor state mismatch "
+                        "request=%u at=%u\n",
+                        request, i);
+                goto cleanup;
+            }
+        }
+        for (uint32_t i = 0; i < COMP_CAP * HEAD_DIM; i++) {
+            if (comp_rn_host[i] != comp_ref_host[i] &&
+                fabsf(comp_rn_host[i] - comp_ref_host[i]) > 1.0e-6f) {
+                fprintf(stderr,
+                        "physical R=n compressor cache mismatch "
+                        "request=%u at=%u got=%g ref=%g\n",
+                        request, i,
+                        (double)comp_rn_host[i],
+                        (double)comp_ref_host[i]);
+                goto cleanup;
+            }
+        }
+    }
+    fprintf(stderr,
+            "cuda-regression: physical R=2 compressor frontiers match "
+            "independent R=1 sessions\n");
+    rc = 0;
+
+cleanup:
+    for (uint32_t request = 0; request < REQUESTS; request++) {
+        ds4_gpu_tensor_free(comp_ref[request]);
+        ds4_gpu_tensor_free(state_sc_ref[request]);
+        ds4_gpu_tensor_free(state_kv_ref[request]);
+        ds4_gpu_tensor_free(comp_rn[request]);
+        ds4_gpu_tensor_free(state_sc_rn[request]);
+        ds4_gpu_tensor_free(state_kv_rn[request]);
+    }
+    ds4_gpu_tensor_free(sc);
+    ds4_gpu_tensor_free(kv);
+    return rc;
+}
+
 int main(void) {
     if (!ds4_gpu_init()) return 1;
     ds4_gpu_nvtx_range_push("ds4/regression/nvtx-link", 0);
@@ -1162,6 +2036,26 @@ int main(void) {
     }
     if (check_decode_attention_overflow_path() != 0) {
         fprintf(stderr, "cuda-regression: FAILED decode attention overflow\n");
+        rc = 1;
+    }
+    if (check_physical_rn_indexed_attention() != 0) {
+        fprintf(stderr,
+                "cuda-regression: FAILED physical R=n indexed attention\n");
+        rc = 1;
+    }
+    if (check_physical_rn_layout_primitives() != 0) {
+        fprintf(stderr,
+                "cuda-regression: FAILED physical R=n layout primitives\n");
+        rc = 1;
+    }
+    if (check_physical_rn_mxfp4_topk() != 0) {
+        fprintf(stderr,
+                "cuda-regression: FAILED physical R=n MXFP4 Top-K\n");
+        rc = 1;
+    }
+    if (check_physical_rn_compressor_frontiers() != 0) {
+        fprintf(stderr,
+                "cuda-regression: FAILED physical R=n compressor\n");
         rc = 1;
     }
     ds4_gpu_cleanup();

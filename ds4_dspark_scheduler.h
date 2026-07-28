@@ -89,6 +89,23 @@ typedef struct {
     uint32_t row_count;
 } ds4_dspark_flatten_plan;
 
+/* Complete host-side input contract for one physical target microbatch.
+ * Rows are contiguous and unpadded. KV/RNG remain request-owned; rng_state is
+ * metadata for the executor and must never be shared across requests. */
+typedef struct {
+    ds4_dspark_flatten_plan layout;
+    int32_t row_token[DS4_DSPARK_SCHEDULER_MAX_ROWS];
+    uint64_t rng_state[DS4_DSPARK_SCHEDULER_MAX_REQUESTS];
+} ds4_dspark_physical_batch;
+
+typedef struct {
+    uint32_t committed_prefix[DS4_DSPARK_SCHEDULER_MAX_REQUESTS];
+    uint32_t emitted_tokens[DS4_DSPARK_SCHEDULER_MAX_REQUESTS];
+    uint32_t continuation_row[DS4_DSPARK_SCHEDULER_MAX_REQUESTS];
+    uint32_t request_count;
+    uint32_t emitted_total;
+} ds4_dspark_physical_result;
+
 /* Implements Algorithm 1 from the DSpark paper. sps[b] is the profiled
  * engine step rate for a physical target batch of b rows. */
 int ds4_dspark_hardware_schedule(
@@ -137,5 +154,22 @@ int ds4_dspark_schedule_flatten(
         const ds4_dspark_schedule_result *schedule,
         const ds4_dspark_schedule_item *items,
         ds4_dspark_flatten_plan *plan);
+
+int ds4_dspark_physical_batch_build(
+        const ds4_dspark_schedule_result *schedule,
+        const ds4_dspark_schedule_item *items,
+        const int32_t *pending_tokens,
+        const int32_t *draft_tokens,
+        uint32_t draft_stride,
+        const uint64_t *rng_state,
+        ds4_dspark_physical_batch *batch);
+
+/* Scatter verifier prefix lengths without crossing request boundaries.
+ * continuation_row identifies the final accepted physical row whose target
+ * logits/frontier belong to that request. */
+int ds4_dspark_physical_batch_scatter(
+        const ds4_dspark_physical_batch *batch,
+        const uint32_t *committed_prefix,
+        ds4_dspark_physical_result *result);
 
 #endif

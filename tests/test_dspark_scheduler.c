@@ -464,6 +464,77 @@ static void test_flattened_marker_layout(void) {
     require_true(ds4_dspark_schedule_flatten(
                      &schedule, items, &plan) != 0,
                  "flatten must reject duplicate request identities");
+
+    items[2].request_id = 7003;
+    items[2].request.max_prefix = 0;
+    require_true(ds4_dspark_schedule_flatten(
+                     &schedule, items, &plan) != 0,
+                 "flatten must reject a prefix not offered by its request");
+}
+
+static void test_physical_batch_build_and_scatter(void) {
+    ds4_dspark_schedule_result schedule;
+    memset(&schedule, 0, sizeof(schedule));
+    schedule.request_count = 3;
+    schedule.prefix[0] = 2;
+    schedule.prefix[1] = 0;
+    schedule.prefix[2] = 1;
+    schedule.batch_size = 6;
+    ds4_dspark_schedule_item items[3] = {
+        schedule_item(71, 0.9, 0.8),
+        schedule_item(72, 0.9, 0.8),
+        schedule_item(73, 0.9, 0.8),
+    };
+    items[0].position = 100;
+    items[1].position = 200;
+    items[2].position = 300;
+    const int32_t pending[] = {1000, 2000, 3000};
+    const int32_t drafts[3][DS4_DSPARK_SCHEDULER_MAX_PREFIX] = {
+        {1001, 1002, 1003, 1004, 1005},
+        {2001, 2002, 2003, 2004, 2005},
+        {3001, 3002, 3003, 3004, 3005},
+    };
+    const uint64_t rng[] = {111, 222, 333};
+    ds4_dspark_physical_batch batch;
+    require_true(ds4_dspark_physical_batch_build(
+                     &schedule,
+                     items,
+                     pending,
+                     &drafts[0][0],
+                     DS4_DSPARK_SCHEDULER_MAX_PREFIX,
+                     rng,
+                     &batch) == 0,
+                 "physical batch build failed");
+    const int32_t expected_tokens[] =
+        {1000, 1001, 1002, 2000, 3000, 3001};
+    for (uint32_t row = 0; row < batch.layout.row_count; row++) {
+        require_true(batch.row_token[row] == expected_tokens[row],
+                     "physical batch must be request-major and unpadded");
+    }
+    require_true(batch.rng_state[0] == 111 &&
+                 batch.rng_state[1] == 222 &&
+                 batch.rng_state[2] == 333,
+                 "physical batch must preserve per-request RNG");
+
+    const uint32_t committed[] = {1, 0, 1};
+    ds4_dspark_physical_result result;
+    require_true(ds4_dspark_physical_batch_scatter(
+                     &batch, committed, &result) == 0,
+                 "physical result scatter failed");
+    require_true(result.emitted_total == 5 &&
+                 result.emitted_tokens[0] == 2 &&
+                 result.emitted_tokens[1] == 1 &&
+                 result.emitted_tokens[2] == 2,
+                 "physical result emitted counts");
+    require_true(result.continuation_row[0] == 1 &&
+                 result.continuation_row[1] == 3 &&
+                 result.continuation_row[2] == 5,
+                 "physical result continuation rows");
+
+    const uint32_t invalid_committed[] = {3, 0, 1};
+    require_true(ds4_dspark_physical_batch_scatter(
+                     &batch, invalid_committed, &result) != 0,
+                 "physical result crossed a request prefix boundary");
 }
 
 int main(void) {
@@ -481,6 +552,7 @@ int main(void) {
     test_stateful_current_boundary_clamps_history();
     test_stateful_history_uses_exact_global_step();
     test_flattened_marker_layout();
+    test_physical_batch_build_and_scatter();
     puts("dspark hardware scheduler regression: OK");
     return 0;
 }

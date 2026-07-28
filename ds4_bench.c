@@ -600,6 +600,377 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
     }
 }
 
+static int run_physical_rn_smoke(
+        ds4_session *owner,
+        const ds4_tokens *prompt) {
+    if (!owner || !prompt || prompt->len < 515) return 1;
+    uint32_t request_count = 2;
+    const char *count_env = getenv("DS4_BENCH_PHYSICAL_RN_SMOKE");
+    if (count_env && count_env[0]) {
+        char *end = NULL;
+        const unsigned long parsed = strtoul(count_env, &end, 10);
+        if (end != count_env && *end == '\0' &&
+            parsed >= 2u && parsed <= 4u) {
+            request_count = (uint32_t)parsed;
+        }
+    }
+    const int prefix_len = prompt->len > 4099 ? 4096 : prompt->len - 3;
+    ds4_tokens prefix = {
+        .v = prompt->v,
+        .len = prefix_len,
+        .cap = prefix_len,
+    };
+    char err[256] = {0};
+    if (ds4_session_sync(owner, &prefix, err, sizeof(err)) != 0) {
+        fprintf(stderr,
+                "ds4-bench: physical R=%u owner prefill failed: %s\n",
+                request_count,
+                err);
+        return 1;
+    }
+
+    ds4_session *sessions[4] = {owner, NULL, NULL, NULL};
+    uint32_t allocated_sessions = 1;
+    int rc = 0;
+    for (uint32_t r = 1; r < request_count; r++) {
+        if (ds4_session_create_shared(&sessions[r], owner) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: physical R=%u lane %u allocation failed\n",
+                    request_count, r);
+            rc = 1;
+            break;
+        }
+        allocated_sessions++;
+        if (ds4_session_sync(
+                    sessions[r], &prefix, err, sizeof(err)) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: physical R=%u lane %u prefill failed: %s\n",
+                    request_count, r, err);
+            rc = 1;
+            break;
+        }
+    }
+
+    int tops[4][2] = {{0}};
+    int sequential_tops[4][2] = {{0}};
+    float *logits[4] = {0};
+    float *sequential_logits[4] = {0};
+    float *row_logits[4] = {0};
+    float *sequential_row_logits[4] = {0};
+    uint64_t draft_rng[4] = {
+        UINT64_C(0x1f123bb5a17d3c41),
+        UINT64_C(0x62db1a716f92e5d3),
+        UINT64_C(0x9e3779b97f4a7c15),
+        UINT64_C(0xd1b54a32d192ed03),
+    };
+    ds4_physical_draft_request draft_request[4];
+    ds4_tokens physical_tokens[4];
+    memset(draft_request, 0, sizeof(draft_request));
+    memset(physical_tokens, 0, sizeof(physical_tokens));
+    for (uint32_t r = 0; rc == 0 && r < request_count; r++) {
+        draft_request[r] = (ds4_physical_draft_request) {
+            .session = sessions[r],
+            .pending_token = prompt->v[prefix_len + (int)r],
+            .proposal_count = 2,
+            .temperature = 1.0f,
+            .min_p = 0.0f,
+            .rng = &draft_rng[r],
+        };
+    }
+    if (rc == 0 && request_count > 1) {
+        uint64_t rng_before[4] = {0};
+        for (uint32_t r = 0; r < request_count; r++) {
+            rng_before[r] = draft_rng[r];
+        }
+        const uint32_t last = request_count - 1u;
+        draft_request[last].proposal_count = 0;
+        const int invalid_rc = ds4_sessions_prepare_dspark_rn(
+            draft_request, request_count, err, sizeof(err));
+        draft_request[last].proposal_count = 2;
+        if (invalid_rc == 0) {
+            fprintf(stderr,
+                    "ds4-bench: physical R=%u invalid DSpark request "
+                    "was accepted\n",
+                    request_count);
+            rc = 1;
+        }
+        for (uint32_t r = 0; r < request_count; r++) {
+            if (draft_rng[r] != rng_before[r]) {
+                fprintf(stderr,
+                        "ds4-bench: physical R=%u DSpark validation "
+                        "advanced lane %u RNG\n",
+                        request_count, r);
+                rc = 1;
+            }
+        }
+    }
+    if (rc == 0 &&
+        ds4_sessions_prepare_dspark_rn(
+                draft_request, request_count, err, sizeof(err)) != 0) {
+        fprintf(stderr,
+                "ds4-bench: physical R=%u DSpark preparation failed: %s\n",
+                request_count, err);
+        rc = 1;
+    }
+    for (uint32_t r = 0; rc == 0 && r < request_count; r++) {
+        physical_tokens[r].len = prefix_len + 3;
+        physical_tokens[r].cap = physical_tokens[r].len;
+        physical_tokens[r].v = malloc(
+                (size_t)physical_tokens[r].len *
+                sizeof(physical_tokens[r].v[0]));
+        if (!physical_tokens[r].v) {
+            rc = 1;
+            continue;
+        }
+        memcpy(physical_tokens[r].v, prompt->v,
+               (size_t)prefix_len * sizeof(prompt->v[0]));
+        physical_tokens[r].v[prefix_len] =
+            draft_request[r].pending_token;
+        physical_tokens[r].v[prefix_len + 1] =
+            draft_request[r].draft_tokens[0];
+        physical_tokens[r].v[prefix_len + 2] =
+            draft_request[r].draft_tokens[1];
+    }
+    for (uint32_t r = 0; rc == 0 && r < request_count; r++) {
+        logits[r] = malloc((size_t)129280 * sizeof(float));
+        sequential_logits[r] =
+            malloc((size_t)129280 * sizeof(float));
+        row_logits[r] =
+            malloc((size_t)3 * 129280 * sizeof(float));
+        sequential_row_logits[r] =
+            malloc((size_t)3 * 129280 * sizeof(float));
+        if (!logits[r] || !sequential_logits[r] ||
+            !row_logits[r] || !sequential_row_logits[r]) {
+            rc = 1;
+        }
+    }
+    ds4_physical_verify_request request[4];
+    ds4_physical_verify_request sequential_request[4];
+    memset(request, 0, sizeof(request));
+    memset(sequential_request, 0, sizeof(sequential_request));
+    for (uint32_t r = 0; r < request_count; r++) {
+        request[r] = (ds4_physical_verify_request) {
+            .session = sessions[r],
+            .tokens = &physical_tokens[r],
+            .start = (uint32_t)prefix_len,
+            .rows = 3,
+            .capture_prefixes = 2,
+            .row_tops = tops[r],
+            .row_logits = row_logits[r],
+            .continuation_logits = logits[r],
+        };
+        sequential_request[r] = request[r];
+        sequential_request[r].row_tops = sequential_tops[r];
+        sequential_request[r].row_logits =
+            sequential_row_logits[r];
+        sequential_request[r].continuation_logits =
+            sequential_logits[r];
+    }
+
+    /* Warm both launch shapes before timing. Frontier restoration makes these
+     * calls observational and therefore repeatable. */
+    if (rc == 0) {
+        rc = ds4_sessions_verify_suffix_rn(
+                &sequential_request[0], 1, err, sizeof(err));
+    }
+    if (rc == 0) {
+        rc = ds4_sessions_verify_suffix_rn(
+                request, request_count, err, sizeof(err));
+    }
+    double sequential_seconds = 0.0;
+    double physical_seconds = 0.0;
+    const uint32_t timing_runs = 3;
+    for (uint32_t run = 0; rc == 0 && run < timing_runs; run++) {
+        const double sequential_t0 = bench_now_sec();
+        for (uint32_t r = 0; rc == 0 && r < request_count; r++) {
+            rc = ds4_sessions_verify_suffix_rn(
+                    &sequential_request[r], 1, err, sizeof(err));
+        }
+        sequential_seconds += bench_now_sec() - sequential_t0;
+
+        const double physical_t0 = bench_now_sec();
+        if (rc == 0) {
+            rc = ds4_sessions_verify_suffix_rn(
+                    request, request_count, err, sizeof(err));
+        }
+        physical_seconds += bench_now_sec() - physical_t0;
+    }
+    double squared = 0.0;
+    double reference = 0.0;
+    if (rc == 0) {
+        for (uint32_t r = 0; r < request_count; r++) {
+            for (uint32_t i = 0; i < 3u * 129280u; i++) {
+                const double delta =
+                    (double)row_logits[r][i] -
+                    (double)sequential_row_logits[r][i];
+                squared += delta * delta;
+                reference +=
+                    (double)sequential_row_logits[r][i] *
+                    (double)sequential_row_logits[r][i];
+            }
+        }
+    }
+    const double rel_rmse =
+        reference > 0.0 ? sqrt(squared / reference) : sqrt(squared);
+    bool parity = rc == 0 && isfinite(rel_rmse) &&
+                  rel_rmse <= 1.0e-5;
+    for (uint32_t r = 0; parity && r < request_count; r++) {
+        parity = tops[r][0] == sequential_tops[r][0] &&
+                 tops[r][1] == sequential_tops[r][1] &&
+                 memcmp(logits[r],
+                        row_logits[r] + (size_t)2 * 129280,
+                        (size_t)129280 * sizeof(float)) == 0;
+    }
+
+    ds4_physical_rejection_request sequential_rejection[4];
+    ds4_physical_rejection_request physical_rejection[4];
+    memset(sequential_rejection, 0, sizeof(sequential_rejection));
+    memset(physical_rejection, 0, sizeof(physical_rejection));
+    for (uint32_t r = 0; r < request_count; r++) {
+        sequential_rejection[r] = (ds4_physical_rejection_request) {
+            .accept_uniforms = draft_request[r].accept_uniforms,
+            .residual_uniforms = draft_request[r].residual_uniforms,
+            .temperature = 1.0f,
+            .min_p = 0.0f,
+        };
+        physical_rejection[r] = sequential_rejection[r];
+    }
+    for (uint32_t r = 0; parity && r < request_count; r++) {
+        ds4_physical_verify_txn *sequential_txn = NULL;
+        if (ds4_sessions_verify_suffix_rn_begin(
+                    &sequential_request[r], 1, &sequential_txn,
+                    err, sizeof(err)) != 0 ||
+            ds4_sessions_verify_suffix_rn_reject(
+                    sequential_txn, &sequential_rejection[r],
+                    err, sizeof(err)) != 0) {
+            parity = false;
+        }
+        if (sequential_txn &&
+            ds4_sessions_verify_suffix_rn_abort(
+                    sequential_txn, err, sizeof(err)) != 0) {
+            parity = false;
+        }
+    }
+    ds4_physical_verify_txn *rejection_txn = NULL;
+    if (parity &&
+        ds4_sessions_verify_suffix_rn_begin(
+                request, request_count, &rejection_txn,
+                err, sizeof(err)) != 0) {
+        parity = false;
+    }
+    if (parity &&
+        ds4_sessions_verify_suffix_rn_reject(
+                rejection_txn, physical_rejection,
+                err, sizeof(err)) != 0) {
+        parity = false;
+    }
+    for (uint32_t r = 0; parity && r < request_count; r++) {
+        parity =
+            physical_rejection[r].committed_drafts ==
+                sequential_rejection[r].committed_drafts &&
+            physical_rejection[r].correction_token ==
+                sequential_rejection[r].correction_token;
+    }
+    if (rejection_txn &&
+        ds4_sessions_verify_suffix_rn_abort(
+                rejection_txn, err, sizeof(err)) != 0) {
+        parity = false;
+    }
+
+    uint32_t keep_rows[4] = {1, 2, 3, 1};
+    ds4_physical_verify_txn *txn = NULL;
+    if (parity &&
+        ds4_sessions_verify_suffix_rn_begin(
+                request, request_count, &txn,
+                err, sizeof(err)) != 0) {
+        parity = false;
+    }
+    if (parity &&
+        ds4_sessions_verify_suffix_rn_finish(
+                txn, keep_rows, err, sizeof(err)) != 0) {
+        txn = NULL;
+        parity = false;
+    } else {
+        txn = NULL;
+    }
+    float *committed_logits =
+        parity ? malloc((size_t)129280 * sizeof(float)) : NULL;
+    if (parity && !committed_logits) parity = false;
+    for (uint32_t r = 0; parity && r < request_count; r++) {
+        const int expected_pos = prefix_len + (int)keep_rows[r];
+        const ds4_tokens *committed = ds4_session_tokens(sessions[r]);
+        parity = ds4_session_pos(sessions[r]) == expected_pos &&
+                 committed && committed->len == expected_pos;
+        for (uint32_t row = 0; parity && row < keep_rows[r]; row++) {
+            parity =
+                committed->v[prefix_len + (int)row] ==
+                physical_tokens[r].v[prefix_len + (int)row];
+        }
+        parity = parity &&
+            ds4_session_copy_logits(
+                    sessions[r], committed_logits, 129280) == 129280 &&
+            memcmp(committed_logits,
+                   row_logits[r] +
+                       (size_t)(keep_rows[r] - 1u) * 129280,
+                   (size_t)129280 * sizeof(float)) == 0;
+    }
+    free(committed_logits);
+    if (txn) {
+        (void)ds4_sessions_verify_suffix_rn_abort(
+                txn, NULL, 0);
+    }
+    if (!parity) {
+        fprintf(stderr,
+                "ds4-bench: physical R=%u parity failed "
+                "rel-rmse=%.8f error=%s\n",
+                request_count,
+                rel_rmse,
+                err);
+        rc = 1;
+    } else {
+        double private_mib = 0.0;
+        for (uint32_t r = 1; r < request_count; r++) {
+            private_mib +=
+                (double)ds4_session_private_device_bytes(sessions[r]) /
+                1048576.0;
+        }
+        fprintf(stderr,
+                "ds4-bench: physical R=%u verifier parity OK "
+                "tops=[%d %d] rel-rmse=%.8f "
+                "sequential=%.3fms physical=%.3fms speedup=%.3fx "
+                "aggregate_rows_per_s=%.2f lane-private-total=%.2f MiB\n",
+                request_count,
+                tops[0][0], tops[0][1],
+                rel_rmse,
+                sequential_seconds * 1000.0 / timing_runs,
+                physical_seconds * 1000.0 / timing_runs,
+                physical_seconds > 0.0
+                    ? sequential_seconds / physical_seconds : 0.0,
+                physical_seconds > 0.0
+                    ? (double)(request_count * 3u * timing_runs) /
+                      physical_seconds : 0.0,
+                private_mib);
+        fprintf(stderr,
+                "ds4-bench: physical R=%u transactional commit OK "
+                "(device p/q parity, independent keep_rows=1..%u, "
+                "no verifier replay)\n",
+                request_count,
+                request_count < 3u ? request_count : 3u);
+    }
+    for (uint32_t r = 0; r < request_count; r++) {
+        free(logits[r]);
+        free(sequential_logits[r]);
+        free(row_logits[r]);
+        free(sequential_row_logits[r]);
+        ds4_tokens_free(&physical_tokens[r]);
+    }
+    for (uint32_t r = 1; r < allocated_sessions; r++) {
+        ds4_session_free(sessions[r]);
+    }
+    ds4_session_rewind(owner, 0);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
 
@@ -666,6 +1037,13 @@ int main(int argc, char **argv) {
     if (cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR &&
         wait_distributed_route(session) != 0)
     {
+        ds4_session_free(session);
+        ds4_tokens_free(&prompt);
+        ds4_engine_close(engine);
+        return 1;
+    }
+    if (getenv("DS4_BENCH_PHYSICAL_RN_SMOKE") != NULL &&
+        run_physical_rn_smoke(session, &prompt) != 0) {
         ds4_session_free(session);
         ds4_tokens_free(&prompt);
         ds4_engine_close(engine);

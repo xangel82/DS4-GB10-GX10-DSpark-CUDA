@@ -35,6 +35,18 @@ DRAFT="${DS4_DSPARK_DRAFT:-5}"
 TELEMETRY="${DS4_TELEMETRY:-0}"
 SCHEDULER_SHADOW="${DS4_DSPARK_SCHEDULER_SHADOW:-$TELEMETRY}"
 SCHEDULER_DETERMINISTIC="${DS4_DSPARK_SCHEDULER_DETERMINISTIC:-0}"
+if [[ -n "${DS4_DSPARK_STS_PROFILE+x}" ]]; then
+  STS_PROFILE="$DS4_DSPARK_STS_PROFILE"
+else
+  STS_PROFILE_DEFAULT="$MODEL_DIR/dspark-sts-${DSPARK_VARIANT}.conf"
+  STS_PROFILE_REPO="$(cd "$(dirname "$0")" && pwd)/profiles/dspark-sts-${DSPARK_VARIANT}.conf"
+  STS_PROFILE=""
+  if [[ -f "$STS_PROFILE_DEFAULT" ]]; then
+    STS_PROFILE="$STS_PROFILE_DEFAULT"
+  elif [[ -f "$STS_PROFILE_REPO" ]]; then
+    STS_PROFILE="$STS_PROFILE_REPO"
+  fi
+fi
 STREAM_HEARTBEAT_SEC="${DS4_STREAM_HEARTBEAT_SEC:-140}"
 PREFILL_POLICY="${DS4_KV_PREFILL_CHECKPOINT_POLICY:-canonical-only}"
 MEMORY_PROFILE="${DS4_MEMORY_PROFILE:-balanced}"
@@ -288,6 +300,15 @@ if [[ "$SCHEDULER_DETERMINISTIC" == "1" ]]; then
 else
   unset DS4_DSPARK_SCHEDULER_DETERMINISTIC
 fi
+if [[ -n "$STS_PROFILE" ]]; then
+  if [[ ! -f "$STS_PROFILE" ]]; then
+    echo "DSpark STS profile not found: $STS_PROFILE" >&2
+    exit 2
+  fi
+  export DS4_DSPARK_STS_PROFILE="$STS_PROFILE"
+else
+  unset DS4_DSPARK_STS_PROFILE
+fi
 
 echo "Target: $MODEL"
 echo "DSpark: $DSPARK (selection=$DSPARK_SELECTION draft=$DRAFT)"
@@ -297,7 +318,8 @@ echo "Prefill: chunk=$PREFILL_CHUNK final-logits-only=${DS4_PREFILL_FINAL_LOGITS
 echo "Streaming: decode-heartbeat=${DS4_STREAM_HEARTBEAT_SEC}s"
 echo "KV:     policy=$DS4_KV_PREFILL_CHECKPOINT_POLICY keep-long-text-hits=$DS4_KV_KEEP_LONG_TEXT_HITS canonical-min-sec=$DS4_KV_CANONICAL_PREFILL_MIN_SEC cold-max=$KV_COLD_MAX_TOKENS long-anchor-min=$DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS trim=$DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS disk-mb=$KV_DISK_SPACE_MB"
 echo "Context guard: physical=$CTX advertise=${ADVERTISE_CONTEXT_PCT}%"
-echo "DSpark scheduler: hardware-aware Algorithm 1 + exact t-2 production capacity (policy R=n, CUDA executor R=1), full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY shadow=$SCHEDULER_SHADOW deterministic=$SCHEDULER_DETERMINISTIC"
+echo "DSpark scheduler: hardware-aware Algorithm 1 + exact t-2 production capacity (physical CUDA R<=3 ready, HTTP cohorting=off), full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY shadow=$SCHEDULER_SHADOW deterministic=$SCHEDULER_DETERMINISTIC"
+echo "DSpark STS: profile=${STS_PROFILE:-online-fallback} capture=${DS4_DSPARK_STS_CAPTURE:-disabled}"
 echo "DSpark parity: confidence-input=$CONFIDENCE_INPUT, verifier-topology-cache=$GRAPH_TOPOLOGY_CACHE"
 echo "DSpark sampling: lossless p/q rejection for top_k=0 top_p=1 min-p policy (rollback DS4_DSPARK_REJECTION_DISABLE=1)"
 echo "HybridLC: enabled=$HYBRID_LC shadow=$HYBRID_LC_SHADOW indexed-suffix=8-token transition-q=top8 BlockV=lossless max-draft=15 graph-rows=8/12/16 forced-width=${HYBRID_WIDTH:-auto}"

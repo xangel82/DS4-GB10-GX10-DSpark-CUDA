@@ -3221,6 +3221,27 @@ extern "C" int ds4_gpu_tensor_copy_async(ds4_gpu_tensor *dst, uint64_t dst_offse
                    "tensor copy async");
 }
 
+extern "C" int ds4_gpu_tensor_pointer_table_write(
+        ds4_gpu_tensor             *table,
+        const ds4_gpu_tensor *const *tensors,
+        uint32_t                    count) {
+    if (!table || !tensors || count == 0u ||
+        table->bytes < (uint64_t)count * sizeof(void *)) {
+        return 0;
+    }
+    void *pointers[256];
+    if (count > 256u) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (!tensors[i] || !tensors[i]->ptr) return 0;
+        pointers[i] = tensors[i]->ptr;
+    }
+    return cuda_ok(cudaMemcpy(table->ptr,
+                              pointers,
+                              (size_t)count * sizeof(pointers[0]),
+                              cudaMemcpyHostToDevice),
+                   "tensor pointer table write");
+}
+
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
 
@@ -6955,6 +6976,73 @@ __global__ static void rope_tail_kernel(
     tail[i + 1] = x0 * s + x1 * c;
 }
 
+__global__ static void rope_tail_positions_kernel(
+        float *x,
+        const uint32_t *positions,
+        uint32_t n_tok,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t n_rot,
+        uint32_t n_ctx_orig,
+        int inverse,
+        float freq_base,
+        float freq_scale,
+        float ext_factor,
+        float attn_factor,
+        float beta_fast,
+        float beta_slow) {
+    const uint32_t gid = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint32_t pairs_per_head = n_rot / 2u;
+    const uint32_t pairs = n_tok * n_head * pairs_per_head;
+    if (gid >= pairs) return;
+    const uint32_t pair = gid % pairs_per_head;
+    const uint32_t tmp = gid / pairs_per_head;
+    const uint32_t h = tmp % n_head;
+    const uint32_t t = tmp / n_head;
+    const uint32_t n_nope = head_dim - n_rot;
+    const uint32_t i = pair * 2u;
+
+    float corr0 = 0.0f;
+    float corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        const float denom = 2.0f * logf(freq_base);
+        corr0 = floorf((float)n_rot *
+                       logf((float)n_ctx_orig /
+                            (beta_fast * 2.0f * (float)M_PI)) /
+                       denom);
+        corr1 = ceilf((float)n_rot *
+                      logf((float)n_ctx_orig /
+                           (beta_slow * 2.0f * (float)M_PI)) /
+                      denom);
+        corr0 = fmaxf(0.0f, corr0);
+        corr1 = fminf((float)(n_rot - 1u), corr1);
+    }
+
+    const float theta_extrap =
+        (float)positions[t] *
+        powf(freq_base, -((float)i) / (float)n_rot);
+    const float theta_interp = freq_scale * theta_extrap;
+    float theta = theta_interp;
+    float mscale = attn_factor;
+    if (ext_factor != 0.0f) {
+        const float ramp_mix =
+            rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
+        theta = theta_interp * (1.0f - ramp_mix) +
+                theta_extrap * ramp_mix;
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+    const float c = cosf(theta) * mscale;
+    float s = sinf(theta) * mscale;
+    if (inverse) s = -s;
+
+    float *tail =
+        x + ((uint64_t)t * n_head + h) * head_dim + n_nope;
+    const float x0 = tail[i];
+    const float x1 = tail[i + 1u];
+    tail[i] = x0 * c - x1 * s;
+    tail[i + 1u] = x0 * s + x1 * c;
+}
+
 __device__ static float dsv4_e4m3fn_value_dev(int i) {
     int exp = (i >> 3) & 15;
     int mant = i & 7;
@@ -7120,6 +7208,38 @@ __global__ static void store_raw_kv_batch_kernel(float *raw, const float *kv, ui
     uint32_t t = gid / head_dim;
     uint32_t row = (pos0 + t) % raw_cap;
     raw[(uint64_t)row * head_dim + d] = __half2float(__float2half(kv[(uint64_t)t * head_dim + d]));
+}
+
+template <bool POINTER_TABLE>
+__global__ static void store_raw_kv_rn_kernel(
+        float *raw,
+        float *const *raw_ptrs,
+        const float *kv,
+        const uint32_t *row_request,
+        const uint32_t *row_position,
+        uint32_t row_count,
+        uint32_t request_count,
+        uint32_t raw_cap,
+        uint32_t raw_stride,
+        uint32_t head_dim) {
+    const uint64_t gid =
+        (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)row_count * head_dim;
+    if (gid >= n) return;
+    const uint32_t d = (uint32_t)(gid % head_dim);
+    const uint32_t row = (uint32_t)(gid / head_dim);
+    const uint32_t request = row_request[row];
+    if (request >= request_count) return;
+    const uint32_t ring_row = row_position[row] % raw_cap;
+    float *request_raw;
+    if constexpr (POINTER_TABLE) {
+        request_raw = raw_ptrs[request];
+    } else {
+        request_raw =
+            raw + (uint64_t)request * raw_stride * head_dim;
+    }
+    request_raw[(uint64_t)ring_row * head_dim + d] =
+        __half2float(__float2half(kv[gid]));
 }
 
 __global__ static void ring_rows_save_kernel(
@@ -8056,6 +8176,247 @@ __global__ static void attention_indexed_mixed_kernel(
                 acc += attention_comp_load<COMP_F16>(
                            comp_kv, (uint64_t)comp_rows[s] * head_dim + d) *
                        scores[raw_count + s];
+            }
+            oh[d] = acc / denom;
+        }
+    }
+}
+
+/* Physical R=n attention. Dense projections operate on the flattened row
+ * batch, while this kernel resolves each row back to its request-owned KV
+ * slice. The arithmetic below intentionally mirrors
+ * attention_indexed_mixed_kernel so the R=1 and R=n paths have the same
+ * softmax/reduction order. */
+template <bool COMP_F16, bool POINTER_TABLE>
+__global__ static void attention_indexed_mixed_rn_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv_arena,
+        const void *comp_kv_arena,
+        const float *const *raw_kv_ptrs,
+        const void *const *comp_kv_ptrs,
+        const int32_t *topk,
+        const uint32_t *row_request,
+        const uint32_t *row_position,
+        const uint32_t *request_position,
+        const uint32_t *request_rows,
+        const uint32_t *request_n_raw,
+        const uint32_t *request_raw_start,
+        const uint32_t *request_n_comp,
+        uint32_t row_count,
+        uint32_t request_count,
+        uint32_t raw_cap,
+        uint32_t raw_stride,
+        uint32_t comp_stride,
+        uint32_t top_k,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    if (t >= row_count || h >= n_head) return;
+    const uint32_t request = row_request[t];
+    if (request >= request_count) return;
+
+    const uint32_t qpos = row_position[t];
+    uint32_t n_raw = request_n_raw[request];
+    if (n_raw > raw_cap) n_raw = raw_cap;
+    uint32_t raw_start = request_raw_start[request];
+    if (raw_cap != 0u) raw_start %= raw_cap;
+    uint32_t n_comp = request_n_comp[request];
+    if (n_comp > comp_stride) n_comp = comp_stride;
+    const uint32_t rows = request_rows[request];
+    const uint32_t pos0 = request_position[request];
+    const uint32_t sequence_end = pos0 + rows;
+    const uint32_t first_raw_pos =
+        sequence_end >= n_raw ? sequence_end - n_raw : 0u;
+    uint32_t visible_comp = n_comp;
+    if (ratio != 0u) {
+        visible_comp = (qpos + 1u) / ratio;
+        if (visible_comp > n_comp) visible_comp = n_comp;
+    }
+
+    const float *raw_kv;
+    const void *comp_kv;
+    if constexpr (POINTER_TABLE) {
+        raw_kv = raw_kv_ptrs[request];
+        comp_kv = comp_kv_ptrs[request];
+    } else {
+        raw_kv =
+            raw_kv_arena + (uint64_t)request * raw_stride * head_dim;
+        const uint64_t comp_element_offset =
+            (uint64_t)request * comp_stride * head_dim;
+        comp_kv = COMP_F16
+            ? (const void *)((const half *)comp_kv_arena +
+                             comp_element_offset)
+            : (const void *)((const float *)comp_kv_arena +
+                             comp_element_offset);
+    }
+    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+
+    __shared__ float scores[768];
+    __shared__ uint32_t raw_rows[256];
+    __shared__ uint32_t comp_rows[512];
+    __shared__ float partial[256];
+    __shared__ float max_s;
+    __shared__ float denom;
+    __shared__ uint32_t raw_count;
+    __shared__ uint32_t raw_first_idx;
+    __shared__ uint32_t comp_count;
+    const float scale = rsqrtf((float)head_dim);
+    if (threadIdx.x == 0) {
+        raw_count = 0;
+        raw_first_idx = 0;
+        comp_count = 0;
+        if (n_raw != 0u) {
+            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+            if (qpos >= first_raw_pos) {
+                uint32_t lo = first_raw_pos;
+                if (window != 0u && qpos + 1u > window) {
+                    const uint32_t wlo = qpos + 1u - window;
+                    if (wlo > lo) lo = wlo;
+                }
+                const uint32_t hi =
+                    qpos < raw_last_pos ? qpos : raw_last_pos;
+                if (hi >= lo) {
+                    raw_first_idx = lo - first_raw_pos;
+                    raw_count = hi - lo + 1u;
+                    if (raw_count > 256u) raw_count = 256u;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
+        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+    }
+    for (uint32_t i = threadIdx.x; i < top_k; i += blockDim.x) {
+        const int32_t c = topk[(uint64_t)t * top_k + i];
+        if (c >= 0 && (uint32_t)c < visible_comp) {
+            const uint32_t slot = atomicAdd(&comp_count, 1u);
+            if (slot < 512u) comp_rows[slot] = (uint32_t)c;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && comp_count > 512u) comp_count = 512u;
+    __syncthreads();
+
+    const uint32_t n_score = raw_count + comp_count;
+    float local_max = sinks[h];
+    if (comp_count == 0u) {
+        for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
+            const float *kvrow =
+                raw_kv + (uint64_t)raw_rows[r] * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) {
+                dot += qh[d] * kvrow[d];
+            }
+            scores[r] = dot * scale;
+            local_max = fmaxf(local_max, scores[r]);
+        }
+    } else {
+        const uint32_t qlane = threadIdx.x & 7u;
+        const uint32_t qgroup = threadIdx.x >> 3u;
+        for (uint32_t row0 = 0; row0 < n_score; row0 += 32u) {
+            const uint32_t row = row0 + qgroup;
+            if (row < n_score) {
+                float dot = 0.0f;
+                const bool use_comp = row >= raw_count;
+                const float *raw_row = use_comp
+                    ? NULL
+                    : raw_kv + (uint64_t)raw_rows[row] * head_dim;
+                const uint64_t comp_off = use_comp
+                    ? (uint64_t)comp_rows[row - raw_count] * head_dim
+                    : 0u;
+                for (uint32_t d = qlane; d < head_dim; d += 8u) {
+                    const float kv = use_comp
+                        ? attention_comp_load<COMP_F16>(
+                              comp_kv, comp_off + d)
+                        : raw_row[d];
+                    dot += qh[d] * kv;
+                }
+                const uint32_t mask = 0xffu << (threadIdx.x & 24u);
+                for (uint32_t off = 4u; off > 0u; off >>= 1u) {
+                    dot += __shfl_down_sync(mask, dot, off, 8);
+                }
+                if (qlane == 0u) scores[row] = dot * scale;
+            }
+        }
+        __syncthreads();
+        for (uint32_t i = threadIdx.x; i < n_score; i += blockDim.x) {
+            local_max = fmaxf(local_max, scores[i]);
+        }
+    }
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] =
+                fmaxf(partial[threadIdx.x],
+                      partial[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) max_s = partial[0];
+    __syncthreads();
+    float den_local = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n_score; i += blockDim.x) {
+        scores[i] = expf(scores[i] - max_s);
+        den_local += scores[i];
+    }
+    partial[threadIdx.x] = den_local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        denom = partial[0] + expf(sinks[h] - max_s);
+    }
+    __syncthreads();
+
+    float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+    if (head_dim == 512u && blockDim.x == 256u) {
+        const uint32_t d0 = threadIdx.x;
+        const uint32_t d1 = d0 + 256u;
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        for (uint32_t r = 0; r < raw_count; r++) {
+            const float s = scores[r];
+            const float *kv =
+                raw_kv + (uint64_t)raw_rows[r] * head_dim;
+            acc0 += kv[d0] * s;
+            acc1 += kv[d1] * s;
+        }
+        for (uint32_t c = 0; c < comp_count; c++) {
+            const float s = scores[raw_count + c];
+            const uint64_t row_off =
+                (uint64_t)comp_rows[c] * head_dim;
+            acc0 += attention_comp_load<COMP_F16>(
+                        comp_kv, row_off + d0) * s;
+            acc1 += attention_comp_load<COMP_F16>(
+                        comp_kv, row_off + d1) * s;
+        }
+        oh[d0] = acc0 / denom;
+        oh[d1] = acc1 / denom;
+    } else {
+        for (uint32_t d = threadIdx.x; d < head_dim;
+             d += blockDim.x) {
+            float acc = 0.0f;
+            for (uint32_t r = 0; r < raw_count; r++) {
+                acc += raw_kv[
+                           (uint64_t)raw_rows[r] * head_dim + d] *
+                       scores[r];
+            }
+            for (uint32_t c = 0; c < comp_count; c++) {
+                acc += attention_comp_load<COMP_F16>(
+                           comp_kv,
+                           (uint64_t)comp_rows[c] * head_dim + d) *
+                       scores[raw_count + c];
             }
             oh[d] = acc / denom;
         }
@@ -14596,11 +14957,292 @@ extern "C" int ds4_gpu_indexer_scores_packed_tensor(
                        scale, causal ? 1 : 0, 0),
                    "indexer MXFP4 scores launch");
 }
+extern "C" int ds4_gpu_indexer_packed_topk_rn_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *score_scratch,
+        const ds4_gpu_tensor *q_packed,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *index_comp_arena,
+        const uint32_t       *request_offset,
+        const uint32_t       *request_rows,
+        const uint32_t       *request_position,
+        const uint32_t       *request_n_comp,
+        uint32_t                request_count,
+        uint32_t                row_count,
+        uint32_t                comp_stride,
+        uint32_t                n_head,
+        uint32_t                ratio,
+        float                   scale,
+        uint32_t                top_k) {
+    if (!selected || !score_scratch || !q_packed || !weights ||
+        !index_comp_arena || !request_offset || !request_rows ||
+        !request_position || !request_n_comp ||
+        request_count == 0u || row_count == 0u ||
+        comp_stride == 0u || n_head == 0u || ratio == 0u ||
+        top_k == 0u || top_k > comp_stride ||
+        q_packed->bytes <
+            (uint64_t)row_count * n_head *
+                DS4_INDEXER_FP4_ROW_BYTES ||
+        weights->bytes <
+            (uint64_t)row_count * n_head * sizeof(float) ||
+        index_comp_arena->bytes <
+            (uint64_t)request_count * comp_stride *
+                DS4_INDEXER_FP4_ROW_BYTES ||
+        selected->bytes <
+            (uint64_t)row_count * top_k * sizeof(uint32_t)) {
+        return 0;
+    }
+
+    uint32_t covered_rows = 0u;
+    uint64_t max_score_bytes = 0u;
+    for (uint32_t request = 0u; request < request_count; request++) {
+        const uint32_t offset = request_offset[request];
+        const uint32_t rows = request_rows[request];
+        const uint32_t n_comp = request_n_comp[request];
+        if (rows == 0u || offset != covered_rows ||
+            rows > row_count - offset ||
+            n_comp < top_k || n_comp > comp_stride ||
+            request_position[request] > UINT32_MAX - (rows - 1u)) {
+            return 0;
+        }
+        covered_rows += rows;
+        const uint64_t bytes =
+            (uint64_t)rows * n_comp * sizeof(float);
+        if (bytes > max_score_bytes) max_score_bytes = bytes;
+    }
+    if (covered_rows != row_count ||
+        score_scratch->bytes < max_score_bytes) {
+        return 0;
+    }
+
+    if (!cuda_ok(cudaMemsetAsync(selected->ptr, 0xff,
+                                 (size_t)((uint64_t)row_count *
+                                          top_k * sizeof(uint32_t))),
+                 "indexer physical R=n selected clear")) {
+        return 0;
+    }
+    for (uint32_t request = 0u; request < request_count; request++) {
+        const uint32_t offset = request_offset[request];
+        const uint32_t rows = request_rows[request];
+        const uint32_t n_comp = request_n_comp[request];
+        ds4_gpu_tensor q_view = {
+            (char *)q_packed->ptr +
+                (uint64_t)offset * n_head *
+                    DS4_INDEXER_FP4_ROW_BYTES,
+            (uint64_t)rows * n_head *
+                DS4_INDEXER_FP4_ROW_BYTES,
+            0,
+        };
+        ds4_gpu_tensor weight_view = {
+            (char *)weights->ptr +
+                (uint64_t)offset * n_head * sizeof(float),
+            (uint64_t)rows * n_head * sizeof(float),
+            0,
+        };
+        ds4_gpu_tensor key_view = {
+            (char *)index_comp_arena->ptr +
+                (uint64_t)request * comp_stride *
+                    DS4_INDEXER_FP4_ROW_BYTES,
+            (uint64_t)n_comp * DS4_INDEXER_FP4_ROW_BYTES,
+            0,
+        };
+        ds4_gpu_tensor score_view = {
+            score_scratch->ptr,
+            (uint64_t)rows * n_comp * sizeof(float),
+            0,
+        };
+        ds4_gpu_tensor selected_view = {
+            (char *)selected->ptr +
+                (uint64_t)offset * top_k * sizeof(uint32_t),
+            (uint64_t)rows * top_k * sizeof(uint32_t),
+            0,
+        };
+        if (!ds4_gpu_indexer_scores_packed_tensor(
+                    &score_view,
+                    &q_view,
+                    &weight_view,
+                    &key_view,
+                    n_comp,
+                    rows,
+                    request_position[request],
+                    n_head,
+                    ratio,
+                    scale,
+                    1u) ||
+            !ds4_gpu_indexer_topk_tensor(
+                    &selected_view,
+                    &score_view,
+                    n_comp,
+                    rows,
+                    top_k)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_indexer_packed_topk_rn_ptrs_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *score_scratch,
+        const ds4_gpu_tensor *q_packed,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *const *index_comp_cache,
+        const uint32_t       *request_offset,
+        const uint32_t       *request_rows,
+        const uint32_t       *request_position,
+        const uint32_t       *request_n_comp,
+        uint32_t                request_count,
+        uint32_t                row_count,
+        uint32_t                n_head,
+        uint32_t                ratio,
+        float                   scale,
+        uint32_t                top_k) {
+    if (!selected || !score_scratch || !q_packed || !weights ||
+        !index_comp_cache || !request_offset || !request_rows ||
+        !request_position || !request_n_comp ||
+        request_count == 0u || row_count == 0u ||
+        n_head == 0u || ratio == 0u || top_k == 0u ||
+        q_packed->bytes <
+            (uint64_t)row_count * n_head *
+                DS4_INDEXER_FP4_ROW_BYTES ||
+        weights->bytes <
+            (uint64_t)row_count * n_head * sizeof(float) ||
+        selected->bytes <
+            (uint64_t)row_count * top_k * sizeof(uint32_t)) {
+        return 0;
+    }
+
+    uint32_t covered_rows = 0u;
+    uint64_t max_score_bytes = 0u;
+    for (uint32_t request = 0u; request < request_count; request++) {
+        const uint32_t offset = request_offset[request];
+        const uint32_t rows = request_rows[request];
+        const uint32_t n_comp = request_n_comp[request];
+        if (!index_comp_cache[request] || rows == 0u ||
+            offset != covered_rows || rows > row_count - offset ||
+            n_comp < top_k ||
+            request_position[request] > UINT32_MAX - (rows - 1u) ||
+            index_comp_cache[request]->bytes <
+                (uint64_t)n_comp * DS4_INDEXER_FP4_ROW_BYTES) {
+            return 0;
+        }
+        covered_rows += rows;
+        const uint64_t bytes =
+            (uint64_t)rows * n_comp * sizeof(float);
+        if (bytes > max_score_bytes) max_score_bytes = bytes;
+    }
+    if (covered_rows != row_count ||
+        score_scratch->bytes < max_score_bytes) {
+        return 0;
+    }
+
+    if (!cuda_ok(cudaMemsetAsync(selected->ptr, 0xff,
+                                 (size_t)((uint64_t)row_count *
+                                          top_k * sizeof(uint32_t))),
+                 "indexer physical R=n pointer selected clear")) {
+        return 0;
+    }
+    for (uint32_t request = 0u; request < request_count; request++) {
+        const uint32_t offset = request_offset[request];
+        const uint32_t rows = request_rows[request];
+        const uint32_t n_comp = request_n_comp[request];
+        ds4_gpu_tensor q_view = {
+            (char *)q_packed->ptr +
+                (uint64_t)offset * n_head *
+                    DS4_INDEXER_FP4_ROW_BYTES,
+            (uint64_t)rows * n_head *
+                DS4_INDEXER_FP4_ROW_BYTES,
+            0,
+        };
+        ds4_gpu_tensor weight_view = {
+            (char *)weights->ptr +
+                (uint64_t)offset * n_head * sizeof(float),
+            (uint64_t)rows * n_head * sizeof(float),
+            0,
+        };
+        ds4_gpu_tensor score_view = {
+            score_scratch->ptr,
+            (uint64_t)rows * n_comp * sizeof(float),
+            0,
+        };
+        ds4_gpu_tensor selected_view = {
+            (char *)selected->ptr +
+                (uint64_t)offset * top_k * sizeof(uint32_t),
+            (uint64_t)rows * top_k * sizeof(uint32_t),
+            0,
+        };
+        if (!ds4_gpu_indexer_scores_packed_tensor(
+                    &score_view,
+                    &q_view,
+                    &weight_view,
+                    index_comp_cache[request],
+                    n_comp,
+                    rows,
+                    request_position[request],
+                    n_head,
+                    ratio,
+                    scale,
+                    1u) ||
+            !ds4_gpu_indexer_topk_tensor(
+                    &selected_view,
+                    &score_view,
+                    n_comp,
+                    rows,
+                    top_k)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
     if (!x || n_rot > head_dim || (n_rot & 1) || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
     uint32_t pairs = n_tok * n_head * (n_rot / 2);
     rope_tail_kernel<<<(pairs + 255) / 256, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, 1, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
     return cuda_ok(cudaGetLastError(), "rope_tail launch");
+}
+extern "C" int ds4_gpu_rope_tail_positions_tensor(
+        ds4_gpu_tensor       *x,
+        const ds4_gpu_tensor *positions,
+        uint32_t                n_tok,
+        uint32_t                n_head,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        bool                    inverse,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow) {
+    const uint64_t values = (uint64_t)n_tok * n_head * head_dim;
+    if (!x || !positions || n_tok == 0u || n_head == 0u ||
+        head_dim == 0u || n_rot == 0u || n_rot > head_dim ||
+        (n_rot & 1u) != 0u ||
+        x->bytes < values * sizeof(float) ||
+        positions->bytes < (uint64_t)n_tok * sizeof(uint32_t)) {
+        return 0;
+    }
+    const uint64_t pairs =
+        (uint64_t)n_tok * n_head * (n_rot / 2u);
+    rope_tail_positions_kernel<<<(pairs + 255u) / 256u, 256>>>(
+            (float *)x->ptr,
+            (const uint32_t *)positions->ptr,
+            n_tok,
+            n_head,
+            head_dim,
+            n_rot,
+            n_ctx_orig,
+            inverse ? 1 : 0,
+            freq_base,
+            freq_scale,
+            ext_factor,
+            attn_factor,
+            beta_fast,
+            beta_slow);
+    return cuda_ok(cudaGetLastError(),
+                   "rope tail physical R=n launch");
 }
 extern "C" int ds4_gpu_store_raw_kv_tensor(ds4_gpu_tensor *raw_cache, const ds4_gpu_tensor *kv, uint32_t raw_cap, uint32_t row, uint32_t head_dim);
 extern "C" int ds4_gpu_kv_fp8_store_raw_tensor(
@@ -14627,6 +15269,82 @@ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache, cons
     uint64_t n = (uint64_t)n_tokens * head_dim;
     store_raw_kv_batch_kernel<<<(n + 255) / 256, 256>>>((float *)raw_cache->ptr, (const float *)kv->ptr, raw_cap, pos0, n_tokens, head_dim);
     return cuda_ok(cudaGetLastError(), "store_raw_kv_batch launch");
+}
+extern "C" int ds4_gpu_store_raw_kv_rn_tensor(
+        ds4_gpu_tensor       *raw_cache_arena,
+        const ds4_gpu_tensor *kv,
+        const ds4_gpu_tensor *row_request,
+        const ds4_gpu_tensor *row_position,
+        uint32_t                row_count,
+        uint32_t                request_count,
+        uint32_t                raw_cap,
+        uint32_t                raw_stride,
+        uint32_t                head_dim) {
+    const uint64_t row_bytes =
+        (uint64_t)row_count * sizeof(uint32_t);
+    const uint64_t kv_values = (uint64_t)row_count * head_dim;
+    const uint64_t raw_values =
+        (uint64_t)request_count * raw_stride * head_dim;
+    if (!raw_cache_arena || !kv || !row_request || !row_position ||
+        row_count == 0u || request_count == 0u || raw_cap == 0u ||
+        raw_stride < raw_cap || head_dim == 0u ||
+        raw_cache_arena->bytes < raw_values * sizeof(float) ||
+        kv->bytes < kv_values * sizeof(float) ||
+        row_request->bytes < row_bytes ||
+        row_position->bytes < row_bytes) {
+        return 0;
+    }
+    store_raw_kv_rn_kernel<false><<<(kv_values + 255u) / 256u, 256>>>(
+            (float *)raw_cache_arena->ptr,
+            nullptr,
+            (const float *)kv->ptr,
+            (const uint32_t *)row_request->ptr,
+            (const uint32_t *)row_position->ptr,
+            row_count,
+            request_count,
+            raw_cap,
+            raw_stride,
+            head_dim);
+    return cuda_ok(cudaGetLastError(),
+                   "store raw KV physical R=n launch");
+}
+
+extern "C" int ds4_gpu_store_raw_kv_rn_ptrs_tensor(
+        const ds4_gpu_tensor *raw_cache_table,
+        const ds4_gpu_tensor *kv,
+        const ds4_gpu_tensor *row_request,
+        const ds4_gpu_tensor *row_position,
+        uint32_t                row_count,
+        uint32_t                request_count,
+        uint32_t                raw_cap,
+        uint32_t                head_dim) {
+    const uint64_t row_bytes =
+        (uint64_t)row_count * sizeof(uint32_t);
+    const uint64_t kv_values = (uint64_t)row_count * head_dim;
+    if (!raw_cache_table || !kv || !row_request || !row_position ||
+        row_count == 0u || request_count == 0u || raw_cap == 0u ||
+        head_dim == 0u ||
+        raw_cache_table->bytes <
+            (uint64_t)request_count * sizeof(void *) ||
+        kv->bytes < kv_values * sizeof(float) ||
+        row_request->bytes < row_bytes ||
+        row_position->bytes < row_bytes) {
+        return 0;
+    }
+    store_raw_kv_rn_kernel<true>
+        <<<(kv_values + 255u) / 256u, 256>>>(
+            nullptr,
+            (float *const *)raw_cache_table->ptr,
+            (const float *)kv->ptr,
+            (const uint32_t *)row_request->ptr,
+            (const uint32_t *)row_position->ptr,
+            row_count,
+            request_count,
+            raw_cap,
+            raw_cap,
+            head_dim);
+    return cuda_ok(cudaGetLastError(),
+                   "store raw KV physical R=n pointer launch");
 }
 
 extern "C" int ds4_gpu_ring_rows_save_tensor(
@@ -14828,6 +15546,120 @@ extern "C" int ds4_gpu_compressor_update_tensor(
     }
     return ok;
 }
+
+extern "C" int ds4_gpu_compressor_update_rn_tensor(
+        const ds4_gpu_tensor *kv,
+        const ds4_gpu_tensor *sc,
+        ds4_gpu_tensor *const *state_kv,
+        ds4_gpu_tensor *const *state_score,
+        ds4_gpu_tensor *const *comp_cache,
+        const uint32_t       *request_offset,
+        const uint32_t       *request_rows,
+        const uint32_t       *request_position,
+        const uint32_t       *request_n_comp,
+        uint32_t             *request_n_comp_after,
+        uint32_t                request_count,
+        uint32_t                row_count,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint64_t                norm_offset,
+        uint32_t                norm_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   rms_eps) {
+    if (!kv || !sc || !state_kv || !state_score || !comp_cache ||
+        !request_offset || !request_rows || !request_position ||
+        !request_n_comp || !request_n_comp_after ||
+        !model_map || request_count == 0u || row_count == 0u ||
+        head_dim == 0u || ratio == 0u) {
+        return 0;
+    }
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t width = coff * head_dim;
+    const uint64_t row_bytes = (uint64_t)width * sizeof(float);
+    if (kv->bytes < (uint64_t)row_count * row_bytes ||
+        sc->bytes < (uint64_t)row_count * row_bytes) {
+        return 0;
+    }
+
+    uint32_t covered_rows = 0u;
+    for (uint32_t request = 0u; request < request_count; request++) {
+        const uint32_t offset = request_offset[request];
+        const uint32_t rows = request_rows[request];
+        const uint32_t pos0 = request_position[request];
+        if (!state_kv[request] || !state_score[request] ||
+            !comp_cache[request] || rows == 0u ||
+            offset != covered_rows || rows > row_count - offset ||
+            pos0 > UINT32_MAX - (rows - 1u)) {
+            return 0;
+        }
+        covered_rows += rows;
+    }
+    if (covered_rows != row_count) return 0;
+
+    for (uint32_t request = 0u; request < request_count; request++) {
+        uint32_t comp_row = request_n_comp[request];
+        const uint32_t offset = request_offset[request];
+        const uint32_t rows = request_rows[request];
+        const uint32_t pos0 = request_position[request];
+        for (uint32_t row = 0u; row < rows; row++) {
+            ds4_gpu_tensor kv_view = {
+                (char *)kv->ptr +
+                    (uint64_t)(offset + row) * row_bytes,
+                row_bytes,
+                0,
+            };
+            ds4_gpu_tensor sc_view = {
+                (char *)sc->ptr +
+                    (uint64_t)(offset + row) * row_bytes,
+                row_bytes,
+                0,
+            };
+            const uint32_t pos = pos0 + row;
+            if (!ds4_gpu_compressor_update_tensor(
+                        &kv_view,
+                        &sc_view,
+                        state_kv[request],
+                        state_score[request],
+                        comp_cache[request],
+                        model_map,
+                        model_size,
+                        ape_offset,
+                        ape_type,
+                        norm_offset,
+                        norm_type,
+                        head_dim,
+                        ratio,
+                        pos,
+                        comp_row,
+                        n_rot,
+                        n_ctx_orig,
+                        freq_base,
+                        freq_scale,
+                        ext_factor,
+                        attn_factor,
+                        beta_fast,
+                        beta_slow,
+                        rms_eps)) {
+                return 0;
+            }
+            if (((pos + 1u) % ratio) == 0u) comp_row++;
+        }
+        request_n_comp_after[request] = comp_row;
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_compressor_prefill_tensor(
         ds4_gpu_tensor       *comp_cache,
         ds4_gpu_tensor       *state_kv,
@@ -16426,6 +17258,256 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             top_k, window, ratio, n_head, head_dim);
     }
     return cuda_ok(cudaGetLastError(), "attention indexed mixed launch");
+}
+
+extern "C" int ds4_gpu_attention_indexed_mixed_rn_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv_arena,
+        const ds4_gpu_tensor *comp_kv_arena,
+        uint32_t                comp_kv_f16,
+        const ds4_gpu_tensor *topk,
+        const ds4_gpu_tensor *row_request,
+        const ds4_gpu_tensor *row_position,
+        const ds4_gpu_tensor *request_position,
+        const ds4_gpu_tensor *request_rows,
+        const ds4_gpu_tensor *request_n_raw,
+        const ds4_gpu_tensor *request_raw_start,
+        const ds4_gpu_tensor *request_n_comp,
+        uint32_t                row_count,
+        uint32_t                request_count,
+        uint32_t                raw_cap,
+        uint32_t                raw_stride,
+        uint32_t                comp_stride,
+        uint32_t                top_k,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    const uint64_t row_meta_bytes =
+        (uint64_t)row_count * sizeof(uint32_t);
+    const uint64_t request_meta_bytes =
+        (uint64_t)request_count * sizeof(uint32_t);
+    const uint64_t q_values =
+        (uint64_t)row_count * n_head * head_dim;
+    const uint64_t raw_values =
+        (uint64_t)request_count * raw_stride * head_dim;
+    const uint64_t comp_values =
+        (uint64_t)request_count * comp_stride * head_dim;
+    if (comp_kv_f16 > 1u || !heads || !model_map || !q ||
+        !raw_kv_arena || !comp_kv_arena || !topk ||
+        !row_request || !row_position || !request_position ||
+        !request_rows || !request_n_raw || !request_raw_start ||
+        !request_n_comp || row_count == 0u || request_count == 0u ||
+        raw_cap == 0u || raw_stride < raw_cap || comp_stride == 0u ||
+        top_k == 0u || top_k > 512u || ratio == 0u ||
+        n_head == 0u || head_dim == 0u ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
+        heads->bytes < q_values * sizeof(float) ||
+        q->bytes < q_values * sizeof(float) ||
+        raw_kv_arena->bytes < raw_values * sizeof(float) ||
+        comp_kv_arena->bytes <
+            comp_values * (comp_kv_f16 ? sizeof(half) : sizeof(float)) ||
+        topk->bytes <
+            (uint64_t)row_count * top_k * sizeof(int32_t) ||
+        row_request->bytes < row_meta_bytes ||
+        row_position->bytes < row_meta_bytes ||
+        request_position->bytes < request_meta_bytes ||
+        request_rows->bytes < request_meta_bytes ||
+        request_n_raw->bytes < request_meta_bytes ||
+        request_raw_start->bytes < request_meta_bytes ||
+        request_n_comp->bytes < request_meta_bytes) {
+        return 0;
+    }
+    const float *sinks = (const float *)cuda_model_range_ptr(
+            model_map, sinks_offset,
+            (uint64_t)n_head * sizeof(float), "attn_sinks");
+    if (!sinks) return 0;
+    dim3 grid(row_count, n_head, 1u);
+    if (comp_kv_f16) {
+        attention_indexed_mixed_rn_kernel<true, false><<<grid, 256>>>(
+            (float *)heads->ptr,
+            sinks,
+            (const float *)q->ptr,
+            (const float *)raw_kv_arena->ptr,
+            comp_kv_arena->ptr,
+            nullptr,
+            nullptr,
+            (const int32_t *)topk->ptr,
+            (const uint32_t *)row_request->ptr,
+            (const uint32_t *)row_position->ptr,
+            (const uint32_t *)request_position->ptr,
+            (const uint32_t *)request_rows->ptr,
+            (const uint32_t *)request_n_raw->ptr,
+            (const uint32_t *)request_raw_start->ptr,
+            (const uint32_t *)request_n_comp->ptr,
+            row_count,
+            request_count,
+            raw_cap,
+            raw_stride,
+            comp_stride,
+            top_k,
+            window,
+            ratio,
+            n_head,
+            head_dim);
+    } else {
+        attention_indexed_mixed_rn_kernel<false, false><<<grid, 256>>>(
+            (float *)heads->ptr,
+            sinks,
+            (const float *)q->ptr,
+            (const float *)raw_kv_arena->ptr,
+            comp_kv_arena->ptr,
+            nullptr,
+            nullptr,
+            (const int32_t *)topk->ptr,
+            (const uint32_t *)row_request->ptr,
+            (const uint32_t *)row_position->ptr,
+            (const uint32_t *)request_position->ptr,
+            (const uint32_t *)request_rows->ptr,
+            (const uint32_t *)request_n_raw->ptr,
+            (const uint32_t *)request_raw_start->ptr,
+            (const uint32_t *)request_n_comp->ptr,
+            row_count,
+            request_count,
+            raw_cap,
+            raw_stride,
+            comp_stride,
+            top_k,
+            window,
+            ratio,
+            n_head,
+            head_dim);
+    }
+    return cuda_ok(cudaGetLastError(),
+                   "attention indexed physical R=n launch");
+}
+
+extern "C" int ds4_gpu_attention_indexed_mixed_rn_ptrs_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_cache_table,
+        const ds4_gpu_tensor *comp_cache_table,
+        uint32_t                comp_kv_f16,
+        const ds4_gpu_tensor *topk,
+        const ds4_gpu_tensor *row_request,
+        const ds4_gpu_tensor *row_position,
+        const ds4_gpu_tensor *request_position,
+        const ds4_gpu_tensor *request_rows,
+        const ds4_gpu_tensor *request_n_raw,
+        const ds4_gpu_tensor *request_raw_start,
+        const ds4_gpu_tensor *request_n_comp,
+        uint32_t                row_count,
+        uint32_t                request_count,
+        uint32_t                raw_cap,
+        uint32_t                comp_cap,
+        uint32_t                top_k,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    const uint64_t row_meta_bytes =
+        (uint64_t)row_count * sizeof(uint32_t);
+    const uint64_t request_meta_bytes =
+        (uint64_t)request_count * sizeof(uint32_t);
+    const uint64_t q_values =
+        (uint64_t)row_count * n_head * head_dim;
+    const uint64_t table_bytes =
+        (uint64_t)request_count * sizeof(void *);
+    if (comp_kv_f16 > 1u || !heads || !model_map || !q ||
+        !raw_cache_table || !comp_cache_table || !topk ||
+        !row_request || !row_position || !request_position ||
+        !request_rows || !request_n_raw || !request_raw_start ||
+        !request_n_comp || row_count == 0u || request_count == 0u ||
+        raw_cap == 0u || comp_cap == 0u ||
+        top_k == 0u || top_k > 512u || ratio == 0u ||
+        n_head == 0u || head_dim == 0u ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) > model_size - sinks_offset ||
+        heads->bytes < q_values * sizeof(float) ||
+        q->bytes < q_values * sizeof(float) ||
+        raw_cache_table->bytes < table_bytes ||
+        comp_cache_table->bytes < table_bytes ||
+        topk->bytes <
+            (uint64_t)row_count * top_k * sizeof(int32_t) ||
+        row_request->bytes < row_meta_bytes ||
+        row_position->bytes < row_meta_bytes ||
+        request_position->bytes < request_meta_bytes ||
+        request_rows->bytes < request_meta_bytes ||
+        request_n_raw->bytes < request_meta_bytes ||
+        request_raw_start->bytes < request_meta_bytes ||
+        request_n_comp->bytes < request_meta_bytes) {
+        return 0;
+    }
+    const float *sinks = (const float *)cuda_model_range_ptr(
+            model_map, sinks_offset,
+            (uint64_t)n_head * sizeof(float), "attn_sinks");
+    if (!sinks) return 0;
+    dim3 grid(row_count, n_head, 1u);
+    if (comp_kv_f16) {
+        attention_indexed_mixed_rn_kernel<true, true><<<grid, 256>>>(
+            (float *)heads->ptr,
+            sinks,
+            (const float *)q->ptr,
+            nullptr,
+            nullptr,
+            (const float *const *)raw_cache_table->ptr,
+            (const void *const *)comp_cache_table->ptr,
+            (const int32_t *)topk->ptr,
+            (const uint32_t *)row_request->ptr,
+            (const uint32_t *)row_position->ptr,
+            (const uint32_t *)request_position->ptr,
+            (const uint32_t *)request_rows->ptr,
+            (const uint32_t *)request_n_raw->ptr,
+            (const uint32_t *)request_raw_start->ptr,
+            (const uint32_t *)request_n_comp->ptr,
+            row_count,
+            request_count,
+            raw_cap,
+            raw_cap,
+            comp_cap,
+            top_k,
+            window,
+            ratio,
+            n_head,
+            head_dim);
+    } else {
+        attention_indexed_mixed_rn_kernel<false, true><<<grid, 256>>>(
+            (float *)heads->ptr,
+            sinks,
+            (const float *)q->ptr,
+            nullptr,
+            nullptr,
+            (const float *const *)raw_cache_table->ptr,
+            (const void *const *)comp_cache_table->ptr,
+            (const int32_t *)topk->ptr,
+            (const uint32_t *)row_request->ptr,
+            (const uint32_t *)row_position->ptr,
+            (const uint32_t *)request_position->ptr,
+            (const uint32_t *)request_rows->ptr,
+            (const uint32_t *)request_n_raw->ptr,
+            (const uint32_t *)request_raw_start->ptr,
+            (const uint32_t *)request_n_comp->ptr,
+            row_count,
+            request_count,
+            raw_cap,
+            raw_cap,
+            comp_cap,
+            top_k,
+            window,
+            ratio,
+            n_head,
+            head_dim);
+    }
+    return cuda_ok(cudaGetLastError(),
+                   "attention indexed physical R=n pointer launch");
 }
 
 static int attention_prefill_mixed_launch(

@@ -220,7 +220,120 @@ int ds4_token_user(ds4_engine *e);
 int ds4_token_assistant(ds4_engine *e);
 
 int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size);
+/* Create an independent CUDA timeline that reuses owner's transient graph
+ * arena. The lane owns its KV/compressor/DSpark state and host RNG/statistics,
+ * but owner must outlive it. This is the memory-bounded prerequisite for a
+ * physical multi-session verifier; shared lanes must not be evaluated
+ * concurrently except through the R=n executor. */
+int ds4_session_create_shared(ds4_session **out, ds4_session *owner);
 void ds4_session_free(ds4_session *s);
+bool ds4_session_is_shared(ds4_session *s);
+uint64_t ds4_session_private_device_bytes(ds4_session *s);
+
+typedef struct {
+    ds4_session *session;
+    const ds4_tokens *tokens;
+    uint32_t start;
+    uint32_t rows;
+    uint32_t capture_prefixes;
+    int *row_tops;
+    /* Optional rows * vocabulary row-major target logits.  This is intended
+     * for validation and CPU sampling; production code should prefer the
+     * device-resident transaction output below. */
+    float *row_logits;
+    float *continuation_logits;
+} ds4_physical_verify_request;
+
+typedef struct ds4_physical_verify_txn ds4_physical_verify_txn;
+
+enum {
+    DS4_PHYSICAL_DSPARK_MAX_DRAFT = 5,
+};
+
+typedef struct {
+    ds4_session *session;
+    int pending_token;
+    uint32_t proposal_count;
+    float temperature;
+    float min_p;
+    uint64_t *rng;
+    int draft_tokens[DS4_PHYSICAL_DSPARK_MAX_DRAFT];
+    float confidence_logits[DS4_PHYSICAL_DSPARK_MAX_DRAFT];
+    float accept_uniforms[DS4_PHYSICAL_DSPARK_MAX_DRAFT];
+    float residual_uniforms[DS4_PHYSICAL_DSPARK_MAX_DRAFT];
+} ds4_physical_draft_request;
+
+/* Run each lane's DSpark drafter against its private history while sharing the
+ * transient CUDA arena. The sampled q rows stay device-resident in that lane
+ * until verify_suffix_rn_reject(); only tokens, confidence and uniforms cross
+ * to the host scheduler. RNG state is request-owned and advanced exactly as in
+ * the single-session stochastic DSpark path. */
+int ds4_sessions_prepare_dspark_rn(
+        ds4_physical_draft_request *requests,
+        uint32_t request_count,
+        char *err,
+        size_t errlen);
+
+/* Begin one CUDA target microbatch over independent speculative suffixes.
+ * Attention and persistent KV remain session-local; dense/FFN/output work is
+ * flattened request-major.  The transaction retains every pre-verify frontier
+ * until finish/abort, and therefore must be resolved before any other operation
+ * uses one of these sessions or their shared scratch arena. */
+int ds4_sessions_verify_suffix_rn_begin(
+        ds4_physical_verify_request *requests,
+        uint32_t request_count,
+        ds4_physical_verify_txn **out,
+        char *err,
+        size_t errlen);
+
+typedef struct {
+    /* Optional row-major q distributions for validation. Production leaves
+     * this NULL because the lane-private DSpark drafter wrote them directly. */
+    const float *draft_probabilities;
+    const float *accept_uniforms;
+    const float *residual_uniforms;
+    float temperature;
+    float min_p;
+    bool block_verify;
+    uint32_t committed_drafts;
+    int correction_token;
+} ds4_physical_rejection_request;
+
+/* Apply lossless p/q rejection independently to every request slice while
+ * target logits remain in the shared device output. This does not consume or
+ * commit the transaction; callers pass 1 + committed_drafts to finish(). */
+int ds4_sessions_verify_suffix_rn_reject(
+        ds4_physical_verify_txn *txn,
+        ds4_physical_rejection_request *rejection,
+        char *err,
+        size_t errlen);
+
+/* Commit keep_rows[r] verified input rows independently for every lane.
+ * A zero restores that lane, a partial prefix restores its rejected ring tail
+ * and commits the captured compressor frontier, and the full row count keeps
+ * the already-computed state.  Selected continuation logits are materialized
+ * directly from the shared device output.  The transaction is consumed. */
+int ds4_sessions_verify_suffix_rn_finish(
+        ds4_physical_verify_txn *txn,
+        const uint32_t *keep_rows,
+        char *err,
+        size_t errlen);
+
+/* Restore all request frontiers and consume the transaction. */
+int ds4_sessions_verify_suffix_rn_abort(
+        ds4_physical_verify_txn *txn,
+        char *err,
+        size_t errlen);
+
+/* Evaluate independent speculative suffixes as an observational CUDA target
+ * microbatch. row_tops receives rows-1 target ids, row_logits optionally
+ * receives every target distribution, and continuation_logits receives the
+ * final distribution. Every frontier is restored before return. */
+int ds4_sessions_verify_suffix_rn(
+        ds4_physical_verify_request *requests,
+        uint32_t request_count,
+        char *err,
+        size_t errlen);
 int ds4_session_power(ds4_session *s);
 int ds4_session_set_power(ds4_session *s, int power_percent);
 bool ds4_session_is_distributed(ds4_session *s);

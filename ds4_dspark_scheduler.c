@@ -425,7 +425,11 @@ int ds4_dspark_schedule_flatten(
             if (items[previous].request_id == items[r].request_id) return 1;
         }
         const uint32_t prefix = schedule->prefix[r];
-        if (prefix > DS4_DSPARK_SCHEDULER_MAX_PREFIX) return 1;
+        if (items[r].request.max_prefix >
+                DS4_DSPARK_SCHEDULER_MAX_PREFIX ||
+            prefix > items[r].request.max_prefix) {
+            return 1;
+        }
         const uint32_t rows = prefix + 1u;
         if (items[r].position > UINT32_MAX - prefix) return 1;
         if (plan->row_count >
@@ -444,9 +448,68 @@ int ds4_dspark_schedule_flatten(
             plan->row_count++;
         }
     }
-    if (schedule->batch_size != 0 &&
-        plan->row_count != schedule->batch_size) {
+    if (plan->row_count != schedule->batch_size) {
         return 1;
+    }
+    return 0;
+}
+
+int ds4_dspark_physical_batch_build(
+        const ds4_dspark_schedule_result *schedule,
+        const ds4_dspark_schedule_item *items,
+        const int32_t *pending_tokens,
+        const int32_t *draft_tokens,
+        uint32_t draft_stride,
+        const uint64_t *rng_state,
+        ds4_dspark_physical_batch *batch) {
+    if (!schedule || !items || !pending_tokens || !draft_tokens ||
+        !rng_state || !batch ||
+        draft_stride < DS4_DSPARK_SCHEDULER_MAX_PREFIX) {
+        return 1;
+    }
+    memset(batch, 0, sizeof(*batch));
+    if (ds4_dspark_schedule_flatten(
+            schedule, items, &batch->layout) != 0) {
+        return 1;
+    }
+    for (uint32_t request = 0;
+         request < batch->layout.request_count; request++) {
+        batch->rng_state[request] = rng_state[request];
+        const uint32_t offset = batch->layout.request_offset[request];
+        const uint32_t rows = batch->layout.request_rows[request];
+        batch->row_token[offset] = pending_tokens[request];
+        for (uint32_t prefix = 1; prefix < rows; prefix++) {
+            batch->row_token[offset + prefix] =
+                draft_tokens[(uint64_t)request * draft_stride +
+                             prefix - 1u];
+        }
+    }
+    return 0;
+}
+
+int ds4_dspark_physical_batch_scatter(
+        const ds4_dspark_physical_batch *batch,
+        const uint32_t *committed_prefix,
+        ds4_dspark_physical_result *result) {
+    if (!batch || !committed_prefix || !result ||
+        batch->layout.request_count == 0u ||
+        batch->layout.request_count >
+            DS4_DSPARK_SCHEDULER_MAX_REQUESTS) {
+        return 1;
+    }
+    memset(result, 0, sizeof(*result));
+    result->request_count = batch->layout.request_count;
+    for (uint32_t request = 0;
+         request < batch->layout.request_count; request++) {
+        const uint32_t selected_prefix =
+            batch->layout.request_rows[request] - 1u;
+        const uint32_t committed = committed_prefix[request];
+        if (committed > selected_prefix) return 1;
+        result->committed_prefix[request] = committed;
+        result->emitted_tokens[request] = committed + 1u;
+        result->continuation_row[request] =
+            batch->layout.request_offset[request] + committed;
+        result->emitted_total += committed + 1u;
     }
     return 0;
 }

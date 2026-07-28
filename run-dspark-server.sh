@@ -297,7 +297,7 @@ echo "Prefill: chunk=$PREFILL_CHUNK final-logits-only=${DS4_PREFILL_FINAL_LOGITS
 echo "Streaming: decode-heartbeat=${DS4_STREAM_HEARTBEAT_SEC}s"
 echo "KV:     policy=$DS4_KV_PREFILL_CHECKPOINT_POLICY keep-long-text-hits=$DS4_KV_KEEP_LONG_TEXT_HITS canonical-min-sec=$DS4_KV_CANONICAL_PREFILL_MIN_SEC cold-max=$KV_COLD_MAX_TOKENS long-anchor-min=$DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS trim=$DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS disk-mb=$KV_DISK_SPACE_MB"
 echo "Context guard: physical=$CTX advertise=${ADVERTISE_CONTEXT_PCT}%"
-echo "DSpark scheduler: full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY shadow=$SCHEDULER_SHADOW deterministic=$SCHEDULER_DETERMINISTIC"
+echo "DSpark scheduler: hardware-aware Algorithm 1 + exact t-2 production capacity (policy R=n, CUDA executor R=1), full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY shadow=$SCHEDULER_SHADOW deterministic=$SCHEDULER_DETERMINISTIC"
 echo "DSpark parity: confidence-input=$CONFIDENCE_INPUT, verifier-topology-cache=$GRAPH_TOPOLOGY_CACHE"
 echo "DSpark sampling: lossless p/q rejection for top_k=0 top_p=1 min-p policy (rollback DS4_DSPARK_REJECTION_DISABLE=1)"
 echo "HybridLC: enabled=$HYBRID_LC shadow=$HYBRID_LC_SHADOW indexed-suffix=8-token transition-q=top8 BlockV=lossless max-draft=15 graph-rows=8/12/16 forced-width=${HYBRID_WIDTH:-auto}"

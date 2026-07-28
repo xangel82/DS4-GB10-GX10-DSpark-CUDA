@@ -17,8 +17,8 @@ ROCM_SRCS := $(wildcard rocm/*.cuh)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_dspark_scheduler.o ds4_metal.o
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o ds4_dspark_scheduler.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -38,8 +38,8 @@ NVCCFLAGS ?= -O3 -g -lineinfo --use_fast_math -std=c++17 $(NVCC_ARCH_FLAGS) -Xco
 MMQ_INCLUDES := -Icuda/mmq
 MMQ_OBJS := cuda/mmq/ds4_ggml_stubs.o cuda/mmq/ds4_mmq.o cuda/mmq/ds4_mmq_d2r.o cuda/mmq/ds4_repack.o cuda/mmq/quantize.o cuda/mmq/mmid.o cuda/mmq/mmvq.o
 CUDA_INDEXER_OBJS := cuda/indexer/ds4_indexer_sm121.o cuda/indexer/ds4_topk_radix.o cuda/indexer/ds4_topk_gvr.o
-CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_cuda.o $(MMQ_OBJS) $(CUDA_INDEXER_OBJS)
-CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
+CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_dspark_scheduler.o ds4_cuda.o $(MMQ_OBJS) $(CUDA_INDEXER_OBJS)
+CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o ds4_dspark_scheduler.o
 CUDA_LDLIBS ?= -lm -Xcompiler -pthread -L$(CUDA_HOME)/targets/sbsa-linux/lib -L$(CUDA_HOME)/lib64 -lcudart -lcublas -ldl
 HIPCC ?= $(shell command -v hipcc 2>/dev/null || echo /opt/rocm/bin/hipcc)
 ROCM_ARCH ?= gfx1151
@@ -50,7 +50,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-dspark-analyzer cpu cuda cuda-spark cuda-spark-graph cuda-spark-mtp-tc cuda-spark-graph-sm121 cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-dspark-analyzer test-dspark-scheduler cpu cuda cuda-spark cuda-spark-graph cuda-spark-mtp-tc cuda-spark-graph-sm121 cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -159,7 +159,7 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_eval_cpu.o ds4_agent_cpu
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CPU_CORE_OBJS) $(LDLIBS)
 
 cuda-regression: NVCCFLAGS += --default-stream per-thread -DDS4_CUDA_TOKEN_GRAPH_BUILD
-cuda-regression: tests/cuda_long_context_smoke
+cuda-regression: test-dspark-scheduler tests/cuda_long_context_smoke
 	./tests/cuda_long_context_smoke
 
 # The generic server unit-test binary intentionally omits CUDA Graph support.
@@ -168,11 +168,14 @@ cuda-regression: tests/cuda_long_context_smoke
 ds4_test: NVCCFLAGS += -diag-suppress 177 -diag-suppress 550
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_dspark_scheduler.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_ssd.o: ds4_ssd.c ds4_ssd.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_ssd.c
+
+ds4_dspark_scheduler.o: ds4_dspark_scheduler.c ds4_dspark_scheduler.h
+	$(CC) $(CFLAGS) -c -o $@ ds4_dspark_scheduler.c
 
 ds4_cli.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ ds4_cli.c
@@ -216,7 +219,7 @@ rax.o: rax.c rax.h rax_malloc.h
 linenoise.o: linenoise.c linenoise.h
 	$(CC) $(CFLAGS) -c -o $@ linenoise.c
 
-ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
+ds4_cpu.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_dspark_scheduler.h
 	$(CC) $(CFLAGS) -DDS4_NO_GPU -c -o $@ ds4.c
 
 ds4_cli_cpu.o: ds4_cli.c ds4.h ds4_ssd.h ds4_distributed.h ds4_help.h linenoise.h
@@ -290,7 +293,7 @@ else
 	$(NVCC) $(NVCCFLAGS) -o $@ ds4_agent_test.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o $(CORE_OBJS) $(CUDA_LDLIBS)
 endif
 
-test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-dspark-analyzer
+test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-dspark-analyzer test-dspark-scheduler
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
 	./ds4_test
@@ -298,9 +301,15 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test test-dspark-analyzer
 test-dspark-analyzer:
 	./tests/test_analyze_dspark_log.sh
 
+test-dspark-scheduler: tests/test_dspark_scheduler
+	./tests/test_dspark_scheduler
+
+tests/test_dspark_scheduler: tests/test_dspark_scheduler.c ds4_dspark_scheduler.c ds4_dspark_scheduler.h
+	$(CC) $(CFLAGS) -I. -o $@ tests/test_dspark_scheduler.c ds4_dspark_scheduler.c -lm
+
 q4k-dot-test: tests/test_q4k_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot *.o cuda/indexer/*.o cuda/mmq/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot tests/test_dspark_scheduler *.o cuda/indexer/*.o cuda/mmq/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o

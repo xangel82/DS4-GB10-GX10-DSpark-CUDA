@@ -39,7 +39,9 @@ rsync -az --progress \
   --exclude='ds4-agent' \
   --exclude='ds4_test' \
   --exclude='ds4_agent_test' \
+  --exclude='*.dSYM' \
   --exclude='tests/test_q4k_dot' \
+  --exclude='tests/test_dspark_scheduler' \
   --exclude='tests/cuda_long_context_smoke' \
   --exclude='gguf-tools/deepseek4-quantize' \
   --exclude='benchmark-results' \

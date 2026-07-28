@@ -44,7 +44,7 @@ function text_value(prefix,    i,a) {
   if (k >= 1 && k <= 5) champion[k]++
   sk = value("shadow_k")
   sr = value("shadow_ready")
-  if (sk >= 1 && sk <= 5) {
+  if (sk >= 0 && sk <= 5) {
     shadow_selected[sk]++
     shadow_decisions++
     if (sk == value("selected")) shadow_agree++
@@ -64,6 +64,30 @@ function text_value(prefix,    i,a) {
   }
   v = value("shadow_stop")
   if (v >= 1 && v <= 5) shadow_stop[v]++
+  hr = value("hw_r")
+  hb = value("hw_batch")
+  ha = value("hw_admitted")
+  hbase = value("hw_base")
+  hs = value("hw_stop_batch")
+  hsync = value("hw_sync_k")
+  hasync = value("hw_async")
+  hcapacity = value("hw_capacity")
+  hcapacity_rate = value("hw_capacity_rate")
+  if (hr > 0 && hb >= hr) {
+    hardware_cycles++
+    hardware_r_sum += hr
+    hardware_batch_sum += hb
+    if (ha >= 0) hardware_admitted_sum += ha
+    if (hbase > 0) hardware_base_sum += hbase
+    if (hs > 0) hardware_stops++
+    if (hsync >= 0 && hsync <= 5) hardware_sync[hsync]++
+    if (hasync == 1) {
+      hardware_async_cycles++
+      if (hsync >= 0 && sk >= 0 && hsync != sk) hardware_async_changes++
+    }
+    if (hcapacity >= hr) hardware_capacity_sum += hcapacity
+    if (hcapacity_rate > 0) hardware_capacity_rate_sum += hcapacity_rate
+  }
 }
 /dspark scheduler bypass/ { bypass++ }
 /dspark pre-draft bypass/ { predraft_bypass++ }
@@ -304,9 +328,9 @@ END {
            deterministic_cycles, deterministic_overrides
   }
   if (shadow_decisions > 0) {
-    printf "Shadow K=1..5:             %d %d %d %d %d\n",
-           shadow_selected[1], shadow_selected[2], shadow_selected[3],
-           shadow_selected[4], shadow_selected[5]
+    printf "Shadow K=0..5:             %d %d %d %d %d %d\n",
+           shadow_selected[0], shadow_selected[1], shadow_selected[2],
+           shadow_selected[3], shadow_selected[4], shadow_selected[5]
     printf "Shadow ready/agreement:    %d / %d (%.2f%% agreement)\n",
            shadow_ready, shadow_agree, 100.0 * shadow_agree / shadow_decisions
     if (scheduler_probes > 0) {
@@ -324,6 +348,25 @@ END {
     if (shadow_rate_n > 0) {
       printf "Mean shadow predicted rate: %.3f t/s\n",
              shadow_rate_sum / shadow_rate_n
+    }
+  }
+  if (hardware_cycles > 0) {
+    printf "Hardware scheduler mean R/batch: %.3f / %.3f\n",
+           hardware_r_sum / hardware_cycles,
+           hardware_batch_sum / hardware_cycles
+    printf "Hardware admitted/cycle:   %.3f (causal stops=%d)\n",
+           hardware_admitted_sum / hardware_cycles, hardware_stops
+    printf "Hardware K0 baseline:      %.3f t/s\n",
+           hardware_base_sum / hardware_cycles
+    printf "Hardware causal K=0..5:    %d %d %d %d %d %d\n",
+           hardware_sync[0], hardware_sync[1], hardware_sync[2],
+           hardware_sync[3], hardware_sync[4], hardware_sync[5]
+    if (hardware_async_cycles > 0) {
+      printf "Hardware async cycles/changes: %d / %d\n",
+             hardware_async_cycles, hardware_async_changes
+      printf "Hardware mean capacity/rate: %.3f / %.3f t/s\n",
+             hardware_capacity_sum / hardware_cycles,
+             hardware_capacity_rate_sum / hardware_cycles
     }
   }
   if (block_n > 0) printf "Mean DSpark block/proposed: %.3f / %.3f\n", block_sum / block_n, proposed_sum / proposed_n

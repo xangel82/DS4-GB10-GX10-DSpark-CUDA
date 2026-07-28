@@ -1,0 +1,452 @@
+/* GB10/GX10 DSpark CUDA modifications:
+ * Copyright (c) 2026 Marco Palaferri. Licensed under the MIT License. */
+
+#include "ds4_dspark_scheduler.h"
+
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    double survival;
+    uint64_t identity;
+    uint32_t request;
+    uint32_t prefix;
+} ds4_dspark_candidate;
+
+enum {
+    DS4_DSPARK_SCHEDULER_MAX_CANDIDATES =
+        DS4_DSPARK_SCHEDULER_MAX_REQUESTS *
+        DS4_DSPARK_SCHEDULER_MAX_PREFIX,
+};
+
+static int ds4_dspark_candidate_compare(const void *lhs_ptr,
+                                        const void *rhs_ptr) {
+    const ds4_dspark_candidate *lhs = lhs_ptr;
+    const ds4_dspark_candidate *rhs = rhs_ptr;
+    if (lhs->survival > rhs->survival) return -1;
+    if (lhs->survival < rhs->survival) return 1;
+    if (lhs->identity < rhs->identity) return -1;
+    if (lhs->identity > rhs->identity) return 1;
+    if (lhs->request < rhs->request) return -1;
+    if (lhs->request > rhs->request) return 1;
+    if (lhs->prefix < rhs->prefix) return -1;
+    if (lhs->prefix > rhs->prefix) return 1;
+    return 0;
+}
+
+static int ds4_dspark_build_candidates(
+        const ds4_dspark_schedule_request *requests,
+        uint32_t request_count,
+        ds4_dspark_candidate *candidates,
+        uint32_t *candidate_count_out) {
+    if (!requests || !candidates || !candidate_count_out ||
+        request_count == 0 ||
+        request_count > DS4_DSPARK_SCHEDULER_MAX_REQUESTS) {
+        return 1;
+    }
+    uint32_t candidate_count = 0;
+    for (uint32_t r = 0; r < request_count; r++) {
+        if (requests[r].max_prefix > DS4_DSPARK_SCHEDULER_MAX_PREFIX) {
+            return 1;
+        }
+        double survival = 1.0;
+        for (uint32_t j = 0; j < requests[r].max_prefix; j++) {
+            double conditional = requests[r].conditional[j];
+            if (!isfinite(conditional)) return 1;
+            if (conditional < 0.0) conditional = 0.0;
+            if (conditional > 1.0) conditional = 1.0;
+            survival *= conditional;
+            if (!(survival > 0.0) || !isfinite(survival)) break;
+            candidates[candidate_count++] = (ds4_dspark_candidate) {
+                .survival = survival,
+                .identity = requests[r].identity,
+                .request = r,
+                .prefix = j + 1u,
+            };
+        }
+    }
+    qsort(candidates, candidate_count, sizeof(candidates[0]),
+          ds4_dspark_candidate_compare);
+    *candidate_count_out = candidate_count;
+    return 0;
+}
+
+static int ds4_dspark_validate_sps(
+        const double *sps, uint32_t sps_count,
+        uint32_t request_count, uint32_t candidate_count) {
+    if (!sps) return 1;
+    const uint32_t max_batch = request_count + candidate_count;
+    if (sps_count <= max_batch) return 1;
+    for (uint32_t b = request_count; b <= max_batch; b++) {
+        if (!(sps[b] > 0.0) || !isfinite(sps[b])) return 1;
+    }
+    return 0;
+}
+
+int ds4_dspark_hardware_schedule(
+        const ds4_dspark_schedule_request *requests,
+        uint32_t request_count,
+        const double *sps,
+        uint32_t sps_count,
+        ds4_dspark_schedule_result *result) {
+    if (!requests || !sps || !result || request_count == 0 ||
+        request_count > DS4_DSPARK_SCHEDULER_MAX_REQUESTS) {
+        return 1;
+    }
+    memset(result, 0, sizeof(*result));
+
+    ds4_dspark_candidate candidates[
+        DS4_DSPARK_SCHEDULER_MAX_CANDIDATES];
+    uint32_t candidate_count = 0;
+    if (ds4_dspark_build_candidates(
+            requests, request_count, candidates, &candidate_count) != 0 ||
+        ds4_dspark_validate_sps(
+            sps, sps_count, request_count, candidate_count) != 0) {
+        return 1;
+    }
+
+    uint32_t current_prefix[DS4_DSPARK_SCHEDULER_MAX_REQUESTS] = {0};
+    uint32_t batch_size = request_count;
+    double expected_tokens = (double)request_count;
+    double best_throughput = expected_tokens * sps[batch_size];
+
+    result->request_count = request_count;
+    result->batch_size = batch_size;
+    result->capacity_batch_size = batch_size;
+    result->expected_tokens = expected_tokens;
+    result->throughput = best_throughput;
+    result->baseline_throughput = best_throughput;
+    result->capacity_throughput = best_throughput;
+    result->stop_request = UINT32_MAX;
+
+    for (uint32_t i = 0; i < candidate_count; i++) {
+        const ds4_dspark_candidate *candidate = &candidates[i];
+        if (candidate->prefix !=
+            current_prefix[candidate->request] + 1u) {
+            return 1;
+        }
+        current_prefix[candidate->request] = candidate->prefix;
+        batch_size++;
+        expected_tokens += candidate->survival;
+        const double throughput = expected_tokens * sps[batch_size];
+        result->evaluated_candidates++;
+
+        if (throughput > best_throughput) {
+            best_throughput = throughput;
+            result->batch_size = batch_size;
+            result->capacity_batch_size = batch_size;
+            result->admitted_candidates = i + 1u;
+            result->expected_tokens = expected_tokens;
+            result->throughput = throughput;
+            result->capacity_throughput = throughput;
+            memcpy(result->prefix, current_prefix,
+                   (size_t)request_count * sizeof(result->prefix[0]));
+            continue;
+        }
+
+        result->stopped = 1;
+        result->stop_batch_size = batch_size;
+        result->stop_request = candidate->request;
+        result->stop_prefix = candidate->prefix;
+        break;
+    }
+    return 0;
+}
+
+int ds4_dspark_hardware_schedule_async(
+        const ds4_dspark_schedule_request *capacity_requests,
+        const ds4_dspark_schedule_request *current_requests,
+        uint32_t request_count,
+        const double *sps,
+        uint32_t sps_count,
+        ds4_dspark_schedule_result *result) {
+    if (!capacity_requests || !current_requests || !sps || !result ||
+        request_count == 0 ||
+        request_count > DS4_DSPARK_SCHEDULER_MAX_REQUESTS) {
+        return 1;
+    }
+    memset(result, 0, sizeof(*result));
+
+    ds4_dspark_candidate capacity_candidates[
+        DS4_DSPARK_SCHEDULER_MAX_CANDIDATES];
+    ds4_dspark_candidate current_candidates[
+        DS4_DSPARK_SCHEDULER_MAX_CANDIDATES];
+    uint32_t capacity_count = 0;
+    uint32_t current_count = 0;
+    if (ds4_dspark_build_candidates(
+            capacity_requests, request_count, capacity_candidates,
+            &capacity_count) != 0 ||
+        ds4_dspark_build_candidates(
+            current_requests, request_count, current_candidates,
+            &current_count) != 0) {
+        return 1;
+    }
+    const uint32_t max_candidates =
+        capacity_count > current_count ? capacity_count : current_count;
+    if (ds4_dspark_validate_sps(
+            sps, sps_count, request_count, max_candidates) != 0) {
+        return 1;
+    }
+
+    uint32_t capacity_admitted = 0;
+    uint32_t capacity_batch = request_count;
+    double capacity_expected = (double)request_count;
+    double capacity_throughput =
+        capacity_expected * sps[capacity_batch];
+    for (uint32_t i = 0; i < capacity_count; i++) {
+        capacity_batch++;
+        capacity_expected += capacity_candidates[i].survival;
+        const double throughput =
+            capacity_expected * sps[capacity_batch];
+        if (throughput > capacity_throughput) {
+            capacity_throughput = throughput;
+            capacity_admitted = i + 1u;
+        }
+    }
+    if (capacity_admitted > current_count) capacity_admitted = current_count;
+
+    /* A current EOS/context boundary may expose fewer candidates than the
+     * historical search selected. Keep the physical limit feasible and make
+     * its diagnostic throughput describe that clamped limit. */
+    capacity_expected = (double)request_count;
+    for (uint32_t i = 0; i < capacity_admitted; i++) {
+        capacity_expected += capacity_candidates[i].survival;
+    }
+    capacity_throughput =
+        capacity_expected * sps[request_count + capacity_admitted];
+
+    uint32_t current_prefix[DS4_DSPARK_SCHEDULER_MAX_REQUESTS] = {0};
+    double current_expected = (double)request_count;
+    for (uint32_t i = 0; i < capacity_admitted; i++) {
+        const ds4_dspark_candidate *candidate = &current_candidates[i];
+        if (candidate->prefix !=
+            current_prefix[candidate->request] + 1u) {
+            return 1;
+        }
+        current_prefix[candidate->request] = candidate->prefix;
+        current_expected += candidate->survival;
+    }
+
+    result->request_count = request_count;
+    result->batch_size = request_count + capacity_admitted;
+    result->capacity_batch_size = request_count + capacity_admitted;
+    result->admitted_candidates = capacity_admitted;
+    result->evaluated_candidates = capacity_count;
+    result->stop_request = UINT32_MAX;
+    result->expected_tokens = current_expected;
+    result->throughput = current_expected * sps[result->batch_size];
+    result->baseline_throughput =
+        (double)request_count * sps[request_count];
+    result->capacity_throughput = capacity_throughput;
+    memcpy(result->prefix, current_prefix,
+           (size_t)request_count * sizeof(result->prefix[0]));
+    return 0;
+}
+
+void ds4_dspark_scheduler_state_reset(
+        ds4_dspark_scheduler_state *state) {
+    if (state) memset(state, 0, sizeof(*state));
+}
+
+static ds4_dspark_scheduler_entry *ds4_dspark_scheduler_find(
+        ds4_dspark_scheduler_state *state,
+        uint64_t request_id) {
+    if (!state) return NULL;
+    for (uint32_t i = 0;
+         i < DS4_DSPARK_SCHEDULER_MAX_REQUESTS;
+         i++) {
+        ds4_dspark_scheduler_entry *entry = &state->entries[i];
+        if (entry->in_use && entry->request_id == request_id) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+static int ds4_dspark_items_contain(
+        const ds4_dspark_schedule_item *items,
+        uint32_t request_count,
+        uint64_t request_id) {
+    for (uint32_t i = 0; i < request_count; i++) {
+        if (items[i].request_id == request_id) return 1;
+    }
+    return 0;
+}
+
+static ds4_dspark_scheduler_entry *ds4_dspark_scheduler_allocate(
+        ds4_dspark_scheduler_state *state,
+        const ds4_dspark_schedule_item *items,
+        uint32_t request_count,
+        uint64_t request_id) {
+    ds4_dspark_scheduler_entry *entry =
+        ds4_dspark_scheduler_find(state, request_id);
+    if (entry) return entry;
+
+    for (uint32_t i = 0;
+         i < DS4_DSPARK_SCHEDULER_MAX_REQUESTS;
+         i++) {
+        if (!state->entries[i].in_use) {
+            entry = &state->entries[i];
+            state->entry_count++;
+            break;
+        }
+    }
+    if (!entry) {
+        uint64_t oldest_step = UINT64_MAX;
+        for (uint32_t i = 0;
+             i < DS4_DSPARK_SCHEDULER_MAX_REQUESTS;
+             i++) {
+            ds4_dspark_scheduler_entry *candidate = &state->entries[i];
+            if (!ds4_dspark_items_contain(
+                    items, request_count, candidate->request_id) &&
+                candidate->last_seen_step < oldest_step) {
+                oldest_step = candidate->last_seen_step;
+                entry = candidate;
+            }
+        }
+    }
+    if (!entry) return NULL;
+
+    memset(entry, 0, sizeof(*entry));
+    entry->request_id = request_id;
+    entry->in_use = 1;
+    return entry;
+}
+
+int ds4_dspark_scheduler_state_forget(
+        ds4_dspark_scheduler_state *state,
+        uint64_t request_id) {
+    ds4_dspark_scheduler_entry *entry =
+        ds4_dspark_scheduler_find(state, request_id);
+    if (!entry) return 0;
+    memset(entry, 0, sizeof(*entry));
+    if (state->entry_count != 0) state->entry_count--;
+    return 1;
+}
+
+int ds4_dspark_hardware_schedule_step(
+        ds4_dspark_scheduler_state *state,
+        const ds4_dspark_schedule_item *items,
+        uint32_t request_count,
+        const double *sps,
+        uint32_t sps_count,
+        ds4_dspark_schedule_step_result *result) {
+    if (!state || !items || !sps || !result ||
+        request_count == 0 ||
+        request_count > DS4_DSPARK_SCHEDULER_MAX_REQUESTS) {
+        return 1;
+    }
+    memset(result, 0, sizeof(*result));
+
+    ds4_dspark_schedule_request
+        current[DS4_DSPARK_SCHEDULER_MAX_REQUESTS];
+    ds4_dspark_schedule_request
+        capacity[DS4_DSPARK_SCHEDULER_MAX_REQUESTS];
+    const uint64_t current_step = state->step + 1u;
+    const uint64_t capacity_step =
+        current_step > 2u ? current_step - 2u : 0u;
+    for (uint32_t i = 0; i < request_count; i++) {
+        if (items[i].request.max_prefix >
+            DS4_DSPARK_SCHEDULER_MAX_PREFIX) {
+            return 1;
+        }
+        for (uint32_t j = 0; j < i; j++) {
+            if (items[j].request_id == items[i].request_id) return 1;
+        }
+        current[i] = items[i].request;
+        current[i].identity = items[i].request_id;
+        ds4_dspark_scheduler_entry *entry =
+            ds4_dspark_scheduler_find(state, items[i].request_id);
+        int history_slot = -1;
+        if (entry && capacity_step != 0u) {
+            for (uint32_t h = 0; h < entry->history_count; h++) {
+                if (entry->history_step[h] == capacity_step) {
+                    history_slot = (int)h;
+                    break;
+                }
+            }
+        }
+        if (history_slot >= 0) {
+            capacity[i] = entry->history[history_slot];
+            capacity[i].identity = items[i].request_id;
+            if (capacity[i].max_prefix > current[i].max_prefix) {
+                capacity[i].max_prefix = current[i].max_prefix;
+            }
+            result->history_ready_requests++;
+        } else {
+            memset(&capacity[i], 0, sizeof(capacity[i]));
+        }
+    }
+
+    if (ds4_dspark_hardware_schedule(
+            current, request_count, sps, sps_count,
+            &result->causal) != 0) {
+        return 1;
+    }
+    result->selected = result->causal;
+    if (result->history_ready_requests == request_count) {
+        if (ds4_dspark_hardware_schedule_async(
+                capacity, current, request_count, sps, sps_count,
+                &result->selected) != 0) {
+            return 1;
+        }
+        result->used_async = 1;
+    }
+
+    for (uint32_t i = 0; i < request_count; i++) {
+        ds4_dspark_scheduler_entry *entry =
+            ds4_dspark_scheduler_allocate(
+                state, items, request_count, items[i].request_id);
+        if (!entry) return 1;
+        entry->history[1] = entry->history[0];
+        entry->history_step[1] = entry->history_step[0];
+        entry->history[0] = items[i].request;
+        entry->history_step[0] = current_step;
+        if (entry->history_count < 2u) entry->history_count++;
+        entry->last_seen_step = current_step;
+    }
+    state->step = current_step;
+    return 0;
+}
+
+int ds4_dspark_schedule_flatten(
+        const ds4_dspark_schedule_result *schedule,
+        const ds4_dspark_schedule_item *items,
+        ds4_dspark_flatten_plan *plan) {
+    if (!schedule || !items || !plan || schedule->request_count == 0 ||
+        schedule->request_count > DS4_DSPARK_SCHEDULER_MAX_REQUESTS) {
+        return 1;
+    }
+    memset(plan, 0, sizeof(*plan));
+    plan->request_count = schedule->request_count;
+    for (uint32_t r = 0; r < schedule->request_count; r++) {
+        for (uint32_t previous = 0; previous < r; previous++) {
+            if (items[previous].request_id == items[r].request_id) return 1;
+        }
+        const uint32_t prefix = schedule->prefix[r];
+        if (prefix > DS4_DSPARK_SCHEDULER_MAX_PREFIX) return 1;
+        const uint32_t rows = prefix + 1u;
+        if (items[r].position > UINT32_MAX - prefix) return 1;
+        if (plan->row_count >
+            DS4_DSPARK_SCHEDULER_MAX_ROWS - rows) {
+            return 1;
+        }
+        plan->request_id[r] = items[r].request_id;
+        plan->request_position[r] = items[r].position;
+        plan->request_offset[r] = plan->row_count;
+        plan->request_rows[r] = rows;
+        for (uint32_t j = 0; j < rows; j++) {
+            plan->row_request[plan->row_count] = r;
+            plan->row_prefix[plan->row_count] = j;
+            plan->row_position[plan->row_count] =
+                items[r].position + j;
+            plan->row_count++;
+        }
+    }
+    if (schedule->batch_size != 0 &&
+        plan->row_count != schedule->batch_size) {
+        return 1;
+    }
+    return 0;
+}

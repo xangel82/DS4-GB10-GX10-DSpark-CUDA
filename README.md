@@ -468,27 +468,37 @@ improvements.
 
 ## License and attribution
 
-This repository keeps the original MIT license and contains work from several
-clearly separated lineages:
+This fork keeps upstream `ds4`'s MIT license. Original GB10/GX10 and DSpark
+modifications authored in this fork are:
+
+```text
+Copyright (c) 2026 Marco Palaferri
+Licensed under the MIT License
+```
+
+Project and maintainer information is available at
+[www.palaferri.com](https://www.palaferri.com). The code in this tree has
+several clearly separated lineages so that reusers can tell who built what:
 
 - [antirez/ds4](https://github.com/antirez/ds4), by Salvatore Sanfilippo, is
-  the original inference engine and server foundation.
+  the upstream engine, model loader, CLI, API server and session-oriented
+  execution foundation.
+- The quantized-matmul implementation under `cuda/mmq` contains kernels from
+  [llama.cpp](https://github.com/ggml-org/llama.cpp), vendored through the
+  Entrpi integration. The exact upstream pin and per-file inventory are in
+  [`cuda/mmq/VENDOR.md`](cuda/mmq/VENDOR.md).
 - [Entrpi/ds4](https://github.com/Entrpi/ds4) is the source of the CUDA prefill
   foundation imported into this fork: routed-MoE D2R/MMQ tiers, aligned-SoA
   repack machinery, token-tile HMMA attention, DS4 MMQ adapters and associated
   tests/prototypes. Those components remain attributable to Entrpi/ds4 under
   the MIT License.
-- The MMQ implementation under `cuda/mmq` also contains kernels from
-  [llama.cpp](https://github.com/ggml-org/llama.cpp), vendored through the
-  Entrpi integration. The exact upstream pin and per-file inventory are in
-  [`cuda/mmq/VENDOR.md`](cuda/mmq/VENDOR.md).
-- Marco Palaferri's original work in this fork includes the DSpark GGUF
-  sidecar integration and lossless p/q verifier, HybridLC, the native SM121a
-  MXFP4 indexer scorer, single-pass fused gate/up with token-bound stream-K,
-  fused HC/RMS/RoPE/MoE epilogues and self-tests, the dynamic direct-F16
-  long-context path, KV/frontier handling, GB10 launch profiles, profiling,
-  packaging and subsequent adaptations made on top of the shared prefill
-  stack.
+- The original work authored by Marco Palaferri in this fork includes the
+  DSpark GGUF sidecar integration and lossless p/q verifier, HybridLC, the
+  native SM121a MXFP4 indexer scorer, single-pass fused gate/up with
+  token-bound stream-K, fused HC/RMS/RoPE/MoE epilogues and self-tests, the
+  dynamic direct-F16 long-context path, KV/frontier handling, GB10 launch
+  profiles, profiling, packaging and subsequent adaptations made on top of the
+  shared prefill stack.
 
 Source comments and commit history identify narrower adaptations, including
 the token-tile HMMA port from Entrpi/ds4 commits `47438d7` and `9de3044`.

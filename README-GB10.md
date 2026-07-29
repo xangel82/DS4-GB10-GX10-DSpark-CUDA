@@ -379,9 +379,9 @@ Il canary implementa ora direttamente l'Algoritmo 1 del paper
 [DSpark](https://arxiv.org/html/2607.05147v1), separato dal runtime CUDA in un
 modulo C puro e testabile. L'interfaccia accetta gia' `R` richieste identificate
 stabilmente, confidence condizionali diverse e una curva hardware `SPS(B)`
-comune. L'executor CUDA multi-sessione e' ora attivo nel backend fino a `R=3`;
-il server HTTP corrente continua a passargli una coorte di una richiesta finche'
-il loop di generazione non verra' trasformato in un coordinatore di coorte.
+comune. L'executor CUDA multi-sessione e' attivo nel backend fino a `R=3`. Il
+server HTTP dispone ora di due lane persistenti e puo' riunire due cicli DSpark
+indipendenti in una coorte fisica `R=2`.
 
 Per ogni richiesta vengono calcolate le probabilita' di sopravvivenza cumulative
 `a[r,j] = product(c[r,1..j])`. Tutte le estensioni `(r,j)` vengono ordinate
@@ -435,16 +435,35 @@ compressor, ring DSpark e distribuzioni `q` privati per sessione, appiattisce le
 righe request-major senza padding e lancia una sola pipeline target. La
 transazione conserva le frontier pre-verifica, applica rejection sampling p/q
 direttamente alle slice di logits sul device e committa un prefisso indipendente
-per lane senza rieseguire il verifier. Su GB10, sidecar Q2 e tre richieste da tre
-righe, il confronto con tre verifiche sequenziali ha dato parita' numerica e
-decisionale esatta con contesto fisico allocato a 262K e frontiera di prova a
-4.096 token. Due run indipendenti hanno misurato
-`375,273-381,547 ms -> 308,031-311,680 ms`, cioe' `1,218-1,224x` e
-`28,88-29,22` righe target/s aggregate. Le due lane aggiuntive usano `3,17 GiB`
-complessivi di stato privato; non aumentano la memoria permanente del normale
-serving `R=1`. La preparazione valida prima l'intera coorte e, in caso di errore
-CUDA, ripristina gli RNG di tutte le lane. `R=3` e' il limite operativo scelto
-sul profilo da 128 GiB; `R=4` non lascia un margine RAM accettabile.
+per lane senza rieseguire il verifier. Su GB10, sidecar Q2 e una coorte
+eterogenea `R=3` da `2+3+3=8` righe, il confronto con tre verifiche sequenziali
+ha dato parita' numerica e decisionale esatta (`rel-rmse=0`) con contesto fisico
+allocato a 262K e frontiera di prova a 4.096 token. Il verifier e' passato da
+`367,751 ms` a `177,127 ms`, cioe' `2,076x` e `45,17` righe target/s aggregate.
+
+La prima implementazione R=3 aveva esposto una discontinuita' nascosta: otto
+righe uscivano dai fast path Q8 e MoE limitati a `N<=6`, producendo sia
+divergenza numerica sia una perdita di throughput. Il percorso Q8 weight-reuse
+e il MoE aligned GB10 coprono ora esattamente `N<=8`; per `N<=6` resta una
+specializzazione separata, cosi' R=2 non paga registri o shared memory
+aggiuntivi. Le due lane oltre la principale usano `4.493,71 MiB` complessivi di
+stato privato; non aumentano la memoria permanente del normale serving `R=1`.
+La preparazione valida prima l'intera coorte e, in caso di errore CUDA,
+ripristina gli RNG di tutte le lane. `R=3` e' il limite operativo scelto sul
+profilo da 128 GiB; `R=4` non lascia un margine RAM accettabile.
+
+Il coordinatore conserva inoltre lo stesso contratto HybridLC del percorso
+`R=1`: ogni lane puo' estendere il prefisso neurale con righe retrieval sparse,
+usa BlockV lossless e mantiene il self-check CPU/GPU periodico sulle proprie
+slice di logits. Un fallimento prima del commit ripristina anche gli uniformi
+RNG aggiuntivi della coda; nel fallback seriale, una lane gia' conclusa non viene
+eseguita una seconda volta. Restore KV, rewind, invalidazione e un ritorno
+temporaneo a `R=1` svuotano le confidence ritardate ma preservano il contatore
+globale di maturita'. I due successivi passi `R>1` restano quindi causali, senza
+riportare ogni volta il gate nel warm-up fisico. Un fallback del verifier
+ripristina inoltre gli RNG target e HybridLC soltanto per le lane non
+committate. Queste correzioni non cambiano logits target, regola p/q, Top-K
+accessibile o distribuzione campionata.
 
 Un canary `R=2` separato, sulla stessa allocazione 262K e frontiera 4.096, ha
 confermato logits, Top-1, rejection p/q e commit indipendente esatti
@@ -452,21 +471,107 @@ confermato logits, Top-1, rejection p/q e commit indipendente esatti
 `212,170 ms` fisici, cioe' `1,176x` e `28,28` righe target/s aggregate; la
 seconda lane ha richiesto `2.246,36 MiB` di stato privato.
 
-Il test operativo con due client HTTP indipendenti ha poi mantenuto due socket
-contemporanei, ma il server ha eseguito le richieste in alternanza strettamente
-seriale. Fra `chatcmpl-9` e `chatcmpl-26` sono stati generati 7.953 token in
-368,2 secondi di decode (`21,60 t/s` ponderati); includendo prefill e attese in
-coda, il throughput wall-clock e' stato circa `17,36 t/s`. Le tool call si sono
-mosse prevalentemente fra 21 e 30 t/s, mentre le due risposte finali lunghe
-hanno chiuso a `17,17 t/s` (2.200 token) e `19,86 t/s` (940 token). Gli append
-prefill sostanziali sono rimasti circa fra 949 e 987 t/s. Il processo ha
-raggiunto 3,62 GiB RSS senza swap; durante l'osservazione il GB10 e' rimasto
-entro 65 C. E' stato osservato un `openai role chunk failed` dopo la chiusura di
-una risposta, senza arresto del server.
+Prima del coordinatore, un test operativo con due client HTTP indipendenti ha
+mantenuto due socket contemporanei ma ha eseguito le richieste in alternanza
+strettamente seriale. Fra `chatcmpl-9` e `chatcmpl-26` sono stati generati 7.953
+token in 368,2 secondi di decode (`21,60 t/s` ponderati); includendo prefill e
+attese in coda, il throughput wall-clock e' stato circa `17,36 t/s`. Le tool
+call si sono mosse prevalentemente fra 21 e 30 t/s, mentre le due risposte
+finali lunghe hanno chiuso a `17,17 t/s` (2.200 token) e `19,86 t/s` (940
+token). Gli append prefill sostanziali sono rimasti circa fra 949 e 987 t/s.
 
-Questo test non viene presentato come batching fisico: dimostra invece che il
-backend e' pronto e quantifica la baseline prima del coordinatore HTTP che
-interlacera' i cicli di generazione.
+### Coordinatore HTTP R=2 e canary R=3
+
+Il coordinatore mantiene da due a tre sessioni con KV, compressor, RNG e stato
+DSpark indipendenti. I pesi e lo scratch CUDA transiente restano condivisi. Il
+dispatcher considera vincolante il `call_id` di una tool continuation, evitando
+che una risposta torni sulla lane sbagliata. Per le richieste non vincolate
+sceglie prima la lane con meno job assegnati e usa il prefisso piu' lungo come
+tie-breaker fra lane con lo stesso carico. Questo evita che una lane con una
+buona affinita' storica monopolizzi anche client indipendenti, costringendola a
+scaricare e ricaricare checkpoint KV mentre la seconda lane resta vuota. Due
+o tre worker si incontrano ai confini dei cicli speculativi per un massimo
+predefinito di 500 microsecondi. Il rendezvous mira a tutte le lane attive,
+evitando che la prima coppia parta prima dell'arrivo della terza. Con
+`DS4_TELEMETRY=1`, la riga
+`coordinator dispatch` espone lane, carico, prefisso comune e lunghezza prompt.
+
+Il costo minimo del microbatch GB10 rende `K=1` equivalente, come forma
+hardware, al vecchio `K=0` con una riga ombra. Lo scheduler include quindi quel
+primo token nel baseline: la stessa riga pagata diventa lavoro utile e resta
+soggetta alla normale verifica target lossless.
+
+Il runtime misura separatamente il rate delle forme fisiche e quello delle
+verifiche seriali che riusano il draft gia' calcolato. Dopo 8 cicli iniziali
+sceglie la forma fisica soltanto quando supera la previsione seriale di almeno
+l'1%; le forme sconosciute vengono sondate ogni 64 cicli. In caso contrario
+esegue i verifier per lane senza rigenerare il draft. Questa selezione non
+modifica logits, p/q rejection, RNG, KV o distribuzione del modello target.
+
+Anche un cohort temporaneamente ridotto a `R=1` resta ora nel physical
+executor. Questo evita la cattura a freddo della famiglia CUDA Graph legacy
+quando una delle due richieste termina prima dell'altra e, soprattutto, non
+azzera la storia hardware-aware a ogni rendezvous mancato. Un server avviato
+con una sola lane continua a usare il percorso storico; il rollback esplicito
+del singleton coordinato e' `DS4_DSPARK_COORDINATOR_MODE=serial`.
+
+Con due richieste fisse da 512 token sullo stesso server:
+
+| Modalita' | Tempo wall | Throughput aggregate |
+| --- | ---: | ---: |
+| baseline, una lane seriale | 63,701 s | 16,075 t/s |
+| `R=2` fisico sempre attivo | 81,140 s | 12,620 t/s |
+| `R=2` con minimo hardware `K=1` | 66,940 s | 15,297 t/s |
+| coordinatore adattivo | 64,019 s | 15,995 t/s |
+| HC/QKV fisico + singleton legacy | 61,953 s | 16,529 t/s |
+| HC/QKV fisico + singleton fisico, media 3 run | 58,489 s | 17,511 t/s |
+
+Il primo gate adattivo eliminava la regressione del batching fisico forzato
+(-21,5%) e conservava la baseline entro lo 0,5%. Il percorso successivo esegue
+HC e proiezioni Q/KV una volta sul batch request-major, applica RoPE con la
+posizione assoluta di ogni riga e lascia KV, compressor e attention timeline
+privati per richiesta. Il verifier CUDA isolato e' passato da `170,371 ms` a
+`151,302 ms` (`1,417x -> 1,616x` rispetto alle verifiche sequenziali,
+`29,35 -> 33,05` righe/s) con `rel-rmse=0`.
+
+Nel test HTTP automatico i tre run R=2 hanno prodotto `18,24`, `17,24` e
+`17,08 t/s`, media `17,52 t/s`: +7,7% rispetto al baseline fisico da
+`16,27 t/s`, senza forzare la modalita'. Il run telemetrico separato ha
+confermato `17,55 t/s`: prima della conclusione del primo client sono stati
+formati 243 cohort R=2 e un solo R=1; gli 87 singleton successivi erano tutti
+la coda reale della richiesta piu' lunga. Il confronto R=1 ha misurato
+`13,79 t/s` al primo giro legacy, `15,74 t/s` a grafi caldi e `16,99 t/s`
+nel physical executor gia' caldo.
+
+Con la stessa build, prompt sintetico e 512 token per client, il canary R=3 ha
+prodotto `18,75` e `19,05 t/s` aggregate, media `18,90 t/s`: +7,9% rispetto
+al riferimento R=2 caldo da `17,52 t/s` e +16,2% rispetto al vecchio baseline
+da `16,27 t/s`. Le singole lane hanno misurato da `6,25` a `8,23 t/s`, come
+atteso quando tre richieste condividono la banda della stessa GB10. Un controllo
+R=2 sulla build N=8 ha misurato `16,73` e `17,52 t/s`, confermando l'assenza di
+regressioni sul profilo predefinito.
+
+Questi numeri sono throughput aggregato: una singola GB10 non raddoppia la
+banda disponibile, quindi due client non mantengono ciascuno il rate R=1.
+Il risultato corretto da osservare e' la somma dei token completati divisa per
+il wall time comune. La regressione CUDA copre parita' R=2 e R=3 di RoPE/raw
+ring, MXFP4 score + exact Top-K, compressor frontier, attention indicizzata,
+Q8 weight-reuse e MoE aligned; non sono stati aggiunti buffer permanenti oltre
+allo stato privato delle lane configurate.
+
+Il default e':
+
+```bash
+DS4_SERVER_DSPARK_LANES=2
+DS4_SERVER_DSPARK_COALESCE_US=500
+```
+
+`DS4_SERVER_DSPARK_LANES=1` ripristina il worker seriale consolidato. La seconda
+lane alloca il proprio contesto ma non duplica i pesi; nel canary a 262K ha
+richiesto circa 2,25 GiB di stato privato. Il coordinatore accetta anche
+`DS4_SERVER_DSPARK_LANES=3`: la terza lane viene allocata soltanto in questo
+profilo, mentre `R=4` resta escluso perche' non lascia un margine UMA sicuro sul
+GB10 da 128 GiB.
 
 ### STS offline autentico
 
@@ -2429,6 +2534,49 @@ la configurazione consigliata mantiene gli snapshot su NVMe; un eventuale
 hot-cache RAM piccolo va valutato soltanto come ottimizzazione del time-to-first
 token.
 
+Con piu' lane, una riga `live kv cache miss ... reason=token-mismatch` descrive
+soltanto il rifiuto della frontier attualmente residente in quella lane: non
+significa che sia fallita anche la ricerca nei checkpoint su disco. Il server
+prosegue cercando il prefisso testuale piu' lungo nella KV persistente. La
+sequenza che prova il riuso corretto e':
+
+```text
+live kv cache miss ... reason=token-mismatch
+kv cache hit text tokens=82605 ...
+chat ctx=82605..85184:2579 ... prompt start
+```
+
+In questo esempio non viene rifatto il prefill da zero: sono valutati soltanto
+i 2.579 token successivi al checkpoint. Un vero prefill completo e'
+riconoscibile invece da `chat ctx=0..N:N prompt start` senza un precedente
+`kv cache hit`. Il dispatcher load-aware riduce proprio i falsi cambi di
+frontier fra client indipendenti; i binding delle tool call continuano ad avere
+precedenza assoluta per preservare la KV campionata corretta.
+
+Il canary del coordinatore a due lane ha verificato anche i tre casi distinti:
+
+```text
+# richiesta identica sopra la soglia persistente
+kv cache hit text tokens=1051 ...
+chat ctx=1051..1051:0 prompt start
+
+# vero turno successivo: assistant precedente + nuovo user message
+kv cache hit text tokens=1052 ...
+chat ctx=1052..1067:15 prompt start
+
+# riscrittura dentro il vecchio user message
+live kv cache miss live=1052 prompt=1063 common=1049 reason=token-mismatch
+chat ctx=0..1063:1063 prompt start
+```
+
+Nel secondo caso l'API ha riportato `cached_tokens=1052` e
+`cache_write_tokens=15`: sono stati prefilleati soltanto i 15 token nuovi. Il
+terzo caso deve invece essere ricostruito, perche' i token modificati precedono
+la frontier salvata. Prompt inferiori a `--kv-cache-min-tokens` non producono
+una snapshot persistente del solo confine prompt; ripetere una richiesta corta
+dopo una generazione lunga puo' quindi richiedere un nuovo prefill, pur essendo
+il percorso KV per le chat lunghe perfettamente operativo.
+
 Comandi utili:
 
 ```bash
@@ -2544,8 +2692,25 @@ tool live continuation match=visible-prefix cached=... prompt=...
 ```
 
 Nel client Athena provato il binding viene registrato, ma il prompt successivo
-non coincide ancora con quella rappresentazione e compare `live kv cache miss`.
-Entra quindi in funzione la seconda rete di sicurezza: il salvataggio
+non coincideva ancora con quella rappresentazione e compariva
+`live kv cache miss`. Il percorso Chat Completions ora usa anche il
+`tool_call_id` come legame semantico con la frontier campionata. Il fast path
+viene ammesso soltanto quando coincidono:
+
+- tutti gli ID della tool call, senza risultati parziali;
+- lo stesso contratto/schema degli strumenti;
+- la posizione della frontier viva e la lane che la possiede.
+
+In quel caso il server conserva la KV campionata, inclusi reasoning nascosto e
+DSML esatto, e tokenizza soltanto `EOS + tool result + nuovo prefisso
+assistant`. Il log atteso e':
+
+```text
+chat live continuation match=tool-call-ids ids=... cached=... prompt=... replay=...
+```
+
+Se uno solo dei vincoli non coincide, il percorso viene ignorato e resta
+attiva la seconda rete di sicurezza: il salvataggio
 `reason=evict` identifica il piu' lungo checkpoint testuale compatibile con la
 richiesta entrante e lo espelle solo dopo tutti i candidati non correlati. Il
 log osservato e':
@@ -2563,10 +2728,25 @@ I replay sono rimasti limitati alle code effettivamente nuove: 3.671 token in
 tra 21,86 e 23,05 t/s.
 
 La suite server copre sia la costruzione del transcript post-tool sia la
-retention del prefisso lungo contro un anchor favorito dall'euristica. Rimane
-un'ottimizzazione separata: accettare anche la rappresentazione senza reasoning
-usata dal client e trasformare il fallback NVMe nel vero hit RAM
-`tool live continuation`.
+retention del prefisso lungo contro un anchor favorito dall'euristica. Copre
+inoltre anchor differente, insieme di tool result incompleto e dispatch verso
+la lane proprietaria. Il binding aggiunge soltanto ID e testo di controllo per
+lane; non alloca una seconda KV e non aumenta il numero delle snapshot GPU.
+
+Il test end-to-end controllato su Athena usa una Chat Completions tool call,
+restituisce il risultato con lo stesso `tool_call_id` e omette il reasoning
+nascosto dalla replay client. Prima della correzione il secondo turno riportava
+`cached_tokens=0` e `live kv cache miss`. Con il binding semantico:
+
+```text
+chat tool binding remembered lane=0 live=398 ids=1 schema=18
+chat live continuation match=tool-call-ids ids=1 cached=398 prompt=417 replay=19
+```
+
+Il secondo turno ha quindi riutilizzato tutti i 398 token della frontier
+campionata e ha valutato soltanto 19 token di coda. La risposta e' rimasta
+corretta; il test non modifica sampling, logits, KV accessibile o acceptance
+DSpark.
 
 ### Nota storica sul deploy
 
@@ -3355,7 +3535,7 @@ DS4_DSPARK_CHAMPION_MARGIN=...  margine sul target ordinario (default 1.01)
 DS4_DSPARK_CHAMPION_EXIT_MARGIN margine di uscita isteretico (default 0.98)
 DS4_CUDA_MOE_TINY_DIRECT=1      percorso MoE diretto per verifier da 2..6 righe
 DS4_CUDA_MOE_TINY_DIRECT_Q4_ONLY=1 limita il direct-MoE al sidecar Q4
-DS4_CUDA_Q8_BATCH_REUSE=1       riusa i pesi Q8 tra 2..6 righe verifier
+DS4_CUDA_Q8_BATCH_REUSE=1       riusa i pesi Q8 tra 2..8 righe verifier
 DS4_CUDA_NO_BATCHED_ARGMAX=1    rollback argmax parallelo multi-riga
 ```
 

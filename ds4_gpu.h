@@ -1095,6 +1095,34 @@ int ds4_gpu_attention_indexed_mixed_rn_ptrs_heads_tensor(
         uint32_t                n_head,
         uint32_t                head_dim);
 
+/* Request-aware dense HCA/raw attention for a physical multi-session batch.
+ * Each row resolves an independent KV ring through the device pointer tables;
+ * compressed rows remain dense and preserve the R=1 reduction order. */
+int ds4_gpu_attention_mixed_rn_ptrs_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_cache_table,
+        const ds4_gpu_tensor *comp_cache_table,
+        uint32_t                comp_kv_f16,
+        const ds4_gpu_tensor *row_request,
+        const ds4_gpu_tensor *row_position,
+        const ds4_gpu_tensor *request_position,
+        const ds4_gpu_tensor *request_rows,
+        const ds4_gpu_tensor *request_n_raw,
+        const ds4_gpu_tensor *request_raw_start,
+        const ds4_gpu_tensor *request_n_comp,
+        uint32_t                row_count,
+        uint32_t                request_count,
+        uint32_t                raw_cap,
+        uint32_t                comp_cap,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim);
+
 int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,

@@ -614,7 +614,23 @@ static int run_physical_rn_smoke(
             request_count = (uint32_t)parsed;
         }
     }
-    const int prefix_len = prompt->len > 4099 ? 4096 : prompt->len - 3;
+    int prefix_len = prompt->len > 4099 ? 4096 : prompt->len - 3;
+    const char *prefix_env = getenv("DS4_BENCH_PHYSICAL_RN_PREFIX");
+    if (prefix_env && prefix_env[0]) {
+        char *end = NULL;
+        const unsigned long parsed = strtoul(prefix_env, &end, 10);
+        if (end == prefix_env || *end != '\0' ||
+            parsed < 512u ||
+            parsed > (unsigned long)(prompt->len - 3)) {
+            fprintf(stderr,
+                    "ds4-bench: invalid DS4_BENCH_PHYSICAL_RN_PREFIX=%s "
+                    "(expected 512..%d)\n",
+                    prefix_env,
+                    prompt->len - 3);
+            return 1;
+        }
+        prefix_len = (int)parsed;
+    }
     ds4_tokens prefix = {
         .v = prompt->v,
         .len = prefix_len,
@@ -753,8 +769,9 @@ static int run_physical_rn_smoke(
             .session = sessions[r],
             .tokens = &physical_tokens[r],
             .start = (uint32_t)prefix_len,
-            .rows = 3,
-            .capture_prefixes = 2,
+            .rows = r == 0u ? 2u : 3u,
+            .capture_prefixes = r == 0u ? 1u : 2u,
+            .shadow_tail_rows = r == 0u ? 1u : 0u,
             .row_tops = tops[r],
             .row_logits = row_logits[r],
             .continuation_logits = logits[r],
@@ -797,14 +814,22 @@ static int run_physical_rn_smoke(
     }
     double squared = 0.0;
     double reference = 0.0;
+    double lane_squared[4] = {0.0};
+    double lane_reference[4] = {0.0};
     if (rc == 0) {
         for (uint32_t r = 0; r < request_count; r++) {
-            for (uint32_t i = 0; i < 3u * 129280u; i++) {
+            for (uint32_t i = 0;
+                 i < request[r].rows * 129280u;
+                 i++) {
                 const double delta =
                     (double)row_logits[r][i] -
                     (double)sequential_row_logits[r][i];
                 squared += delta * delta;
+                lane_squared[r] += delta * delta;
                 reference +=
+                    (double)sequential_row_logits[r][i] *
+                    (double)sequential_row_logits[r][i];
+                lane_reference[r] +=
                     (double)sequential_row_logits[r][i] *
                     (double)sequential_row_logits[r][i];
             }
@@ -815,10 +840,17 @@ static int run_physical_rn_smoke(
     bool parity = rc == 0 && isfinite(rel_rmse) &&
                   rel_rmse <= 1.0e-5;
     for (uint32_t r = 0; parity && r < request_count; r++) {
-        parity = tops[r][0] == sequential_tops[r][0] &&
-                 tops[r][1] == sequential_tops[r][1] &&
+        for (uint32_t row = 0;
+             parity &&
+                 row + 1u + request[r].shadow_tail_rows <
+                     request[r].rows;
+             row++) {
+            parity = tops[r][row] == sequential_tops[r][row];
+        }
+        parity = parity &&
                  memcmp(logits[r],
-                        row_logits[r] + (size_t)2 * 129280,
+                        row_logits[r] +
+                            (size_t)(request[r].rows - 1u) * 129280,
                         (size_t)129280 * sizeof(float)) == 0;
     }
 
@@ -920,6 +952,15 @@ static int run_physical_rn_smoke(
                 txn, NULL, 0);
     }
     if (!parity) {
+        fprintf(stderr, "ds4-bench: physical R=%u lane rel-rmse",
+                request_count);
+        for (uint32_t r = 0; r < request_count; r++) {
+            const double lane_rel_rmse = lane_reference[r] > 0.0
+                ? sqrt(lane_squared[r] / lane_reference[r])
+                : sqrt(lane_squared[r]);
+            fprintf(stderr, " r%u=%.8f", r, lane_rel_rmse);
+        }
+        fprintf(stderr, "\n");
         fprintf(stderr,
                 "ds4-bench: physical R=%u parity failed "
                 "rel-rmse=%.8f error=%s\n",
@@ -929,6 +970,10 @@ static int run_physical_rn_smoke(
         rc = 1;
     } else {
         double private_mib = 0.0;
+        uint32_t total_rows = 0u;
+        for (uint32_t r = 0; r < request_count; r++) {
+            total_rows += request[r].rows;
+        }
         for (uint32_t r = 1; r < request_count; r++) {
             private_mib +=
                 (double)ds4_session_private_device_bytes(sessions[r]) /
@@ -936,18 +981,18 @@ static int run_physical_rn_smoke(
         }
         fprintf(stderr,
                 "ds4-bench: physical R=%u verifier parity OK "
-                "tops=[%d %d] rel-rmse=%.8f "
+                "tops=[r0:%d r1:%d] rel-rmse=%.8f "
                 "sequential=%.3fms physical=%.3fms speedup=%.3fx "
                 "aggregate_rows_per_s=%.2f lane-private-total=%.2f MiB\n",
                 request_count,
-                tops[0][0], tops[0][1],
+                tops[0][0], request_count > 1u ? tops[1][0] : -1,
                 rel_rmse,
                 sequential_seconds * 1000.0 / timing_runs,
                 physical_seconds * 1000.0 / timing_runs,
                 physical_seconds > 0.0
                     ? sequential_seconds / physical_seconds : 0.0,
                 physical_seconds > 0.0
-                    ? (double)(request_count * 3u * timing_runs) /
+                    ? (double)(total_rows * timing_runs) /
                       physical_seconds : 0.0,
                 private_mib);
         fprintf(stderr,

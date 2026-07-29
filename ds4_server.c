@@ -649,6 +649,15 @@ typedef struct {
     bool anthropic_requires_live_tool_state;
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
+    /* Chat Completions tool continuation contract:
+     *
+     * The client replays the whole visible history, but the assistant tool-call
+     * turn in live KV may contain hidden reasoning or sampled DSML bytes that
+     * are not byte-identical to that replay.  The prior prompt and exact call
+     * ids bind the incoming tool-result tail to the sampled frontier. */
+    stop_list chat_live_call_ids;
+    char *chat_live_schema_text;
+    char *chat_live_suffix_text;
     tool_replay_stats tool_replay;
 } request;
 
@@ -789,6 +798,10 @@ static void request_free(request *r) {
     stop_list_clear(&r->anthropic_live_call_ids);
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
+    stop_list_clear(&r->chat_live_call_ids);
+    free(r->chat_live_call_ids.v);
+    free(r->chat_live_schema_text);
+    free(r->chat_live_suffix_text);
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
 }
@@ -2477,6 +2490,25 @@ static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
     }
 }
 
+static char *tool_schema_signature(const tool_schema_orders *orders,
+                                   bool enabled) {
+    buf out = {0};
+    if (!enabled || !orders) return buf_take(&out);
+    for (int i = 0; i < orders->len; i++) {
+        const tool_schema_order *o = &orders->v[i];
+        buf_puts(&out, o->namespace ? o->namespace : "");
+        buf_putc(&out, '/');
+        buf_puts(&out, o->wire_name ? o->wire_name :
+                       (o->name ? o->name : ""));
+        for (int j = 0; j < o->len; j++) {
+            buf_putc(&out, '\x1f');
+            buf_puts(&out, o->prop[j] ? o->prop[j] : "");
+        }
+        buf_putc(&out, '\n');
+    }
+    return buf_take(&out);
+}
+
 static const chat_msg *responses_find_prior_call_msg(const chat_msgs *msgs,
                                                      int before,
                                                      const char *id) {
@@ -2660,6 +2692,67 @@ static void anthropic_prepare_live_continuation(request *r,
         render_live_tool_tail(msgs, tail_start, r->think_mode);
 }
 
+/* Prepare a protocol-bound Chat Completions continuation.
+ *
+ * Unlike Responses, Chat Completions replays the prior assistant tool_calls
+ * object.  Do not use that visible object as the KV prefix: it may omit hidden
+ * reasoning or reconstruct the sampled DSML differently.  Instead, prove that
+ * the history before the assistant call is exactly the prompt that produced
+ * the live frontier, bind the frontier with the call IDs, and append only the
+ * messages following that assistant call.
+ *
+ * This is deliberately conservative.  A partial tool result set, an assistant
+ * message after the candidate call, or an ID not owned by that call disables
+ * the fast path and leaves normal token/text/disk replay untouched. */
+static void chat_prepare_live_continuation(request *r,
+                                           const chat_msgs *msgs) {
+    if (!r || r->api != API_OPENAI || !msgs || msgs->len == 0) return;
+
+    int anchor = -1;
+    for (int i = msgs->len - 1; i >= 0; i--) {
+        const chat_msg *m = &msgs->v[i];
+        if (!strcmp(m->role, "assistant") && m->calls.len > 0) {
+            anchor = i;
+            break;
+        }
+    }
+    if (anchor < 0 || anchor + 1 >= msgs->len) return;
+
+    bool saw_tool_result = false;
+    stop_list ids = {0};
+    for (int i = anchor + 1; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!strcmp(m->role, "assistant")) goto no_match;
+        if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
+            chat_msg_collect_tool_call_ids(m, &ids);
+            saw_tool_result = true;
+        } else if (!strcmp(m->role, "user")) {
+            if (!saw_tool_result) goto no_match;
+        } else if (!role_is_system(m->role)) {
+            goto no_match;
+        }
+    }
+    if (!saw_tool_result || ids.len == 0) goto no_match;
+
+    const chat_msg *assistant = &msgs->v[anchor];
+    for (int i = 0; i < ids.len; i++) {
+        if (!chat_msg_has_call_id(assistant, ids.v[i])) goto no_match;
+    }
+    if (ids.len != assistant->calls.len) goto no_match;
+
+    stop_list_clear(&r->chat_live_call_ids);
+    for (int i = 0; i < ids.len; i++) {
+        id_list_push_unique(&r->chat_live_call_ids, ids.v[i]);
+    }
+
+    free(r->chat_live_suffix_text);
+    r->chat_live_suffix_text =
+        render_live_tool_tail(msgs, anchor + 1, r->think_mode);
+
+no_match:
+    id_list_free(&ids);
+}
+
 /* The API parsers are intentionally selective JSON parsers: they keep only
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
@@ -2823,6 +2916,10 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     kv_cache_restore_tool_memory_for_messages(s, &msgs);
     tool_memory_attach_to_messages(s, &msgs, &r->tool_replay);
     const char *active_tool_schemas = r->has_tools ? tool_schemas : NULL;
+    free(r->chat_live_schema_text);
+    r->chat_live_schema_text =
+        tool_schema_signature(&r->tool_orders, r->has_tools);
+    chat_prepare_live_continuation(r, &msgs);
     r->prompt_preserves_reasoning =
         chat_history_uses_tool_context(&msgs, active_tool_schemas);
     r->prompt_text = render_chat_prompt_text(&msgs, active_tool_schemas,
@@ -7893,6 +7990,8 @@ typedef struct {
 } visible_live_state;
 
 #define DS4_SERVER_GPU_FRONTIER_SLOTS 4u
+#define DS4_SERVER_DSPARK_DEFAULT_LANES 2u
+#define DS4_SERVER_DSPARK_MAX_LANES 3u
 
 typedef struct {
     uint64_t snapshot_id;
@@ -7906,12 +8005,19 @@ static bool id_list_contains(const stop_list *ids, const char *id);
 static void id_list_push_unique(stop_list *ids, const char *id);
 
 struct server {
+    struct server *root;
+    struct server **lanes;
+    uint32_t lane_count;
+    uint32_t lane_id;
+    uint32_t assigned_jobs;
+    ds4_tokens affinity;
     ds4_engine *engine;
     ds4_session *session;
     int default_tokens;
     int advertised_ctx_size;
     kv_disk_cache kv;
     tool_memory tool_mem;
+    live_tool_state chat_live;
     live_tool_state responses_live;
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
@@ -7931,6 +8037,18 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    pthread_mutex_t gpu_mu;
+    pthread_mutex_t cycle_mu;
+    pthread_cond_t cycle_cv;
+    bool cycle_running;
+    bool decode_active;
+    struct {
+        bool pending;
+        bool done;
+        int rc;
+        ds4_speculative_request request;
+        char err[160];
+    } cycle[DS4_SERVER_DSPARK_MAX_LANES];
     /* One-shot authorization for restoring the canonical pre-decode
      * checkpoint after a failed streaming write.  The exact prompt identity
      * prevents an unrelated client from rewinding the live session. */
@@ -7957,8 +8075,75 @@ struct job {
     bool done;
     pthread_mutex_t mu;
     pthread_cond_t cv;
+    uint32_t lane_id;
     job *next;
 };
+
+static server *server_root(server *s) {
+    return s && s->root ? s->root : s;
+}
+
+static kv_disk_cache *server_kv(server *s) {
+    server *root = server_root(s);
+    return root ? &root->kv : NULL;
+}
+
+static tool_memory *server_tool_memory(server *s) {
+    server *root = server_root(s);
+    return root ? &root->tool_mem : NULL;
+}
+
+static pthread_mutex_t *server_tool_mutex(server *s) {
+    server *root = server_root(s);
+    return root ? &root->tool_mu : NULL;
+}
+
+static FILE *server_trace_file(server *s) {
+    server *root = server_root(s);
+    return root ? root->trace : NULL;
+}
+
+static pthread_mutex_t *server_trace_mutex(server *s) {
+    server *root = server_root(s);
+    return root ? &root->trace_mu : NULL;
+}
+
+static void server_gpu_enter(server *s) {
+    pthread_mutex_lock(&server_root(s)->gpu_mu);
+}
+
+static void server_gpu_leave(server *s) {
+    pthread_mutex_unlock(&server_root(s)->gpu_mu);
+}
+
+static int token_prefix_len(const ds4_tokens *a, const ds4_tokens *b) {
+    if (!a || !b) return 0;
+    int n = a->len < b->len ? a->len : b->len;
+    int i = 0;
+    while (i < n && a->v[i] == b->v[i]) i++;
+    return i;
+}
+
+static void server_lane_update_affinity(server *lane) {
+    if (!lane || !lane->session) return;
+    const ds4_tokens *tokens = ds4_session_tokens(lane->session);
+    server *root = server_root(lane);
+    pthread_mutex_lock(&root->mu);
+    if (tokens && tokens->len > 0) {
+        if (lane->affinity.cap < tokens->len) {
+            lane->affinity.v = xrealloc(
+                    lane->affinity.v,
+                    (size_t)tokens->len * sizeof(lane->affinity.v[0]));
+            lane->affinity.cap = tokens->len;
+        }
+        memcpy(lane->affinity.v, tokens->v,
+               (size_t)tokens->len * sizeof(tokens->v[0]));
+        lane->affinity.len = tokens->len;
+    } else {
+        lane->affinity.len = 0;
+    }
+    pthread_mutex_unlock(&root->mu);
+}
 
 static void stream_retry_guard_arm(server *s, const request *r) {
     if (!s) return;
@@ -8227,28 +8412,28 @@ static void visible_live_free(visible_live_state *st) {
 
 static void thinking_live_clear(server *s) {
     if (!s) return;
-    pthread_mutex_lock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
     visible_live_clear_locked(&s->thinking_live);
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_unlock(server_tool_mutex(s));
 }
 
 static void thinking_live_remember(server *s, const char *visible_text,
                                    bool tool_checkpoint) {
     if (!s || !visible_text || !visible_text[0]) return;
-    pthread_mutex_lock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
     visible_live_clear_locked(&s->thinking_live);
     s->thinking_live.visible_text = xstrdup(visible_text);
     s->thinking_live.visible_len = strlen(visible_text);
     s->thinking_live.live_tokens = ds4_session_pos(s->session);
     s->thinking_live.tool_checkpoint = tool_checkpoint;
     s->thinking_live.valid = true;
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_unlock(server_tool_mutex(s));
 }
 
 static void responses_live_remember(server *s, const char *visible_text,
                                     const tool_calls *calls) {
     if (!s || !visible_text || !visible_text[0]) return;
-    pthread_mutex_lock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
     live_tool_state_clear_locked(&s->responses_live);
     s->responses_live.visible_text = xstrdup(visible_text);
     s->responses_live.visible_len = strlen(visible_text);
@@ -8259,86 +8444,182 @@ static void responses_live_remember(server *s, const char *visible_text,
     }
     s->responses_live.live_tokens = ds4_session_pos(s->session);
     s->responses_live.valid = true;
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_unlock(server_tool_mutex(s));
 }
 
 static void anthropic_live_remember(server *s, const tool_calls *calls) {
     if (!s || !calls || calls->len == 0) return;
-    pthread_mutex_lock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
     live_tool_state_clear_locked(&s->anthropic_live);
     for (int i = 0; i < calls->len; i++) {
         id_list_push_unique(&s->anthropic_live.call_ids, calls->v[i].id);
     }
     s->anthropic_live.live_tokens = ds4_session_pos(s->session);
     s->anthropic_live.valid = s->anthropic_live.call_ids.len > 0;
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_unlock(server_tool_mutex(s));
+}
+
+static void chat_live_remember(server *s, const char *schema_text,
+                               const tool_calls *calls) {
+    if (!s || !schema_text || !calls || calls->len == 0) return;
+    pthread_mutex_lock(server_tool_mutex(s));
+    live_tool_state_clear_locked(&s->chat_live);
+    s->chat_live.visible_text = xstrdup(schema_text);
+    s->chat_live.visible_len = strlen(schema_text);
+    for (int i = 0; i < calls->len; i++) {
+        id_list_push_unique(&s->chat_live.call_ids, calls->v[i].id);
+    }
+    s->chat_live.live_tokens = ds4_session_pos(s->session);
+    s->chat_live.valid = s->chat_live.call_ids.len > 0;
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: chat tool binding remembered lane=%u live=%d ids=%d schema=%zu",
+               s->lane_id, s->chat_live.live_tokens,
+               s->chat_live.call_ids.len, s->chat_live.visible_len);
+    pthread_mutex_unlock(server_tool_mutex(s));
+}
+
+static void chat_live_clear(server *s) {
+    if (!s) return;
+    pthread_mutex_lock(server_tool_mutex(s));
+    live_tool_state_clear_locked(&s->chat_live);
+    pthread_mutex_unlock(server_tool_mutex(s));
 }
 
 static void responses_live_clear(server *s) {
     if (!s) return;
-    pthread_mutex_lock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
     live_tool_state_clear_locked(&s->responses_live);
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_unlock(server_tool_mutex(s));
 }
 
 static void anthropic_live_clear(server *s) {
     if (!s) return;
-    pthread_mutex_lock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
     live_tool_state_clear_locked(&s->anthropic_live);
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_unlock(server_tool_mutex(s));
 }
 
 static bool responses_live_has_call_id(server *s, const char *id) {
     if (!s || !id || !id[0]) return false;
-    pthread_mutex_lock(&s->tool_mu);
-    bool found = s->responses_live.valid &&
-                 id_list_contains(&s->responses_live.call_ids, id);
-    pthread_mutex_unlock(&s->tool_mu);
+    server *root = server_root(s);
+    pthread_mutex_lock(server_tool_mutex(s));
+    bool found = false;
+    const uint32_t lanes = root->lane_count ? root->lane_count : 1u;
+    for (uint32_t i = 0; i < lanes && !found; i++) {
+        server *lane = root->lanes ? root->lanes[i] : root;
+        found = lane && lane->responses_live.valid &&
+            id_list_contains(&lane->responses_live.call_ids, id);
+    }
+    pthread_mutex_unlock(server_tool_mutex(s));
     return found;
 }
 
 static bool anthropic_live_has_call_id(server *s, const char *id) {
     if (!s || !id || !id[0]) return false;
-    pthread_mutex_lock(&s->tool_mu);
-    bool found = s->anthropic_live.valid &&
-                 id_list_contains(&s->anthropic_live.call_ids, id);
-    pthread_mutex_unlock(&s->tool_mu);
+    server *root = server_root(s);
+    pthread_mutex_lock(server_tool_mutex(s));
+    bool found = false;
+    const uint32_t lanes = root->lane_count ? root->lane_count : 1u;
+    for (uint32_t i = 0; i < lanes && !found; i++) {
+        server *lane = root->lanes ? root->lanes[i] : root;
+        found = lane && lane->anthropic_live.valid &&
+            id_list_contains(&lane->anthropic_live.call_ids, id);
+    }
+    pthread_mutex_unlock(server_tool_mutex(s));
     return found;
 }
 
 static bool responses_live_matches_request(server *s, const stop_list *ids,
                                            int live_tokens) {
     if (!s || !ids || ids->len == 0) return false;
-    pthread_mutex_lock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
     bool ok = s->responses_live.valid &&
               s->responses_live.live_tokens == live_tokens &&
               s->responses_live.call_ids.len == ids->len;
     for (int i = 0; ok && i < ids->len; i++) {
         ok = id_list_contains(&s->responses_live.call_ids, ids->v[i]);
     }
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_unlock(server_tool_mutex(s));
     return ok;
 }
 
 static bool anthropic_live_matches_request(server *s, const stop_list *ids,
                                            int live_tokens) {
     if (!s || !ids || ids->len == 0) return false;
-    pthread_mutex_lock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
     bool ok = s->anthropic_live.valid &&
               s->anthropic_live.live_tokens == live_tokens &&
               s->anthropic_live.call_ids.len == ids->len;
     for (int i = 0; ok && i < ids->len; i++) {
         ok = id_list_contains(&s->anthropic_live.call_ids, ids->v[i]);
     }
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_unlock(server_tool_mutex(s));
     return ok;
+}
+
+static bool chat_live_matches_request(server *s, const request *req,
+                                      int live_tokens) {
+    if (!s || !req || req->api != API_OPENAI ||
+        req->chat_live_call_ids.len == 0 ||
+        !req->chat_live_schema_text) return false;
+    pthread_mutex_lock(server_tool_mutex(s));
+    bool ok = s->chat_live.valid &&
+              s->chat_live.live_tokens == live_tokens &&
+              s->chat_live.call_ids.len == req->chat_live_call_ids.len &&
+              s->chat_live.visible_text &&
+              !strcmp(s->chat_live.visible_text,
+                      req->chat_live_schema_text);
+    for (int i = 0; ok && i < req->chat_live_call_ids.len; i++) {
+        ok = id_list_contains(&s->chat_live.call_ids,
+                              req->chat_live_call_ids.v[i]);
+    }
+    pthread_mutex_unlock(server_tool_mutex(s));
+    return ok;
+}
+
+static void chat_live_log_miss(server *s, const request *req,
+                               int live_tokens) {
+    if (!s || !req || req->chat_live_call_ids.len == 0) return;
+    pthread_mutex_lock(server_tool_mutex(s));
+    const bool schema_match =
+        s->chat_live.visible_text && req->chat_live_schema_text &&
+        !strcmp(s->chat_live.visible_text, req->chat_live_schema_text);
+    size_t schema_common = 0;
+    const size_t state_schema_len =
+        s->chat_live.visible_text ? strlen(s->chat_live.visible_text) : 0;
+    const size_t request_schema_len =
+        req->chat_live_schema_text ? strlen(req->chat_live_schema_text) : 0;
+    const size_t schema_min =
+        state_schema_len < request_schema_len ?
+        state_schema_len : request_schema_len;
+    while (schema_common < schema_min &&
+           s->chat_live.visible_text[schema_common] ==
+           req->chat_live_schema_text[schema_common]) {
+        schema_common++;
+    }
+    int matched_ids = 0;
+    for (int i = 0; i < req->chat_live_call_ids.len; i++) {
+        if (id_list_contains(&s->chat_live.call_ids,
+                             req->chat_live_call_ids.v[i])) {
+            matched_ids++;
+        }
+    }
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: chat tool binding miss lane=%u valid=%d live=%d/%d ids=%d/%d schema=%d bytes=%zu/%zu common=%zu",
+               s->lane_id, s->chat_live.valid ? 1 : 0,
+               s->chat_live.live_tokens, live_tokens,
+               matched_ids, req->chat_live_call_ids.len,
+               schema_match ? 1 : 0,
+               state_schema_len, request_schema_len, schema_common);
+    pthread_mutex_unlock(server_tool_mutex(s));
 }
 
 static bool tool_memory_has_id(server *s, const char *id) {
     if (!s || s->disable_exact_dsml_tool_replay || !id || !id[0]) return false;
-    pthread_mutex_lock(&s->tool_mu);
-    bool found = tool_memory_find_entry_locked(&s->tool_mem, id) != NULL;
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
+    bool found =
+        tool_memory_find_entry_locked(server_tool_memory(s), id) != NULL;
+    pthread_mutex_unlock(server_tool_mutex(s));
     return found;
 }
 
@@ -8356,21 +8637,22 @@ static const char *tool_memory_lookup_locked(tool_memory *m, const char *id,
 static void tool_memory_remember(server *s, const tool_calls *calls) {
     if (!s || s->disable_exact_dsml_tool_replay ||
         !calls || !calls->raw_dsml || !calls->raw_dsml[0]) return;
-    pthread_mutex_lock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
     for (int i = 0; i < calls->len; i++) {
-        tool_memory_put_locked(&s->tool_mem, calls->v[i].id, calls->raw_dsml,
+        tool_memory_put_locked(server_tool_memory(s),
+                               calls->v[i].id, calls->raw_dsml,
                                TOOL_MEMORY_RAM);
     }
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_unlock(server_tool_mutex(s));
 }
 
 static void tool_memory_put_source(server *s, const char *id, const char *dsml,
                                    tool_memory_source source) {
     if (!s || s->disable_exact_dsml_tool_replay ||
         !id || !id[0] || !dsml || !dsml[0]) return;
-    pthread_mutex_lock(&s->tool_mu);
-    tool_memory_put_locked(&s->tool_mem, id, dsml, source);
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
+    tool_memory_put_locked(server_tool_memory(s), id, dsml, source);
+    pthread_mutex_unlock(server_tool_mutex(s));
 }
 
 #ifdef DS4_SERVER_TEST
@@ -8393,7 +8675,7 @@ static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
         }
         return;
     }
-    pthread_mutex_lock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
     for (int i = 0; i < msgs->len; i++) {
         tool_calls *calls = &msgs->v[i].calls;
         if (calls->len == 0 || calls->raw_dsml) continue;
@@ -8405,7 +8687,8 @@ static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
             tool_memory_source source = TOOL_MEMORY_DISK;
             tool_memory_block *block = NULL;
             const char *dsml =
-                tool_memory_lookup_locked(&s->tool_mem, calls->v[j].id,
+                tool_memory_lookup_locked(server_tool_memory(s),
+                                          calls->v[j].id,
                                           &source, &block);
             if (!dsml) {
                 exact = false;
@@ -8431,7 +8714,7 @@ static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
             stats->missing_ids += missing;
         }
     }
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_unlock(server_tool_mutex(s));
 }
 
 static bool tool_calls_contains_id(const tool_calls *calls, const char *id, int upto) {
@@ -8640,14 +8923,16 @@ static bool kv_tool_map_measure_locked(server *s, const char *text,
                                        uint64_t *bytes_out) {
     uint32_t count = 0;
     uint64_t bytes = KV_TOOL_MAP_HEADER;
-    uint64_t scan = ++s->tool_mem.scan_clock;
+    tool_memory *memory = server_tool_memory(s);
+    uint64_t scan = ++memory->scan_clock;
     const char *p = text;
     for (;;) {
         const char *end = NULL;
         const char *start = find_next_dsml_tool_block(p, &end);
         if (!start || !end) break;
         tool_memory_block *b =
-            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
+            tool_memory_find_block_locked(memory, start,
+                                          (size_t)(end - start));
         if (b && b->seen != scan) {
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; e; e = e->block_next) {
@@ -8676,9 +8961,9 @@ static bool kv_tool_map_serialized_size(server *s, const char *text,
     if (bytes_out) *bytes_out = 0;
     if (!s || s->disable_exact_dsml_tool_replay || !text || !text[0]) return true;
 
-    pthread_mutex_lock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
     bool ok = kv_tool_map_measure_locked(s, text, NULL, bytes_out);
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_unlock(server_tool_mutex(s));
     return ok;
 }
 
@@ -8687,16 +8972,16 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
     if (written_bytes) *written_bytes = 0;
     if (!s || s->disable_exact_dsml_tool_replay || !fp || !text || !text[0]) return true;
 
-    pthread_mutex_lock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
     uint32_t count = 0;
     uint64_t bytes = 0;
     bool ok = kv_tool_map_measure_locked(s, text, &count, &bytes);
     if (!ok) {
-        pthread_mutex_unlock(&s->tool_mu);
+        pthread_mutex_unlock(server_tool_mutex(s));
         return false;
     }
     if (count == 0) {
-        pthread_mutex_unlock(&s->tool_mu);
+        pthread_mutex_unlock(server_tool_mutex(s));
         return true;
     }
 
@@ -8708,14 +8993,16 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
     le_put32(h + 4, count);
     ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h);
 
-    uint64_t scan = ++s->tool_mem.scan_clock;
+    tool_memory *memory = server_tool_memory(s);
+    uint64_t scan = ++memory->scan_clock;
     const char *p = text;
     for (;;) {
         const char *end = NULL;
         const char *start = find_next_dsml_tool_block(p, &end);
         if (!start || !end || !ok) break;
         tool_memory_block *b =
-            tool_memory_find_block_locked(&s->tool_mem, start, (size_t)(end - start));
+            tool_memory_find_block_locked(memory, start,
+                                          (size_t)(end - start));
         if (b && b->seen != scan) {
             b->seen = scan;
             for (tool_memory_entry *e = b->entries; ok && e; e = e->block_next) {
@@ -8732,7 +9019,7 @@ static bool kv_tool_map_write(server *s, FILE *fp, const char *text,
         }
         p = end;
     }
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_unlock(server_tool_mutex(s));
 
     if (ok && written_bytes) *written_bytes = bytes;
     return ok;
@@ -8748,7 +9035,10 @@ static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wante
         h[2] != KV_TOOL_MAP_MAGIC2 || h[3] != KV_TOOL_MAP_VERSION) return 0;
 
     uint32_t count = le_get32(h + 4);
-    if ((uint64_t)count > (uint64_t)tool_memory_max_entries(&s->tool_mem) * 4u) return 0;
+    if ((uint64_t)count >
+        (uint64_t)tool_memory_max_entries(server_tool_memory(s)) * 4u) {
+        return 0;
+    }
     int loaded = 0;
     for (uint32_t i = 0; i < count; i++) {
         uint8_t lens[8];
@@ -8793,7 +9083,9 @@ static bool kv_read_header(FILE *fp, kv_entry *e, uint32_t *text_bytes) {
 
 
 static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs *msgs) {
-    if (!s || s->disable_exact_dsml_tool_replay || !s->kv.enabled || !msgs) return;
+    kv_disk_cache *kc = server_kv(s);
+    if (!s || s->disable_exact_dsml_tool_replay ||
+        !kc || !kc->enabled || !msgs) return;
     stop_list wanted = {0};
     collect_tool_call_ids(msgs, &wanted);
     if (wanted.len == 0) return;
@@ -8802,7 +9094,7 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
      * Flash/Pro shapes even when the rendered chat text is identical. */
     uint8_t model_id = s->engine ? (uint8_t)ds4_engine_model_id(s->engine) : 0;
 
-    DIR *d = opendir(s->kv.dir);
+    DIR *d = opendir(kc->dir);
     if (!d) {
         id_list_free(&wanted);
         return;
@@ -8812,7 +9104,7 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
         char sha[41];
         if (!sha_hex_name(de->d_name, sha)) continue;
         (void)sha;
-        char *path = path_join(s->kv.dir, de->d_name);
+        char *path = path_join(kc->dir, de->d_name);
         FILE *fp = fopen(path, "rb");
         free(path);
         if (!fp) continue;
@@ -8996,7 +9288,8 @@ static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                                             const char *protect_prompt_text) {
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    return ds4_kvstore_store_live_prefix_text(&s->kv, s->engine, s->session,
+    return ds4_kvstore_store_live_prefix_text(server_kv(s),
+                                               s->engine, s->session,
                                               tokens, store_len, reason,
                                               cache_text_override,
                                               cache_text_ext,
@@ -9019,7 +9312,7 @@ static void kv_cache_store_current(server *s, const char *reason,
     char *visible_text = NULL;
     uint8_t visible_ext = 0;
     const char *visible_key = NULL;
-    pthread_mutex_lock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
     if (s->responses_live.valid &&
         s->responses_live.live_tokens == tokens->len &&
         s->responses_live.visible_text &&
@@ -9037,7 +9330,7 @@ static void kv_cache_store_current(server *s, const char *reason,
         visible_ext = KV_EXT_THINKING_VISIBLE;
         visible_key = "thinking-visible";
     }
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_unlock(server_tool_mutex(s));
 
     /* A visible live checkpoint can contain hidden reasoning that the client
      * intentionally does not replay.  For disk recovery after a session switch,
@@ -9066,6 +9359,7 @@ static void kv_cache_defer_stream_failed_prompt(server *s,
     if (!s || !prompt) return;
     const int live = ds4_session_pos(s->session);
     thinking_live_clear(s);
+    chat_live_clear(s);
     responses_live_clear(s);
     anthropic_live_clear(s);
     server_log(canonical_saved ? DS4_LOG_KVCACHE : DS4_LOG_WARNING,
@@ -9100,12 +9394,12 @@ static void kv_cache_discard_failed_disk_entry(server *s, const char *path) {
                    "ds4-server: kv cache failed to discard prefill-failed file=%s: %s",
                    path, strerror(errno));
     }
-    s->kv.continued_last_store_tokens = 0;
+    server_kv(s)->continued_last_store_tokens = 0;
     ds4_session_invalidate(s->session);
 }
 
 static void kv_cache_maybe_store_continued(server *s) {
-    kv_disk_cache *kc = &s->kv;
+    kv_disk_cache *kc = server_kv(s);
     const ds4_tokens *tokens = ds4_session_tokens(s->session);
     if (!tokens) return;
     const int target = kv_cache_continued_store_target(kc, tokens->len);
@@ -9131,7 +9425,8 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    int loaded = ds4_kvstore_try_load_text(&s->kv, s->engine, s->session,
+    int loaded = ds4_kvstore_try_load_text(server_kv(s),
+                                           s->engine, s->session,
                                            prompt_text, effective_prompt, &lr,
                                            &hooks, responses_protocol);
     if (loaded > 0) {
@@ -9303,6 +9598,30 @@ static int anthropic_live_continuation_prompt(server *s, const request *req,
     return live_tokens->len;
 }
 
+/* Full-history Chat Completions continuation.
+ *
+ * The request carries a visible replay, but exact call IDs plus the prompt that
+ * originally produced the tool call are the semantic continuation proof.  The
+ * live sampled token history remains authoritative; tokenize only EOS + tool
+ * results + the next assistant prefix. */
+static int chat_live_continuation_prompt(server *s, const request *req,
+                                         int live_pos,
+                                         ds4_tokens *effective_prompt,
+                                         int *matched_ids) {
+    if (!s || !req || !effective_prompt ||
+        !req->chat_live_suffix_text) return 0;
+    if (!chat_live_matches_request(s, req, live_pos)) return 0;
+
+    const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
+    if (!live_tokens || live_tokens->len != live_pos) return 0;
+
+    build_prompt_from_exact_prefix_and_text_suffix(
+        s->engine, live_tokens, req->chat_live_suffix_text,
+        effective_prompt);
+    if (matched_ids) *matched_ids = req->chat_live_call_ids.len;
+    return live_tokens->len;
+}
+
 /* Visible-replay Responses continuation.
  *
  * Other clients send the full visible transcript on every turn even though the
@@ -9324,7 +9643,7 @@ static int responses_live_visible_prefix_prompt(server *s, const request *req,
 
     const size_t prompt_len = strlen(req->prompt_text);
     size_t visible_len = 0;
-    pthread_mutex_lock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
     bool ok = s->responses_live.valid &&
               s->responses_live.live_tokens == live_pos &&
               s->responses_live.visible_text &&
@@ -9333,7 +9652,7 @@ static int responses_live_visible_prefix_prompt(server *s, const request *req,
                                 s->responses_live.visible_text,
                                 s->responses_live.visible_len);
     if (ok) visible_len = s->responses_live.visible_len;
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_unlock(server_tool_mutex(s));
     if (!ok) return 0;
 
     const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
@@ -9368,7 +9687,7 @@ static int thinking_live_visible_prefix_prompt(server *s, const request *req,
 
     const size_t prompt_len = strlen(req->prompt_text);
     size_t visible_len = 0;
-    pthread_mutex_lock(&s->tool_mu);
+    pthread_mutex_lock(server_tool_mutex(s));
     bool ok = s->thinking_live.valid &&
               s->thinking_live.live_tokens == live_pos &&
               s->thinking_live.visible_text &&
@@ -9379,7 +9698,7 @@ static int thinking_live_visible_prefix_prompt(server *s, const request *req,
     if (ok) visible_len = s->thinking_live.visible_len;
     if (ok && tool_checkpoint_out)
         *tool_checkpoint_out = s->thinking_live.tool_checkpoint;
-    pthread_mutex_unlock(&s->tool_mu);
+    pthread_mutex_unlock(server_tool_mutex(s));
     if (!ok) return 0;
 
     const ds4_tokens *live_tokens = ds4_session_tokens(s->session);
@@ -9507,7 +9826,8 @@ static void trace_write_cache_diag(
         int disk_cached,
         const char *disk_path)
 {
-    fprintf(s->trace,
+    FILE *trace = server_trace_file(s);
+    fprintf(trace,
             "\n--- cache decision ---\n"
             "live_tokens_before: %d\n"
             "prompt_tokens: %d\n"
@@ -9531,7 +9851,9 @@ static void trace_write_cache_diag(
             cache_source ? cache_source : "none",
             cached,
             disk_cached);
-    if (disk_path && disk_path[0]) fprintf(s->trace, "disk_cache_file: %s\n", disk_path);
+    if (disk_path && disk_path[0]) {
+        fprintf(trace, "disk_cache_file: %s\n", disk_path);
+    }
 
     if (!d || !d->valid || d->old_pos == 0 ||
         (d->common == d->old_pos && d->prompt_len >= d->old_pos))
@@ -9539,7 +9861,7 @@ static void trace_write_cache_diag(
         return;
     }
 
-    fprintf(s->trace,
+    fprintf(trace,
             "\nfirst_mismatch_token: %d\n"
             "token_window: [%d..%d)\n",
             d->common,
@@ -9554,11 +9876,11 @@ static void trace_write_cache_diag(
         else if (prompt < 0) mark = "live-only";
         else mark = live == prompt ? "==" : "!=";
 
-        fprintf(s->trace, "%7d %-11s live ", pos, mark);
-        trace_write_token(s->trace, s->engine, live);
-        fputs(" | prompt ", s->trace);
-        trace_write_token(s->trace, s->engine, prompt);
-        fputc('\n', s->trace);
+        fprintf(trace, "%7d %-11s live ", pos, mark);
+        trace_write_token(trace, s->engine, live);
+        fputs(" | prompt ", trace);
+        trace_write_token(trace, s->engine, prompt);
+        fputc('\n', trace);
     }
 }
 
@@ -9580,13 +9902,15 @@ static uint64_t trace_begin(
         const char *cache_source,
         int disk_cached,
         const char *disk_path) {
-    if (!s->trace) return 0;
+    server *root = server_root(s);
+    FILE *trace = server_trace_file(s);
+    if (!trace) return 0;
 
-    pthread_mutex_lock(&s->trace_mu);
-    uint64_t id = ++s->trace_seq;
-    fprintf(s->trace, "\n===== request %llu ", (unsigned long long)id);
-    trace_time(s->trace);
-    fprintf(s->trace,
+    pthread_mutex_lock(server_trace_mutex(s));
+    uint64_t id = ++root->trace_seq;
+    fprintf(trace, "\n===== request %llu ", (unsigned long long)id);
+    trace_time(trace);
+    fprintf(trace,
             " =====\nkind: %s\nmodel: %s\nstream: %d\ntools: %d\nthink_mode: %s\nprompt_tokens: %d\neffective_prompt_tokens: %d\ncached_tokens: %d\nmax_tokens: %d\ntemperature: %.3f\ntop_k: %d\ntop_p: %.3f\nmin_p: %.3f\nseed: %llu\n",
             j->req.kind == REQ_CHAT ? "chat" : "completion",
             j->req.model ? j->req.model : "",
@@ -9602,49 +9926,51 @@ static uint64_t trace_begin(
             j->req.top_p,
             j->req.min_p,
             (unsigned long long)j->req.seed);
-    fprintf(s->trace, "stream_include_usage: %d\n",
+    fprintf(trace, "stream_include_usage: %d\n",
             j->req.stream_include_usage ? 1 : 0);
     trace_write_cache_diag(s, cache_diag, &j->req.tool_replay, cached,
                            cache_source, disk_cached, disk_path);
     if (j->req.raw_body) {
-        fputs("\n--- raw request json ---\n", s->trace);
-        fputs(j->req.raw_body, s->trace);
+        fputs("\n--- raw request json ---\n", trace);
+        fputs(j->req.raw_body, trace);
         if (!j->req.raw_body[0] || j->req.raw_body[strlen(j->req.raw_body) - 1] != '\n') {
-            fputc('\n', s->trace);
+            fputc('\n', trace);
         }
     }
     if (j->req.prompt_text) {
-        fputs("\n--- rendered prompt ---\n", s->trace);
-        fputs(j->req.prompt_text, s->trace);
+        fputs("\n--- rendered prompt ---\n", trace);
+        fputs(j->req.prompt_text, trace);
         if (!j->req.prompt_text[0] || j->req.prompt_text[strlen(j->req.prompt_text) - 1] != '\n') {
-            fputc('\n', s->trace);
+            fputc('\n', trace);
         }
     }
-    fputs("\n--- generated text ---\n", s->trace);
-    fflush(s->trace);
-    pthread_mutex_unlock(&s->trace_mu);
+    fputs("\n--- generated text ---\n", trace);
+    fflush(trace);
+    pthread_mutex_unlock(server_trace_mutex(s));
     return id;
 }
 
 static void trace_piece(server *s, uint64_t id, const char *piece, size_t len) {
-    if (!s->trace || !id || !piece || !len) return;
-    pthread_mutex_lock(&s->trace_mu);
-    fwrite(piece, 1, len, s->trace);
-    fflush(s->trace);
-    pthread_mutex_unlock(&s->trace_mu);
+    FILE *trace = server_trace_file(s);
+    if (!trace || !id || !piece || !len) return;
+    pthread_mutex_lock(server_trace_mutex(s));
+    fwrite(piece, 1, len, trace);
+    fflush(trace);
+    pthread_mutex_unlock(server_trace_mutex(s));
 }
 
 static void trace_event(server *s, uint64_t id, const char *fmt, ...) {
-    if (!s->trace || !id) return;
-    pthread_mutex_lock(&s->trace_mu);
-    fputs("\n\n--- trace: ", s->trace);
+    FILE *trace = server_trace_file(s);
+    if (!trace || !id) return;
+    pthread_mutex_lock(server_trace_mutex(s));
+    fputs("\n\n--- trace: ", trace);
     va_list ap;
     va_start(ap, fmt);
-    vfprintf(s->trace, fmt, ap);
+    vfprintf(trace, fmt, ap);
     va_end(ap);
-    fputs(" ---\n\n", s->trace);
-    fflush(s->trace);
-    pthread_mutex_unlock(&s->trace_mu);
+    fputs(" ---\n\n", trace);
+    fflush(trace);
+    pthread_mutex_unlock(server_trace_mutex(s));
 }
 
 static void trace_finish(
@@ -9659,10 +9985,11 @@ static void trace_finish(
         const char *parsed_reasoning,
         const tool_calls *parsed_calls,
         double elapsed) {
-    if (!s->trace || !id) return;
+    FILE *trace = server_trace_file(s);
+    if (!trace || !id) return;
 
-    pthread_mutex_lock(&s->trace_mu);
-    fprintf(s->trace,
+    pthread_mutex_lock(server_trace_mutex(s));
+    fprintf(trace,
             "\n\n--- parsed message ---\nfinish: %s\ngenerated_tokens: %d\ndsml_start: %d\ndsml_end: %d\nelapsed_sec: %.3f\n",
             final_finish,
             completion,
@@ -9671,27 +9998,29 @@ static void trace_finish(
             elapsed);
     if (r->kind == REQ_CHAT) {
         if (parsed_reasoning && parsed_reasoning[0]) {
-            fputs("\nreasoning:\n", s->trace);
-            fputs(parsed_reasoning, s->trace);
-            fputc('\n', s->trace);
+            fputs("\nreasoning:\n", trace);
+            fputs(parsed_reasoning, trace);
+            fputc('\n', trace);
         }
         if (parsed_content && parsed_content[0]) {
-            fputs("\ncontent:\n", s->trace);
-            fputs(parsed_content, s->trace);
-            fputc('\n', s->trace);
+            fputs("\ncontent:\n", trace);
+            fputs(parsed_content, trace);
+            fputc('\n', trace);
         }
         for (int i = 0; i < parsed_calls->len; i++) {
             const tool_call *tc = &parsed_calls->v[i];
-            fprintf(s->trace, "\ntool_call[%d]:\nid: %s\nname: %s\narguments:\n%s\n",
+            fprintf(trace,
+                    "\ntool_call[%d]:\nid: %s\nname: %s\narguments:\n%s\n",
                     i,
                     tc->id ? tc->id : "",
                     tc->name ? tc->name : "",
                     tc->arguments ? tc->arguments : "");
         }
     }
-    fprintf(s->trace, "\n===== end request %llu =====\n", (unsigned long long)id);
-    fflush(s->trace);
-    pthread_mutex_unlock(&s->trace_mu);
+    fprintf(trace, "\n===== end request %llu =====\n",
+            (unsigned long long)id);
+    fflush(trace);
+    pthread_mutex_unlock(server_trace_mutex(s));
 }
 
 typedef struct {
@@ -10452,6 +10781,221 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
     return true;
 }
 
+static long server_coalesce_us(void) {
+    const char *value = getenv("DS4_SERVER_DSPARK_COALESCE_US");
+    if (!value || !value[0]) return 500;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' ||
+        parsed < 0 || parsed > 10000) {
+        return 500;
+    }
+    return parsed;
+}
+
+static long server_active_coalesce_us(void) {
+    const char *value =
+        getenv("DS4_SERVER_DSPARK_ACTIVE_COALESCE_US");
+    if (!value || !value[0]) return 20000;
+    char *end = NULL;
+    long parsed = strtol(value, &end, 10);
+    if (end == value || *end != '\0' ||
+        parsed < 0 || parsed > 100000) {
+        return 20000;
+    }
+    return parsed;
+}
+
+/* cycle_mu protects this state. A longer rendezvous is useful only while a
+ * peer is already decoding; cold prefill or a single active request must not
+ * inherit multi-session latency. */
+static bool server_peer_decode_active_locked(
+        const server *root, uint32_t own) {
+    for (uint32_t i = 0; i < root->lane_count; i++) {
+        if (i != own && root->lanes[i]->decode_active) return true;
+    }
+    return false;
+}
+
+/* The coordinator used to launch as soon as any two lanes were pending. That
+ * made R=3 unreachable: the first pair always left before the third lane could
+ * enter the cohort. Aim for every lane currently decoding, but retain a goal
+ * of two for the short rendezvous that can catch a newly starting peer. The
+ * deadline remains authoritative and releases whatever is actually pending. */
+static uint32_t server_cohort_goal_locked(const server *root) {
+    uint32_t active = 0u;
+    for (uint32_t i = 0; i < root->lane_count; i++) {
+        if (root->lanes[i]->decode_active) active++;
+    }
+    uint32_t goal = active < 2u ? 2u : active;
+    if (goal > root->lane_count) goal = root->lane_count;
+    return goal;
+}
+
+static void server_set_decode_active(server *lane, bool active) {
+    server *root = server_root(lane);
+    if (root->lane_count <= 1u) return;
+    pthread_mutex_lock(&root->cycle_mu);
+    lane->decode_active = active;
+    pthread_cond_broadcast(&root->cycle_cv);
+    pthread_mutex_unlock(&root->cycle_mu);
+}
+
+static int server_eval_speculative(
+        server *lane,
+        int first_token,
+        int max_tokens,
+        int eos_token,
+        float temperature,
+        int top_k,
+        float top_p,
+        float min_p,
+        uint64_t *rng,
+        int *accepted,
+        int accepted_cap,
+        char *err,
+        size_t errlen) {
+    server *root = server_root(lane);
+    if (root->lane_count <= 1u ||
+        lane->lane_id >= root->lane_count) {
+        server_gpu_enter(lane);
+        const int result = ds4_session_eval_speculative_sample(
+                lane->session, first_token, max_tokens, eos_token,
+                temperature, top_k, top_p, min_p, rng,
+                accepted, accepted_cap, err, errlen);
+        server_gpu_leave(lane);
+        return result;
+    }
+
+    const uint32_t own = lane->lane_id;
+    pthread_mutex_lock(&root->cycle_mu);
+    while (root->cycle_running || root->cycle[own].pending ||
+           root->cycle[own].done) {
+        pthread_cond_wait(&root->cycle_cv, &root->cycle_mu);
+    }
+    root->cycle[own].request = (ds4_speculative_request) {
+        .session = lane->session,
+        .request_id = own + 1u,
+        .first_token = first_token,
+        .max_tokens = max_tokens,
+        .eos_token = eos_token,
+        .temperature = temperature,
+        .top_k = top_k,
+        .top_p = top_p,
+        .min_p = min_p,
+        .rng = rng,
+        .accepted = accepted,
+        .accepted_cap = accepted_cap,
+        .result = -1,
+    };
+    root->cycle[own].err[0] = '\0';
+    root->cycle[own].pending = true;
+    pthread_cond_broadcast(&root->cycle_cv);
+
+    bool leader = false;
+    uint32_t selected[DS4_SERVER_DSPARK_MAX_LANES] = {0};
+    uint32_t selected_count = 0u;
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    const bool peer_decode_active =
+        server_peer_decode_active_locked(root, own);
+    const long wait_us = peer_decode_active
+        ? server_active_coalesce_us()
+        : server_coalesce_us();
+    deadline.tv_nsec += wait_us * 1000L;
+    deadline.tv_sec += deadline.tv_nsec / 1000000000L;
+    deadline.tv_nsec %= 1000000000L;
+
+    for (;;) {
+        if (root->cycle[own].done) break;
+        if (root->cycle_running && !root->cycle[own].pending) {
+            pthread_cond_wait(&root->cycle_cv, &root->cycle_mu);
+            continue;
+        }
+        uint32_t pending = 0u;
+        for (uint32_t i = 0; i < root->lane_count; i++) {
+            if (root->cycle[i].pending) pending++;
+        }
+        const uint32_t cohort_goal =
+            server_cohort_goal_locked(root);
+        if (!root->cycle_running && pending >= cohort_goal) {
+            for (uint32_t i = 0; i < root->lane_count; i++) {
+                if (root->cycle[i].pending) {
+                    selected[selected_count++] = i;
+                }
+            }
+            leader = true;
+            break;
+        }
+        if (wait_us == 0) {
+            selected[selected_count++] = own;
+            leader = true;
+            break;
+        }
+        const int wait_rc = pthread_cond_timedwait(
+                &root->cycle_cv, &root->cycle_mu, &deadline);
+        if (wait_rc == ETIMEDOUT && root->cycle[own].pending &&
+            !root->cycle_running) {
+            selected[selected_count++] = own;
+            leader = true;
+            break;
+        }
+    }
+
+    if (leader) {
+        ds4_speculative_request cohort[DS4_SERVER_DSPARK_MAX_LANES];
+        root->cycle_running = true;
+        for (uint32_t i = 0; i < selected_count; i++) {
+            const uint32_t slot = selected[i];
+            root->cycle[slot].pending = false;
+            cohort[i] = root->cycle[slot].request;
+        }
+        pthread_mutex_unlock(&root->cycle_mu);
+
+        char cohort_err[160] = {0};
+        server_gpu_enter(lane);
+        const int cohort_rc = ds4_sessions_eval_speculative_sample_rn(
+                cohort, selected_count,
+                cohort_err, sizeof(cohort_err));
+        server_gpu_leave(lane);
+
+        pthread_mutex_lock(&root->cycle_mu);
+        for (uint32_t i = 0; i < selected_count; i++) {
+            const uint32_t slot = selected[i];
+            root->cycle[slot].request.result = cohort[i].result;
+            const bool lane_ok = cohort[i].result >= 0;
+            root->cycle[slot].rc = lane_ok
+                ? 0 : (cohort_rc != 0 ? cohort_rc : 1);
+            if (!lane_ok) {
+                snprintf(root->cycle[slot].err,
+                         sizeof(root->cycle[slot].err),
+                         "%s", cohort_err);
+            } else {
+                root->cycle[slot].err[0] = '\0';
+            }
+            root->cycle[slot].done = true;
+        }
+        root->cycle_running = false;
+        pthread_cond_broadcast(&root->cycle_cv);
+    }
+
+    while (!root->cycle[own].done) {
+        pthread_cond_wait(&root->cycle_cv, &root->cycle_mu);
+    }
+    const int result = root->cycle[own].request.result;
+    const int cycle_rc = root->cycle[own].rc;
+    if (cycle_rc != 0 && err && errlen) {
+        snprintf(err, errlen, "%s",
+                 root->cycle[own].err[0]
+                    ? root->cycle[own].err
+                    : "coordinated DSpark cycle failed");
+    }
+    root->cycle[own].done = false;
+    pthread_cond_broadcast(&root->cycle_cv);
+    pthread_mutex_unlock(&root->cycle_mu);
+    return cycle_rc == 0 ? result : -1;
+}
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -10465,6 +11009,8 @@ static bool should_canonicalize_tool_checkpoint(const server *s, const tool_call
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
 static void generate_job(server *s, job *j) {
+    server_gpu_enter(s);
+    bool gpu_locked = true;
     char err[160];
     err[0] = '\0';
     const int old_pos = ds4_session_pos(s->session);
@@ -10487,11 +11033,13 @@ static void generate_job(server *s, job *j) {
     const bool responses_protocol = j->req.api == API_RESPONSES;
     bool responses_live_continuation = false;
     bool anthropic_live_continuation = false;
+    bool chat_live_continuation = false;
     bool thinking_live_continuation = false;
     bool tool_live_continuation = false;
     const char *responses_live_match = NULL;
     int responses_live_match_ids = 0;
     int anthropic_live_match_ids = 0;
+    int chat_live_match_ids = 0;
     /* Responses gets the first chance to continue from live state.  This is
      * the whole point of the API shape: a request that is bound to prior live
      * output by visible transcript or tool call ids does not need to prove an
@@ -10529,6 +11077,17 @@ static void generate_job(server *s, job *j) {
             prompt_for_sync = &effective_prompt;
         }
     }
+    if (cached == 0) {
+        cached = chat_live_continuation_prompt(s, &j->req, old_pos,
+                                              &effective_prompt,
+                                              &chat_live_match_ids);
+        if (cached > 0) {
+            chat_live_continuation = true;
+            cache_source = "chat-tool-output";
+            prompt_for_sync = &effective_prompt;
+        }
+    }
+    if (cached == 0) chat_live_log_miss(s, &j->req, old_pos);
     if (cached == 0 && responses_protocol &&
         j->req.responses_requires_live_tool_state)
     {
@@ -10539,6 +11098,7 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&effective_prompt);
         http_error(j->fd, s->enable_cors, 409,
                    "Responses continuation state is not available; retry by replaying the full input history");
+        server_gpu_leave(s);
         return;
     } else if (cached == 0 && j->req.api == API_ANTHROPIC &&
                j->req.anthropic_requires_live_tool_state)
@@ -10546,6 +11106,7 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&effective_prompt);
         http_error(j->fd, s->enable_cors, 409,
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
+        server_gpu_leave(s);
         return;
     } else if (cached == 0 && !stream_retry_force_disk) {
         cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
@@ -10602,9 +11163,10 @@ static void generate_job(server *s, job *j) {
                    old_pos, j->req.prompt.len, common,
                    trace_cache_miss_reason(&cache_diag));
     }
-    if (cached == 0) s->kv.continued_last_store_tokens = 0;
-    if (s->kv.enabled && cached == 0 && !stream_retry_force_disk &&
-        old_pos >= s->kv.opt.min_tokens) {
+    kv_disk_cache *shared_kv = server_kv(s);
+    if (cached == 0) shared_kv->continued_last_store_tokens = 0;
+    if (shared_kv->enabled && cached == 0 && !stream_retry_force_disk &&
+        old_pos >= shared_kv->opt.min_tokens) {
         /* Loading a disk snapshot replaces the live Metal session.  Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
@@ -10669,7 +11231,8 @@ static void generate_job(server *s, job *j) {
     const kv_prefill_policy kv_policy = kv_prefill_policy_parse(kv_policy_env);
     progress.kv_canonical_only = kv_policy == KV_PREFILL_POLICY_CANONICAL_ONLY;
     snprintf(progress.ctx, sizeof(progress.ctx), "%s", ctx_span);
-    if (progress.kv_canonical_only && s->kv.enabled && prompt_tokens > cached) {
+    if (progress.kv_canonical_only &&
+        shared_kv->enabled && prompt_tokens > cached) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: kv prefill checkpoints policy=canonical-only cached=%d prompt=%d intermediate=0",
                    cached, prompt_tokens);
@@ -10690,6 +11253,13 @@ static void generate_job(server *s, job *j) {
                    anthropic_live_match_ids,
                    cached,
                    prompt_tokens);
+    } else if (chat_live_continuation) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: chat live continuation match=tool-call-ids ids=%d cached=%d prompt=%d replay=%d",
+                   chat_live_match_ids,
+                   cached,
+                   prompt_tokens,
+                   prompt_tokens - cached);
     } else if (thinking_live_continuation) {
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: %s live continuation match=visible-prefix cached=%d prompt=%d",
@@ -10725,21 +11295,24 @@ static void generate_job(server *s, job *j) {
 
     int cold_store_len = 0;
     if (cached == 0 &&
-        s->kv.enabled &&
-        prompt_for_sync->len >= s->kv.opt.min_tokens &&
-        s->kv.opt.cold_max_tokens > 0 &&
-        prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
+        shared_kv->enabled &&
+        prompt_for_sync->len >= shared_kv->opt.min_tokens &&
+        shared_kv->opt.cold_max_tokens > 0 &&
+        prompt_for_sync->len <= shared_kv->opt.cold_max_tokens)
     {
-        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
+        const int anchor = kv_cache_chat_anchor_pos(shared_kv, prompt_for_sync,
                                                     ds4_token_user(s->engine),
                                                     ds4_token_assistant(s->engine));
-        int boundary = kv_cache_long_cold_boundary_len(&s->kv, prompt_for_sync->len,
+        int boundary = kv_cache_long_cold_boundary_len(shared_kv,
+                                                       prompt_for_sync->len,
                                                        ds4_session_ctx(s->session));
-        if (boundary < s->kv.opt.min_tokens) {
-            boundary = kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        if (boundary < shared_kv->opt.min_tokens) {
+            boundary = kv_cache_store_len(shared_kv,
+                                          prompt_for_sync->len);
         }
         cold_store_len = boundary;
-        if (anchor >= s->kv.opt.min_tokens && anchor > cold_store_len) {
+        if (anchor >= shared_kv->opt.min_tokens &&
+            anchor > cold_store_len) {
             cold_store_len = anchor;
         }
         server_log(DS4_LOG_KVCACHE,
@@ -10747,7 +11320,8 @@ static void generate_job(server *s, job *j) {
                    prompt_for_sync->len, cold_store_len, anchor, boundary);
     }
     int suppressed_continued_last = -1;
-    if (!progress.kv_canonical_only && cold_store_len >= s->kv.opt.min_tokens) {
+    if (!progress.kv_canonical_only &&
+        cold_store_len >= shared_kv->opt.min_tokens) {
         /* A cold checkpoint can land exactly on the continued-checkpoint
          * frontier.  The prefill progress callback would then write the same
          * prefix as "continued" while we are intentionally stopping there to
@@ -10755,11 +11329,11 @@ static void generate_job(server *s, job *j) {
          * sync reaches it; if the cold write fails, restore the old schedule so
          * a later continued write can still try. */
         suppressed_continued_last =
-            kv_cache_suppress_continued_store(&s->kv, cold_store_len);
+            kv_cache_suppress_continued_store(shared_kv, cold_store_len);
     }
 
-    if (s->kv.enabled &&
-        cold_store_len >= s->kv.opt.min_tokens &&
+    if (shared_kv->enabled &&
+        cold_store_len >= shared_kv->opt.min_tokens &&
         cold_store_len < prompt_for_sync->len)
     {
         ds4_tokens prefix = {0};
@@ -10769,19 +11343,22 @@ static void generate_job(server *s, job *j) {
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(s->session, NULL, NULL);
             ds4_session_set_display_progress(s->session, NULL, NULL);
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
+            kv_cache_restore_suppressed_continued(shared_kv,
+                                                  suppressed_continued_last,
                                                   cold_store_len);
             kv_cache_discard_failed_disk_entry(s, disk_cache_path);
             free(disk_cache_path);
             trace_event(s, trace_id, "prefill failed: %s", err);
             send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+            server_gpu_leave(s);
             return;
         }
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
-            kv_cache_note_store(&s->kv, cold_store_len);
+            kv_cache_note_store(shared_kv, cold_store_len);
             suppressed_continued_last = -1;
         } else {
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
+            kv_cache_restore_suppressed_continued(shared_kv,
+                                                  suppressed_continued_last,
                                                   cold_store_len);
             suppressed_continued_last = -1;
         }
@@ -10792,12 +11369,14 @@ static void generate_job(server *s, job *j) {
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(s->session, NULL, NULL);
         ds4_session_set_display_progress(s->session, NULL, NULL);
-        kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
+        kv_cache_restore_suppressed_continued(shared_kv,
+                                              suppressed_continued_last,
                                               cold_store_len);
         kv_cache_discard_failed_disk_entry(s, disk_cache_path);
         free(disk_cache_path);
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
+        server_gpu_leave(s);
         return;
     }
     free(disk_cache_path);
@@ -10805,6 +11384,10 @@ static void generate_job(server *s, job *j) {
      * a binding only when this request explicitly continued from it. */
     if (!responses_live_continuation) responses_live_clear(s);
     if (!anthropic_live_continuation) anthropic_live_clear(s);
+    /* A Chat binding is single-use.  Once its tool-result tail has been
+     * appended (or another prompt has replaced the session), only a tool call
+     * generated by this request may create the next binding. */
+    chat_live_clear(s);
     if (!thinking_live_continuation) thinking_live_clear(s);
     ds4_session_set_progress(s->session, NULL, NULL);
     ds4_session_set_display_progress(s->session, NULL, NULL);
@@ -10816,9 +11399,9 @@ static void generate_job(server *s, job *j) {
     double canonical_min_sec = canonical_min_env ? strtod(canonical_min_env, NULL) : 30.0;
     if (canonical_min_sec < 0.0) canonical_min_sec = 0.0;
     const double prefill_elapsed = now_sec() - t0;
-    if (canonical_enabled && s->kv.enabled &&
+    if (canonical_enabled && shared_kv->enabled &&
         (progress.kv_canonical_only || prefill_elapsed >= canonical_min_sec) &&
-        prompt_tokens >= s->kv.opt.min_tokens &&
+        prompt_tokens >= shared_kv->opt.min_tokens &&
         j->req.prompt_text && j->req.prompt_text[0])
     {
         /* This is the sole durable checkpoint for canonical-only: exact full
@@ -10827,7 +11410,9 @@ static void generate_job(server *s, job *j) {
             s, prompt_for_sync, prompt_tokens, "continued",
             j->req.prompt_text, responses_protocol ? KV_EXT_RESPONSES_VISIBLE : 0,
             "prefill-complete", NULL);
-        if (canonical_prefill_saved) kv_cache_note_store(&s->kv, prompt_tokens);
+        if (canonical_prefill_saved) {
+            kv_cache_note_store(shared_kv, prompt_tokens);
+        }
         server_log(canonical_prefill_saved ? DS4_LOG_KVCACHE : DS4_LOG_WARNING,
                    "ds4-server: kv canonical prefill checkpoint tokens=%d elapsed=%.3fs persisted=%d",
                    prompt_tokens, prefill_elapsed, canonical_prefill_saved ? 1 : 0);
@@ -10842,10 +11427,11 @@ static void generate_job(server *s, job *j) {
                prefill_elapsed);
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, prompt_for_sync, cold_store_len, "cold")) {
-            kv_cache_note_store(&s->kv, cold_store_len);
+            kv_cache_note_store(shared_kv, cold_store_len);
             suppressed_continued_last = -1;
         } else {
-            kv_cache_restore_suppressed_continued(&s->kv, suppressed_continued_last,
+            kv_cache_restore_suppressed_continued(shared_kv,
+                                                  suppressed_continued_last,
                                                   cold_store_len);
         }
     }
@@ -10871,9 +11457,11 @@ static void generate_job(server *s, job *j) {
         }
     }
     char id[96];
+    const uint64_t request_sequence =
+        __sync_add_and_fetch(&server_root(s)->seq, 1u);
     snprintf(id, sizeof(id), "%s-%llu",
              j->req.kind == REQ_CHAT ? "chatcmpl" : "cmpl",
-             (unsigned long long)++s->seq);
+             (unsigned long long)request_sequence);
 
     bool structured_stream = request_uses_structured_stream(&j->req);
     anthropic_stream anthropic_live = {0};
@@ -10891,6 +11479,7 @@ static void generate_job(server *s, job *j) {
                        req_flags[0] ? " " : "",
                        req_flags);
             ds4_tokens_free(&effective_prompt);
+            server_gpu_leave(s);
             return;
         }
         /* The prefill progress callback may have already sent the SSE headers
@@ -10904,6 +11493,7 @@ static void generate_job(server *s, job *j) {
                        req_flags[0] ? " " : "",
                        req_flags);
             ds4_tokens_free(&effective_prompt);
+            server_gpu_leave(s);
             return;
         }
         progress.headers_sent = true;
@@ -10912,12 +11502,14 @@ static void generate_job(server *s, job *j) {
                                       prompt_tokens, &anthropic_live)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s anthropic stream start failed", ctx_span);
             ds4_tokens_free(&effective_prompt);
+            server_gpu_leave(s);
             return;
         }
         if (j->req.api == API_OPENAI && j->req.kind == REQ_CHAT &&
             !sse_chunk(j->fd, &j->req, id, NULL, NULL)) {
             server_log(DS4_LOG_GENERATION, "ds4-server: chat ctx=%s openai role chunk failed", ctx_span);
             ds4_tokens_free(&effective_prompt);
+            server_gpu_leave(s);
             return;
         }
         if (openai_live_chat) openai_stream_start(&j->req, &openai_live);
@@ -10932,14 +11524,18 @@ static void generate_job(server *s, job *j) {
                            req_flags);
                 responses_stream_free(&responses_live);
                 ds4_tokens_free(&effective_prompt);
+                server_gpu_leave(s);
                 return;
             }
         }
     }
 
+    server_gpu_leave(s);
+    gpu_locked = false;
     bool dsml_recovery_attempted = false;
     uint64_t rng = j->req.seed ? j->req.seed :
-        (((uint64_t)time(NULL) << 32) ^ ((uint64_t)s->seq << 1) ^ (uint64_t)(uintptr_t)j);
+        (((uint64_t)time(NULL) << 32) ^
+         (request_sequence << 1) ^ (uint64_t)(uintptr_t)j);
 decode_again:
     ;
     buf text = {0};
@@ -10986,6 +11582,7 @@ decode_again:
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
+    server_set_decode_active(s, true);
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
@@ -10993,7 +11590,9 @@ decode_again:
         const bool in_tool_call = dsml_decode_state_is_tool(dsml_state);
         if (!progress.kv_canonical_only &&
             !(j->req.kind == REQ_CHAT && j->req.has_tools && (saw_tool_start || in_tool_call))) {
+            server_gpu_enter(s);
             kv_cache_maybe_store_continued(s);
+            server_gpu_leave(s);
         }
         float temperature = j->req.temperature;
         int top_k = j->req.top_k;
@@ -11038,25 +11637,27 @@ decode_again:
             ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("DS4_MTP_SPEC_DISABLE") == NULL;
         if (use_dspark_spec || use_mtp_spec) {
-            ntok = ds4_session_eval_speculative_sample(s->session,
-                                                       token,
-                                                       max_tokens - completion,
-                                                       ds4_token_eos(s->engine),
-                                                       temperature,
-                                                       top_k,
-                                                       top_p,
-                                                       min_p,
-                                                       &rng,
-                                                       toks,
-                                                       (int)(sizeof(toks) / sizeof(toks[0])),
-                                                       err,
-                                                       sizeof(err));
+            ntok = server_eval_speculative(
+                    s,
+                    token,
+                    max_tokens - completion,
+                    ds4_token_eos(s->engine),
+                    temperature,
+                    top_k,
+                    top_p,
+                    min_p,
+                    &rng,
+                    toks,
+                    (int)(sizeof(toks) / sizeof(toks[0])),
+                    err,
+                    sizeof(err));
             if (ntok < 0) {
                 finish = "error";
                 break;
             }
         } else {
             int eval_rc;
+            server_gpu_enter(s);
             if (device_greedy_request) {
                 eval_rc = ds4_session_eval_greedy(s->session,
                                                   token,
@@ -11070,6 +11671,7 @@ decode_again:
                                            err,
                                            sizeof(err));
             }
+            server_gpu_leave(s);
             if (eval_rc != 0) {
                 finish = "error";
                 break;
@@ -11175,11 +11777,16 @@ decode_again:
                      * forgot to close its thinking; recover by forcing the
                      * close so the model restarts the call on the executable
                      * side. */
-                    const int recovered = think_tool_recovery_enabled ?
-                        chat_think_tool_recovery(s, &text, &thinking,
-                                                 &think_recovery_scan_from,
-                                                 &completion, max_tokens,
-                                                 err, sizeof(err)) : 0;
+                    int recovered = 0;
+                    if (think_tool_recovery_enabled) {
+                        server_gpu_enter(s);
+                        recovered = chat_think_tool_recovery(
+                                s, &text, &thinking,
+                                &think_recovery_scan_from,
+                                &completion, max_tokens,
+                                err, sizeof(err));
+                        server_gpu_leave(s);
+                    }
                     if (recovered < 0) {
                         finish = "error";
                         stop_decode = true;
@@ -11236,7 +11843,8 @@ decode_again:
                     const size_t marker_hold = 80;
                     size_t hold_from = text.len > marker_hold ? text.len - marker_hold : 0;
                     if (hold_from > tool_scan_from) tool_scan_from = hold_from;
-                    if (s->trace && completion >= next_tool_progress) {
+                    if (server_trace_file(s) &&
+                        completion >= next_tool_progress) {
                         trace_event(s, trace_id,
                                     "progress gen=%d dsml_start=%d dsml_end=%d",
                                     completion, saw_tool_start ? 1 : 0, saw_tool_end ? 1 : 0);
@@ -11276,6 +11884,10 @@ decode_again:
         }
         if (stop_decode) break;
     }
+    server_set_decode_active(s, false);
+
+    server_gpu_enter(s);
+    gpu_locked = true;
 
     if (g_stop_requested && strcmp(finish, "error") != 0) {
         finish = "error";
@@ -11345,6 +11957,8 @@ decode_again:
                                 recovery_tokens);
                     buf_free(&repaired);
                     buf_free(&text);
+                    server_gpu_leave(s);
+                    gpu_locked = false;
                     goto decode_again;
                 }
                 finish = "error";
@@ -11438,6 +12052,8 @@ decode_again:
                     free(parsed_reasoning);
                     tool_calls_free(&parsed_calls);
                     buf_free(&text);
+                    server_gpu_leave(s);
+                    gpu_locked = false;
                     goto decode_again;
                 }
                 final_finish = "error";
@@ -11554,6 +12170,11 @@ decode_again:
         remember_tool_checkpoint_frontier(s, j, ctx_span, trace_id,
                                           parsed_content ? parsed_content : "",
                                           parsed_reasoning, &parsed_calls);
+        if (j->req.api == API_OPENAI) {
+            chat_live_remember(s, j->req.chat_live_schema_text ?
+                                  j->req.chat_live_schema_text : "",
+                               &parsed_calls);
+        }
     } else if (parsed_calls.len) {
         thinking_live_clear(s);
     } else if (!parsed_calls.len &&
@@ -11713,42 +12334,153 @@ decode_again:
     responses_stream_free(&responses_live);
     buf_free(&text);
     ds4_tokens_free(&effective_prompt);
+    if (gpu_locked) server_gpu_leave(s);
 }
 
-static bool enqueue(server *s, job *j) {
-    pthread_mutex_lock(&s->mu);
-    if (s->stopping) {
-        pthread_mutex_unlock(&s->mu);
+static bool lane_has_live_binding_locked(const server *lane,
+                                         const request *req) {
+    if (!lane || !req) return false;
+    const live_tool_state *state = NULL;
+    const stop_list *ids = NULL;
+    if (req->api == API_RESPONSES &&
+        req->responses_live_call_ids.len > 0) {
+        state = &lane->responses_live;
+        ids = &req->responses_live_call_ids;
+    } else if (req->api == API_ANTHROPIC &&
+               req->anthropic_live_call_ids.len > 0) {
+        state = &lane->anthropic_live;
+        ids = &req->anthropic_live_call_ids;
+    } else if (req->api == API_OPENAI &&
+               req->chat_live_call_ids.len > 0) {
+        state = &lane->chat_live;
+        ids = &req->chat_live_call_ids;
+    } else {
         return false;
     }
-    if (s->tail) s->tail->next = j; else s->head = j;
-    s->tail = j;
-    pthread_cond_signal(&s->cv);
-    pthread_mutex_unlock(&s->mu);
+    if (!state->valid || !ids ||
+        state->call_ids.len != ids->len) {
+        return false;
+    }
+    if (req->api == API_OPENAI &&
+        (!req->chat_live_schema_text || !state->visible_text ||
+         strcmp(req->chat_live_schema_text, state->visible_text))) {
+        return false;
+    }
+    for (int i = 0; i < ids->len; i++) {
+        if (!id_list_contains(&state->call_ids, ids->v[i])) {
+            return false;
+        }
+    }
     return true;
 }
 
-static job *dequeue(server *s) {
-    pthread_mutex_lock(&s->mu);
-    while (!s->head && !s->stopping) pthread_cond_wait(&s->cv, &s->mu);
-    if (!s->head) {
-        pthread_mutex_unlock(&s->mu);
-        return NULL;
+/* Select a lane while root->mu is held. Protocol call ids are authoritative:
+ * a tool-result-only continuation may contain almost no prompt prefix, but it
+ * must return to the lane that owns the corresponding hidden/live frontier. */
+static uint32_t select_lane_locked(server *root, const request *req) {
+    uint32_t selected = 0u;
+    int best_prefix = -1;
+    uint32_t best_load = UINT32_MAX;
+    const uint32_t lane_count =
+        root->lane_count ? root->lane_count : 1u;
+
+    bool found_binding = false;
+    pthread_mutex_lock(server_tool_mutex(root));
+    for (uint32_t i = 0; i < lane_count; i++) {
+        server *lane = root->lanes ? root->lanes[i] : root;
+        if (!lane_has_live_binding_locked(lane, req)) continue;
+        if (!found_binding || lane->assigned_jobs < best_load) {
+            selected = i;
+            best_load = lane->assigned_jobs;
+            found_binding = true;
+        }
     }
-    job *j = s->head;
-    s->head = j->next;
-    if (!s->head) s->tail = NULL;
-    pthread_mutex_unlock(&s->mu);
-    j->next = NULL;
-    return j;
+    pthread_mutex_unlock(server_tool_mutex(root));
+    if (found_binding) return selected;
+
+    for (uint32_t i = 0; i < lane_count; i++) {
+        server *lane = root->lanes ? root->lanes[i] : root;
+        if (lane->assigned_jobs < best_load) {
+            best_load = lane->assigned_jobs;
+        }
+    }
+    for (uint32_t i = 0; i < lane_count; i++) {
+        server *lane = root->lanes ? root->lanes[i] : root;
+        if (lane->assigned_jobs != best_load) continue;
+        const int prefix =
+            token_prefix_len(&lane->affinity, &req->prompt);
+        if (prefix > best_prefix) {
+            selected = i;
+            best_prefix = prefix;
+        }
+    }
+    return selected;
+}
+
+static bool enqueue(server *s, job *j) {
+    server *root = server_root(s);
+    pthread_mutex_lock(&root->mu);
+    if (root->stopping) {
+        pthread_mutex_unlock(&root->mu);
+        return false;
+    }
+    const uint32_t selected = select_lane_locked(root, &j->req);
+    j->lane_id = selected;
+    server *lane = root->lanes ? root->lanes[selected] : root;
+    if (getenv("DS4_DSPARK_LOG") != NULL && root->lane_count > 1u) {
+        fprintf(stderr,
+                "ds4-server: coordinator dispatch lane=%u load=%u "
+                "prefix=%d prompt=%d\n",
+                selected,
+                lane->assigned_jobs,
+                token_prefix_len(&lane->affinity, &j->req.prompt),
+                j->req.prompt.len);
+    }
+    lane->assigned_jobs++;
+    if (root->tail) root->tail->next = j; else root->head = j;
+    root->tail = j;
+    pthread_cond_broadcast(&root->cv);
+    pthread_mutex_unlock(&root->mu);
+    return true;
+}
+
+static job *dequeue(server *lane) {
+    server *root = server_root(lane);
+    pthread_mutex_lock(&root->mu);
+    for (;;) {
+        job *previous = NULL;
+        job *j = root->head;
+        while (j && j->lane_id != lane->lane_id) {
+            previous = j;
+            j = j->next;
+        }
+        if (j) {
+            if (previous) previous->next = j->next;
+            else root->head = j->next;
+            if (root->tail == j) root->tail = previous;
+            j->next = NULL;
+            pthread_mutex_unlock(&root->mu);
+            return j;
+        }
+        if (root->stopping) {
+            pthread_mutex_unlock(&root->mu);
+            return NULL;
+        }
+        pthread_cond_wait(&root->cv, &root->mu);
+    }
 }
 
 static void *worker_main(void *arg) {
-    server *s = arg;
+    server *lane = arg;
+    server *root = server_root(lane);
     for (;;) {
-        job *j = dequeue(s);
+        job *j = dequeue(lane);
         if (!j) break;
-        generate_job(s, j);
+        generate_job(lane, j);
+        server_lane_update_affinity(lane);
+        pthread_mutex_lock(&root->mu);
+        if (lane->assigned_jobs > 0u) lane->assigned_jobs--;
+        pthread_mutex_unlock(&root->mu);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -12210,25 +12942,49 @@ static void log_context_memory(ds4_backend backend,
 }
 
 static void server_close_resources(server *s) {
+    server *root = server_root(s);
+    if (s != root) return;
     if (s->trace) {
         fclose(s->trace);
         s->trace = NULL;
     }
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
+    live_tool_state_free(&s->chat_live);
     live_tool_state_free(&s->responses_live);
     live_tool_state_free(&s->anthropic_live);
     visible_live_free(&s->thinking_live);
     for (uint32_t i = 0; i < DS4_SERVER_GPU_FRONTIER_SLOTS; i++) {
         free(s->gpu_frontier[i].text);
     }
+    ds4_tokens_free(&s->affinity);
+    if (s->lanes) {
+        for (uint32_t lane_id = 1; lane_id < s->lane_count; lane_id++) {
+            server *lane = s->lanes[lane_id];
+            if (!lane) continue;
+            live_tool_state_free(&lane->chat_live);
+            live_tool_state_free(&lane->responses_live);
+            live_tool_state_free(&lane->anthropic_live);
+            visible_live_free(&lane->thinking_live);
+            for (uint32_t i = 0; i < DS4_SERVER_GPU_FRONTIER_SLOTS; i++) {
+                free(lane->gpu_frontier[i].text);
+            }
+            ds4_tokens_free(&lane->affinity);
+            ds4_session_free(lane->session);
+            free(lane);
+        }
+    }
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
+    pthread_cond_destroy(&s->cycle_cv);
+    pthread_mutex_destroy(&s->cycle_mu);
+    pthread_mutex_destroy(&s->gpu_mu);
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mu);
     ds4_session_free(s->session);
     ds4_engine_close(s->engine);
+    free(s->lanes);
     memset(s, 0, sizeof(*s));
 }
 
@@ -12500,6 +13256,13 @@ int main(int argc, char **argv) {
 
     server s;
     memset(&s, 0, sizeof(s));
+    s.root = &s;
+    s.lane_count = 1u;
+    s.lanes = xmalloc(
+            DS4_SERVER_DSPARK_MAX_LANES * sizeof(s.lanes[0]));
+    memset(s.lanes, 0,
+           DS4_SERVER_DSPARK_MAX_LANES * sizeof(s.lanes[0]));
+    s.lanes[0] = &s;
     s.engine = engine;
     s.session = session;
     s.default_tokens = cfg.default_tokens;
@@ -12526,6 +13289,9 @@ int main(int argc, char **argv) {
     pthread_cond_init(&s.clients_cv, NULL);
     pthread_mutex_init(&s.tool_mu, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
+    pthread_mutex_init(&s.gpu_mu, NULL);
+    pthread_mutex_init(&s.cycle_mu, NULL);
+    pthread_cond_init(&s.cycle_cv, NULL);
     if (cfg.trace_path) {
         s.trace = fopen(cfg.trace_path, "w");
         if (!s.trace) {
@@ -12538,8 +13304,61 @@ int main(int argc, char **argv) {
         server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
     }
 
-    pthread_t worker;
-    if (pthread_create(&worker, NULL, worker_main, &s) != 0) die("failed to start worker");
+    const char *lane_env = getenv("DS4_SERVER_DSPARK_LANES");
+    uint32_t requested_lanes = DS4_SERVER_DSPARK_DEFAULT_LANES;
+    if (lane_env && lane_env[0]) {
+        char *end = NULL;
+        const unsigned long parsed = strtoul(lane_env, &end, 10);
+        if (end != lane_env && *end == '\0' &&
+            parsed >= 1u && parsed <= DS4_SERVER_DSPARK_MAX_LANES) {
+            requested_lanes = (uint32_t)parsed;
+        }
+    }
+    if (requested_lanes > 1u &&
+        ds4_engine_has_dspark(engine) &&
+        cfg.engine.backend == DS4_BACKEND_CUDA) {
+        for (uint32_t lane_id = 1u;
+             lane_id < requested_lanes;
+             lane_id++) {
+            ds4_session *shared = NULL;
+            if (ds4_session_create_shared(&shared, session) != 0) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: shared DSpark lane %u unavailable; "
+                           "continuing with %u lane(s)",
+                           lane_id, s.lane_count);
+                break;
+            }
+            server *lane = xmalloc(sizeof(*lane));
+            memset(lane, 0, sizeof(*lane));
+            lane->root = &s;
+            lane->lane_id = lane_id;
+            lane->engine = engine;
+            lane->session = shared;
+            lane->default_tokens = s.default_tokens;
+            lane->advertised_ctx_size = s.advertised_ctx_size;
+            lane->disable_exact_dsml_tool_replay =
+                s.disable_exact_dsml_tool_replay;
+            lane->enable_cors = s.enable_cors;
+            s.lanes[lane_id] = lane;
+            s.lane_count = lane_id + 1u;
+        }
+        if (s.lane_count > 1u) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: DSpark cohort coordinator active "
+                       "(lanes=%u, coalesce=%ldus, "
+                       "load-aware prefix dispatch, physical R=1..%u)",
+                       s.lane_count, server_coalesce_us(), s.lane_count);
+        }
+    }
+
+    pthread_t workers[DS4_SERVER_DSPARK_MAX_LANES];
+    memset(workers, 0, sizeof(workers));
+    for (uint32_t i = 0; i < s.lane_count; i++) {
+        if (pthread_create(&workers[i], NULL,
+                           worker_main, s.lanes[i]) != 0) {
+            die("failed to start worker");
+        }
+    }
 
     int lfd = listen_on(cfg.host, cfg.port);
     if (lfd < 0) {
@@ -12548,7 +13367,9 @@ int main(int argc, char **argv) {
         s.stopping = true;
         pthread_cond_broadcast(&s.cv);
         pthread_mutex_unlock(&s.mu);
-        pthread_join(worker, NULL);
+        for (uint32_t i = 0; i < s.lane_count; i++) {
+            pthread_join(workers[i], NULL);
+        }
         server_close_resources(&s);
         return 1;
     }
@@ -12597,17 +13418,25 @@ int main(int argc, char **argv) {
     s.stopping = true;
     pthread_cond_broadcast(&s.cv);
     pthread_mutex_unlock(&s.mu);
-    pthread_join(worker, NULL);
+    for (uint32_t i = 0; i < s.lane_count; i++) {
+        pthread_join(workers[i], NULL);
+    }
     pthread_mutex_lock(&s.mu);
     while (s.clients > 0) pthread_cond_wait(&s.clients_cv, &s.mu);
     pthread_mutex_unlock(&s.mu);
 
-    const ds4_tokens *tokens = ds4_session_tokens(s.session);
-    if (s.kv.enabled && tokens && tokens->len >= s.kv.opt.min_tokens) {
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: persisting current KV cache before shutdown tokens=%d",
-                   tokens->len);
-        kv_cache_store_current(&s, "shutdown", NULL);
+    for (uint32_t i = 0; i < s.lane_count; i++) {
+        server *lane = s.lanes[i];
+        const ds4_tokens *tokens =
+            ds4_session_tokens(lane->session);
+        if (s.kv.enabled && tokens &&
+            tokens->len >= s.kv.opt.min_tokens) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: persisting lane %u KV cache before "
+                       "shutdown tokens=%d",
+                       i, tokens->len);
+            kv_cache_store_current(lane, "shutdown", NULL);
+        }
     }
     server_close_resources(&s);
     return 0;
@@ -14878,6 +15707,105 @@ static void test_anthropic_tool_memory_replays_sampled_dsml(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_chat_live_tail_binds_schema_and_call_ids(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+    r.think_mode = DS4_THINK_HIGH;
+    r.chat_live_schema_text = xstrdup("");
+
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("run pwd");
+    chat_msgs_push(&msgs, user);
+
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call tc = {0};
+    tc.id = xstrdup("call_live");
+    tc.name = xstrdup("bash");
+    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.tool_call_id = xstrdup("call_live");
+    tool.content = xstrdup("/tmp");
+    chat_msgs_push(&msgs, tool);
+
+    chat_prepare_live_continuation(&r, &msgs);
+    TEST_ASSERT(r.chat_live_call_ids.len == 1);
+    TEST_ASSERT(!strcmp(r.chat_live_call_ids.v[0], "call_live"));
+    TEST_ASSERT(r.chat_live_schema_text != NULL);
+    TEST_ASSERT(r.chat_live_suffix_text != NULL);
+
+    TEST_ASSERT(!strcmp(r.chat_live_schema_text, ""));
+    TEST_ASSERT(!strncmp(r.chat_live_suffix_text,
+                         "<｜end▁of▁sentence｜><｜User｜><tool_result>",
+                         strlen("<｜end▁of▁sentence｜><｜User｜><tool_result>")));
+    TEST_ASSERT(strstr(r.chat_live_suffix_text,
+                       "/tmp</tool_result>") != NULL);
+    TEST_ASSERT(strstr(r.chat_live_suffix_text,
+                       "<｜Assistant｜><think>") != NULL);
+    TEST_ASSERT(strstr(r.chat_live_suffix_text, "bash") == NULL);
+
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    s.chat_live.valid = true;
+    s.chat_live.live_tokens = 321;
+    s.chat_live.visible_text = xstrdup("");
+    s.chat_live.visible_len = 0;
+    id_list_push_unique(&s.chat_live.call_ids, "call_live");
+    TEST_ASSERT(chat_live_matches_request(&s, &r, 321));
+
+    r.chat_live_schema_text[0] = '[';
+    TEST_ASSERT(!chat_live_matches_request(&s, &r, 321));
+
+    live_tool_state_free(&s.chat_live);
+    pthread_mutex_destroy(&s.tool_mu);
+    chat_msgs_free(&msgs);
+    request_free(&r);
+}
+
+static void test_chat_live_tail_rejects_partial_tool_results(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.api = API_OPENAI;
+
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("run both");
+    chat_msgs_push(&msgs, user);
+
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    for (int i = 0; i < 2; i++) {
+        tool_call tc = {0};
+        tc.id = xstrdup(i == 0 ? "call_a" : "call_b");
+        tc.name = xstrdup("bash");
+        tc.arguments = xstrdup("{}");
+        tool_calls_push(&assistant.calls, tc);
+    }
+    chat_msgs_push(&msgs, assistant);
+
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.tool_call_id = xstrdup("call_a");
+    tool.content = xstrdup("ok");
+    chat_msgs_push(&msgs, tool);
+
+    chat_prepare_live_continuation(&r, &msgs);
+    TEST_ASSERT(r.chat_live_call_ids.len == 0);
+    TEST_ASSERT(r.chat_live_schema_text == NULL);
+    TEST_ASSERT(r.chat_live_suffix_text == NULL);
+
+    chat_msgs_free(&msgs);
+    request_free(&r);
+}
+
 static void test_anthropic_live_tail_renders_tool_results_only(void) {
     request r;
     request_init(&r, REQ_CHAT, 128);
@@ -16879,6 +17807,99 @@ static void test_gpu_frontier_text_ring_evicts_oldest(void) {
     TEST_ASSERT(matches == 1);
 }
 
+static void test_coordinator_dispatches_by_prefix_and_tool_binding(void) {
+    server root = {0};
+    server second = {0};
+    server third = {0};
+    server *lanes[DS4_SERVER_DSPARK_MAX_LANES] = {
+        &root,
+        &second,
+        &third,
+    };
+    int affinity0[] = {1, 2, 3, 4};
+    int affinity1[] = {1, 2, 8, 9};
+    int prompt_tokens[] = {1, 2, 8, 10};
+    request req = {0};
+
+    root.root = &root;
+    root.lanes = lanes;
+    root.lane_count = 2u;
+    root.affinity = (ds4_tokens) {
+        .v = affinity0,
+        .len = 4,
+        .cap = 4,
+    };
+    second.root = &root;
+    second.lane_id = 1u;
+    second.affinity = (ds4_tokens) {
+        .v = affinity1,
+        .len = 4,
+        .cap = 4,
+    };
+    req.prompt = (ds4_tokens) {
+        .v = prompt_tokens,
+        .len = 4,
+        .cap = 4,
+    };
+    pthread_mutex_init(&root.tool_mu, NULL);
+
+    TEST_ASSERT(select_lane_locked(&root, &req) == 1u);
+
+    /* Prefix affinity is a tie-breaker, not permission to serialize unrelated
+     * active clients onto one lane. Keep an idle lane available for a second
+     * live frontier instead of forcing disk-KV swaps through the busy lane. */
+    root.assigned_jobs = 1u;
+    second.assigned_jobs = 0u;
+    req.prompt.v = affinity0;
+    TEST_ASSERT(select_lane_locked(&root, &req) == 1u);
+    req.prompt.v = prompt_tokens;
+    root.assigned_jobs = 0u;
+
+    req.api = API_RESPONSES;
+    id_list_push_unique(&req.responses_live_call_ids, "call-lane-0");
+    root.responses_live.valid = true;
+    id_list_push_unique(&root.responses_live.call_ids, "call-lane-0");
+    second.assigned_jobs = 0u;
+    root.assigned_jobs = 1u;
+    TEST_ASSERT(select_lane_locked(&root, &req) == 0u);
+
+    stop_list_clear(&req.responses_live_call_ids);
+    free(req.responses_live_call_ids.v);
+    live_tool_state_free(&root.responses_live);
+
+    memset(&req.responses_live_call_ids, 0,
+           sizeof(req.responses_live_call_ids));
+    req.api = API_OPENAI;
+    id_list_push_unique(&req.chat_live_call_ids, "call-chat-lane-1");
+    req.chat_live_schema_text = xstrdup("chat-schema");
+    second.chat_live.valid = true;
+    second.chat_live.visible_text = xstrdup("chat-schema");
+    second.chat_live.visible_len = strlen("chat-schema");
+    id_list_push_unique(&second.chat_live.call_ids, "call-chat-lane-1");
+    root.assigned_jobs = 0u;
+    second.assigned_jobs = 1u;
+    TEST_ASSERT(select_lane_locked(&root, &req) == 1u);
+
+    stop_list_clear(&req.chat_live_call_ids);
+    free(req.chat_live_call_ids.v);
+    free(req.chat_live_schema_text);
+    live_tool_state_free(&second.chat_live);
+
+    root.lane_count = 3u;
+    third.root = &root;
+    third.lane_id = 2u;
+    root.decode_active = true;
+    second.decode_active = true;
+    third.decode_active = true;
+    TEST_ASSERT(server_cohort_goal_locked(&root) == 3u);
+    third.decode_active = false;
+    TEST_ASSERT(server_cohort_goal_locked(&root) == 2u);
+    second.decode_active = false;
+    TEST_ASSERT(server_cohort_goal_locked(&root) == 2u);
+
+    pthread_mutex_destroy(&root.tool_mu);
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_request_defaults_use_min_p_filtering();
     test_thinking_sampling_respects_explicit_client_values();
@@ -16931,6 +17952,8 @@ static void ds4_server_unit_tests_run(void) {
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
     test_anthropic_tool_memory_replays_sampled_dsml();
+    test_chat_live_tail_binds_schema_and_call_ids();
+    test_chat_live_tail_rejects_partial_tool_results();
     test_anthropic_live_tail_renders_tool_results_only();
     test_anthropic_tool_result_id_validation();
     test_anthropic_full_replay_allows_unknown_live_id();
@@ -16951,6 +17974,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_with_tools_preserves_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
     test_gpu_frontier_text_ring_evicts_oldest();
+    test_coordinator_dispatches_by_prefix_and_tool_binding();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();
     test_stop_list_parses_all_sequences();

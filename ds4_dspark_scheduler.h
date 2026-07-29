@@ -18,6 +18,9 @@ typedef struct {
     /* Stable key used only for deterministic tie-breaking. Direct callers may
      * leave it zero; the stateful production API fills it from request_id. */
     uint64_t identity;
+    /* Hardware may make a short prefix effectively free. Such rows belong to
+     * the baseline batch and remain subject to exact target verification. */
+    uint32_t minimum_prefix;
     uint32_t max_prefix;
     double conditional[DS4_DSPARK_SCHEDULER_MAX_PREFIX];
 } ds4_dspark_schedule_request;
@@ -129,6 +132,12 @@ int ds4_dspark_hardware_schedule_async(
         ds4_dspark_schedule_result *result);
 
 void ds4_dspark_scheduler_state_reset(
+        ds4_dspark_scheduler_state *state);
+
+/* Drop delayed confidence after a scheduling gap while preserving the global
+ * step. The next two cohort steps therefore fall back to causal scheduling,
+ * but unrelated runtime maturity/probe counters do not re-enter startup. */
+void ds4_dspark_scheduler_state_reset_history(
         ds4_dspark_scheduler_state *state);
 
 /* Forgetting a retired request prevents a later request that reuses its

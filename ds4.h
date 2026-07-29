@@ -236,6 +236,9 @@ typedef struct {
     uint32_t start;
     uint32_t rows;
     uint32_t capture_prefixes;
+    /* Physical tail rows used only to stabilize a CUDA launch shape. They are
+     * excluded from rejection sampling and can never be committed. */
+    uint32_t shadow_tail_rows;
     int *row_tops;
     /* Optional rows * vocabulary row-major target logits.  This is intended
      * for validation and CPU sampling; production code should prefer the
@@ -263,13 +266,43 @@ typedef struct {
     float residual_uniforms[DS4_PHYSICAL_DSPARK_MAX_DRAFT];
 } ds4_physical_draft_request;
 
-/* Run each lane's DSpark drafter against its private history while sharing the
- * transient CUDA arena. The sampled q rows stay device-resident in that lane
- * until verify_suffix_rn_reject(); only tokens, confidence and uniforms cross
- * to the host scheduler. RNG state is request-owned and advanced exactly as in
- * the single-session stochastic DSpark path. */
+typedef struct {
+    ds4_session *session;
+    uint64_t request_id;
+    int first_token;
+    int max_tokens;
+    int eos_token;
+    float temperature;
+    int top_k;
+    float top_p;
+    float min_p;
+    uint64_t *rng;
+    int *accepted;
+    int accepted_cap;
+    int result;
+} ds4_speculative_request;
+
+/* Run each lane's DSpark drafter against its private history. Multi-request
+ * cohorts flatten embedding, Transformer FFN and vocabulary work into one
+ * physical CUDA batch; attention KV and causal Markov state remain lane-local.
+ * Sampled q rows stay device-resident until verify_suffix_rn_reject(); only
+ * tokens, confidence and uniforms cross to the host scheduler. RNG state is
+ * request-owned and advances exactly as in the single-session path. */
 int ds4_sessions_prepare_dspark_rn(
         ds4_physical_draft_request *requests,
+        uint32_t request_count,
+        char *err,
+        size_t errlen);
+
+/* Execute one lossless speculative cycle for independent sessions sharing the
+ * same CUDA arena. Coordinator singletons remain in the physical executor so
+ * an R>1 tail cannot trigger cold legacy graph capture; explicit serial mode
+ * restores the established R=1 path. Compatible multi-request stochastic
+ * DSpark cycles use one physical target verifier batch; unsupported policies
+ * fall back to serialized R=1 evaluation without changing target sampling
+ * semantics. */
+int ds4_sessions_eval_speculative_sample_rn(
+        ds4_speculative_request *requests,
         uint32_t request_count,
         char *err,
         size_t errlen);

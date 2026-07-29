@@ -35,6 +35,9 @@ DRAFT="${DS4_DSPARK_DRAFT:-5}"
 TELEMETRY="${DS4_TELEMETRY:-0}"
 SCHEDULER_SHADOW="${DS4_DSPARK_SCHEDULER_SHADOW:-$TELEMETRY}"
 SCHEDULER_DETERMINISTIC="${DS4_DSPARK_SCHEDULER_DETERMINISTIC:-0}"
+COORDINATOR_LANES="${DS4_SERVER_DSPARK_LANES:-2}"
+COORDINATOR_COALESCE_US="${DS4_SERVER_DSPARK_COALESCE_US:-500}"
+COORDINATOR_ACTIVE_COALESCE_US="${DS4_SERVER_DSPARK_ACTIVE_COALESCE_US:-20000}"
 if [[ -n "${DS4_DSPARK_STS_PROFILE+x}" ]]; then
   STS_PROFILE="$DS4_DSPARK_STS_PROFILE"
 else
@@ -103,6 +106,20 @@ case "$SCHEDULER_DETERMINISTIC" in
   0|1) ;;
   *) echo "Invalid DS4_DSPARK_SCHEDULER_DETERMINISTIC: $SCHEDULER_DETERMINISTIC (expected 0 or 1)" >&2; exit 2 ;;
 esac
+case "$COORDINATOR_LANES" in
+  1|2|3) ;;
+  *) echo "Invalid DS4_SERVER_DSPARK_LANES: $COORDINATOR_LANES (expected 1, 2 or 3)" >&2; exit 2 ;;
+esac
+if [[ ! "$COORDINATOR_COALESCE_US" =~ ^[0-9]+$ ]] ||
+   (( COORDINATOR_COALESCE_US > 10000 )); then
+  echo "Invalid DS4_SERVER_DSPARK_COALESCE_US: $COORDINATOR_COALESCE_US (expected 0..10000)" >&2
+  exit 2
+fi
+if [[ ! "$COORDINATOR_ACTIVE_COALESCE_US" =~ ^[0-9]+$ ]] ||
+   (( COORDINATOR_ACTIVE_COALESCE_US > 100000 )); then
+  echo "Invalid DS4_SERVER_DSPARK_ACTIVE_COALESCE_US: $COORDINATOR_ACTIVE_COALESCE_US (expected 0..100000)" >&2
+  exit 2
+fi
 if [[ "$SCHEDULER_DETERMINISTIC" == "1" ]]; then
   SCHEDULER_SHADOW=1
 fi
@@ -300,6 +317,9 @@ if [[ "$SCHEDULER_DETERMINISTIC" == "1" ]]; then
 else
   unset DS4_DSPARK_SCHEDULER_DETERMINISTIC
 fi
+export DS4_SERVER_DSPARK_LANES="$COORDINATOR_LANES"
+export DS4_SERVER_DSPARK_COALESCE_US="$COORDINATOR_COALESCE_US"
+export DS4_SERVER_DSPARK_ACTIVE_COALESCE_US="$COORDINATOR_ACTIVE_COALESCE_US"
 if [[ -n "$STS_PROFILE" ]]; then
   if [[ ! -f "$STS_PROFILE" ]]; then
     echo "DSpark STS profile not found: $STS_PROFILE" >&2
@@ -318,7 +338,8 @@ echo "Prefill: chunk=$PREFILL_CHUNK final-logits-only=${DS4_PREFILL_FINAL_LOGITS
 echo "Streaming: decode-heartbeat=${DS4_STREAM_HEARTBEAT_SEC}s"
 echo "KV:     policy=$DS4_KV_PREFILL_CHECKPOINT_POLICY keep-long-text-hits=$DS4_KV_KEEP_LONG_TEXT_HITS canonical-min-sec=$DS4_KV_CANONICAL_PREFILL_MIN_SEC cold-max=$KV_COLD_MAX_TOKENS long-anchor-min=$DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS trim=$DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS disk-mb=$KV_DISK_SPACE_MB"
 echo "Context guard: physical=$CTX advertise=${ADVERTISE_CONTEXT_PCT}%"
-echo "DSpark scheduler: hardware-aware Algorithm 1 + exact t-2 production capacity (physical CUDA R<=3 ready, HTTP cohorting=off), full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY shadow=$SCHEDULER_SHADOW deterministic=$SCHEDULER_DETERMINISTIC"
+echo "DSpark scheduler: hardware-aware Algorithm 1 + exact t-2 production capacity, full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY shadow=$SCHEDULER_SHADOW deterministic=$SCHEDULER_DETERMINISTIC"
+echo "DSpark coordinator: lanes=$COORDINATOR_LANES coalesce=${COORDINATOR_COALESCE_US}us active-rendezvous=${COORDINATOR_ACTIVE_COALESCE_US}us load-aware-prefix=1 physical-R1..R${COORDINATOR_LANES}=cost-gated serial-fallback=1"
 echo "DSpark STS: profile=${STS_PROFILE:-online-fallback} capture=${DS4_DSPARK_STS_CAPTURE:-disabled}"
 echo "DSpark parity: confidence-input=$CONFIDENCE_INPUT, verifier-topology-cache=$GRAPH_TOPOLOGY_CACHE"
 echo "DSpark sampling: lossless p/q rejection for top_k=0 top_p=1 min-p policy (rollback DS4_DSPARK_REJECTION_DISABLE=1)"

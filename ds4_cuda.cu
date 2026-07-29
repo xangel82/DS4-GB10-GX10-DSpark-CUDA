@@ -6561,12 +6561,13 @@ __global__ static void matmul_q8_0_preq_batch_warp8_kernel(
     if (lane == 0) out[tok * out_dim + row] = acc;
 }
 
-/* Tiny verifier batches repeatedly multiply the same Q8 row by 2..6 token
+/* Tiny verifier batches repeatedly multiply the same Q8 row by 2..8 token
  * activations.  The generic grid uses a separate CUDA block for every token,
  * re-reading the full weight row N times.  GB10 has ample parallelism across
  * output rows, so keep one block per row and reuse each packed Q8 block across
  * all token accumulators.  Per-token block assignment and the 256-lane tree
  * reduction are unchanged, preserving the native Q8 numerical order. */
+template <uint32_t MAX_TOKENS>
 __global__ static void matmul_q8_0_preq_batch_reuse_kernel(
         float *out,
         const unsigned char *w,
@@ -6577,7 +6578,7 @@ __global__ static void matmul_q8_0_preq_batch_reuse_kernel(
         uint32_t n_tok,
         uint64_t blocks,
         int use_dp4a) {
-    enum { MAX_TOKENS = 6, THREADS = 256 };
+    enum { THREADS = 256 };
     const uint64_t row = (uint64_t)blockIdx.x;
     const uint32_t tid = threadIdx.x;
     if (row >= out_dim || n_tok == 0 || n_tok > MAX_TOKENS) return;
@@ -8423,6 +8424,244 @@ __global__ static void attention_indexed_mixed_rn_kernel(
     }
 }
 
+/* Dense request-aware counterpart of attention_decode_mixed_kernel.  The
+ * request metadata changes only KV/position lookup; the dot products, FP32
+ * reduction tree, softmax, and value accumulation retain the R=1 order. */
+template <bool COMP_F16>
+__global__ static void attention_decode_mixed_rn_ptrs_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *const *raw_kv_ptrs,
+        const void *const *comp_kv_ptrs,
+        const uint32_t *row_request,
+        const uint32_t *row_position,
+        const uint32_t *request_position,
+        const uint32_t *request_rows,
+        const uint32_t *request_n_raw,
+        const uint32_t *request_raw_start,
+        const uint32_t *request_n_comp,
+        uint32_t row_count,
+        uint32_t request_count,
+        uint32_t raw_cap,
+        uint32_t comp_cap,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    if (t >= row_count || h >= n_head) return;
+    const uint32_t request = row_request[t];
+    if (request >= request_count) return;
+
+    const uint32_t rows = request_rows[request];
+    const uint32_t pos0 = request_position[request];
+    const uint32_t qpos = row_position[t];
+    const bool single_all = rows == 1u && ratio == 0u;
+    uint32_t n_raw = request_n_raw[request];
+    if (n_raw > raw_cap) n_raw = raw_cap;
+    uint32_t raw_start = request_raw_start[request];
+    if (raw_cap != 0u) raw_start %= raw_cap;
+    uint32_t n_comp = request_n_comp[request];
+    if (n_comp > comp_cap) n_comp = comp_cap;
+    const uint32_t sequence_end = pos0 + rows;
+    const uint32_t first_raw_pos =
+        sequence_end >= n_raw ? sequence_end - n_raw : 0u;
+    uint32_t visible_comp =
+        single_all ? n_comp
+                   : (n_comp != 0u ? (qpos + 1u) / ratio : 0u);
+    if (visible_comp > n_comp) visible_comp = n_comp;
+
+    const float *raw_kv = raw_kv_ptrs[request];
+    const void *comp_kv = comp_kv_ptrs[request];
+    const float *qh =
+        q + ((uint64_t)t * n_head + h) * head_dim;
+    __shared__ float scores[DS4_CUDA_ATTENTION_SCORE_CAP];
+    __shared__ uint32_t raw_rows[256];
+    __shared__ float partial[256];
+    __shared__ float max_s;
+    __shared__ float denom;
+    __shared__ uint32_t raw_count;
+    __shared__ uint32_t raw_first_idx;
+    const float scale = rsqrtf((float)head_dim);
+
+    if (threadIdx.x == 0) {
+        raw_count = 0u;
+        raw_first_idx = 0u;
+        if (n_raw != 0u) {
+            const uint32_t raw_last_pos =
+                first_raw_pos + n_raw - 1u;
+            if (single_all) {
+                raw_count = n_raw > 256u ? 256u : n_raw;
+            } else if (qpos >= first_raw_pos) {
+                uint32_t lo = first_raw_pos;
+                if (window != 0u && qpos + 1u > window) {
+                    const uint32_t wlo = qpos + 1u - window;
+                    if (wlo > lo) lo = wlo;
+                }
+                const uint32_t hi =
+                    qpos < raw_last_pos ? qpos : raw_last_pos;
+                if (hi >= lo) {
+                    raw_first_idx = lo - first_raw_pos;
+                    raw_count = hi - lo + 1u;
+                    if (raw_count > 256u) raw_count = 256u;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    for (uint32_t r = threadIdx.x; r < raw_count;
+         r += blockDim.x) {
+        raw_rows[r] =
+            (raw_start + raw_first_idx + r) % raw_cap;
+    }
+    __syncthreads();
+
+    const uint32_t n_score = raw_count + visible_comp;
+    float local_max = sinks[h];
+    if (visible_comp == 0u || rows == 1u) {
+        for (uint32_t r = threadIdx.x; r < raw_count;
+             r += blockDim.x) {
+            const float *kvrow =
+                raw_kv + (uint64_t)raw_rows[r] * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) {
+                dot += qh[d] * kvrow[d];
+            }
+            scores[r] = dot * scale;
+            local_max = fmaxf(local_max, scores[r]);
+        }
+        for (uint32_t c = threadIdx.x; c < visible_comp;
+             c += blockDim.x) {
+            float dot = 0.0f;
+            const uint64_t row_off = (uint64_t)c * head_dim;
+            for (uint32_t d = 0; d < head_dim; d++) {
+                dot += qh[d] *
+                    attention_comp_load<COMP_F16>(
+                            comp_kv, row_off + d);
+            }
+            const float score = dot * scale;
+            scores[raw_count + c] = score;
+            local_max = fmaxf(local_max, score);
+        }
+    } else {
+        const uint32_t qlane = threadIdx.x & 7u;
+        const uint32_t qgroup = threadIdx.x >> 3u;
+        for (uint32_t row0 = 0; row0 < n_score; row0 += 32u) {
+            const uint32_t row = row0 + qgroup;
+            if (row < n_score) {
+                const bool use_comp = row >= raw_count;
+                const float *raw_row = use_comp
+                    ? NULL
+                    : raw_kv +
+                        (uint64_t)raw_rows[row] * head_dim;
+                const uint64_t comp_off = use_comp
+                    ? (uint64_t)(row - raw_count) * head_dim
+                    : 0u;
+                float dot = 0.0f;
+                for (uint32_t d = qlane; d < head_dim;
+                     d += 8u) {
+                    const float kv = use_comp
+                        ? attention_comp_load<COMP_F16>(
+                              comp_kv, comp_off + d)
+                        : raw_row[d];
+                    dot += qh[d] * kv;
+                }
+                const uint32_t mask =
+                    0xffu << (threadIdx.x & 24u);
+                for (uint32_t off = 4u; off > 0u; off >>= 1u) {
+                    dot += __shfl_down_sync(mask, dot, off, 8);
+                }
+                if (qlane == 0u) scores[row] = dot * scale;
+            }
+        }
+        __syncthreads();
+        for (uint32_t i = threadIdx.x; i < n_score;
+             i += blockDim.x) {
+            local_max = fmaxf(local_max, scores[i]);
+        }
+    }
+
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u;
+         stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] =
+                fmaxf(partial[threadIdx.x],
+                      partial[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) max_s = partial[0];
+    __syncthreads();
+
+    float den_local = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n_score;
+         i += blockDim.x) {
+        scores[i] = expf(scores[i] - max_s);
+        den_local += scores[i];
+    }
+    partial[threadIdx.x] = den_local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1u;
+         stride > 0u; stride >>= 1u) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] +=
+                partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0u) {
+        denom = partial[0] + expf(sinks[h] - max_s);
+    }
+    __syncthreads();
+
+    float *oh =
+        heads + ((uint64_t)t * n_head + h) * head_dim;
+    if (head_dim == 512u && blockDim.x == 256u) {
+        const uint32_t d0 = threadIdx.x;
+        const uint32_t d1 = d0 + 256u;
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        for (uint32_t r = 0; r < raw_count; r++) {
+            const float score = scores[r];
+            const float *kv =
+                raw_kv + (uint64_t)raw_rows[r] * head_dim;
+            acc0 += kv[d0] * score;
+            acc1 += kv[d1] * score;
+        }
+        for (uint32_t c = 0; c < visible_comp; c++) {
+            const float score = scores[raw_count + c];
+            const uint64_t row_off = (uint64_t)c * head_dim;
+            acc0 += attention_comp_load<COMP_F16>(
+                        comp_kv, row_off + d0) * score;
+            acc1 += attention_comp_load<COMP_F16>(
+                        comp_kv, row_off + d1) * score;
+        }
+        oh[d0] = acc0 / denom;
+        oh[d1] = acc1 / denom;
+    } else {
+        for (uint32_t d = threadIdx.x; d < head_dim;
+             d += blockDim.x) {
+            float acc = 0.0f;
+            for (uint32_t r = 0; r < raw_count; r++) {
+                acc += raw_kv[
+                           (uint64_t)raw_rows[r] * head_dim + d] *
+                       scores[r];
+            }
+            for (uint32_t c = 0; c < visible_comp; c++) {
+                acc += attention_comp_load<COMP_F16>(
+                           comp_kv,
+                           (uint64_t)c * head_dim + d) *
+                       scores[raw_count + c];
+            }
+            oh[d] = acc / denom;
+        }
+    }
+}
+
 /* Decode on Flash uses one shared 512-wide latent K/V row for every attention
  * head.  The generic one-head/block kernels maximize grid parallelism, but at
  * long context they also issue the same K/V loads once per head.  This GB10
@@ -9072,6 +9311,224 @@ __global__ static void attention_indexed_mixed_heads8_online_kernel(
         o3.x *= inv_s; o3.y *= inv_s; o3.z *= inv_s; o3.w *= inv_s;
         float4 *out4 = (float4 *)(heads + ((uint64_t)t * n_head + head) * head_dim);
         out4[lane +  0u] = o0;
+        out4[lane + 32u] = o1;
+        out4[lane + 64u] = o2;
+        out4[lane + 96u] = o3;
+    }
+}
+
+/* Request-aware form of the verifier's existing heads-grouped online
+ * attention.  Only cache/position lookup changes: arithmetic within each
+ * head follows attention_indexed_mixed_heads8_online_kernel exactly so
+ * physical R=n scheduling does not introduce another numerical path. */
+template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP, bool COMP_F16>
+__global__ static void attention_indexed_mixed_heads8_online_rn_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *const *raw_kv_ptrs,
+        const void *const *comp_kv_ptrs,
+        const int32_t *topk,
+        const uint32_t *row_request,
+        const uint32_t *row_position,
+        const uint32_t *request_position,
+        const uint32_t *request_rows,
+        const uint32_t *request_n_raw,
+        const uint32_t *request_raw_start,
+        const uint32_t *request_n_comp,
+        uint32_t row_count,
+        uint32_t request_count,
+        uint32_t raw_cap,
+        uint32_t comp_cap,
+        uint32_t top_k,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const uint32_t t = blockIdx.x;
+    const uint32_t head_group = blockIdx.y;
+    if (t >= row_count || head_dim != 512u) return;
+    const uint32_t request = row_request[t];
+    if (request >= request_count) return;
+
+    const uint32_t lane = threadIdx.x & 31u;
+    const uint32_t warp = threadIdx.x >> 5u;
+    const uint32_t head = head_group * HEADS_PER_GROUP + warp;
+    const bool valid_head = head < n_head;
+    const uint32_t qpos = row_position[t];
+    uint32_t n_raw = request_n_raw[request];
+    if (n_raw > raw_cap) n_raw = raw_cap;
+    uint32_t raw_start = request_raw_start[request];
+    if (raw_cap != 0u) raw_start %= raw_cap;
+    uint32_t n_comp = request_n_comp[request];
+    if (n_comp > comp_cap) n_comp = comp_cap;
+    const uint32_t sequence_end =
+        request_position[request] + request_rows[request];
+    const uint32_t first_raw_pos =
+        sequence_end >= n_raw ? sequence_end - n_raw : 0u;
+    uint32_t visible_comp = n_comp;
+    if (ratio != 0u) {
+        visible_comp = (qpos + 1u) / ratio;
+        if (visible_comp > n_comp) visible_comp = n_comp;
+    }
+
+    const float *raw_kv = raw_kv_ptrs[request];
+    const void *comp_kv = comp_kv_ptrs[request];
+    __shared__ uint32_t raw_rows[256];
+    __shared__ uint32_t raw_count;
+    __shared__ uint32_t raw_first_idx;
+    __shared__ float4 kv_shared[ROWS_PER_STAGE * 128];
+
+    if (threadIdx.x == 0) {
+        raw_count = 0;
+        raw_first_idx = 0;
+        if (n_raw != 0u) {
+            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+            if (qpos >= first_raw_pos) {
+                uint32_t lo = first_raw_pos;
+                if (window != 0u && qpos + 1u > window) {
+                    const uint32_t wlo = qpos + 1u - window;
+                    if (wlo > lo) lo = wlo;
+                }
+                const uint32_t hi =
+                    qpos < raw_last_pos ? qpos : raw_last_pos;
+                if (hi >= lo) {
+                    raw_first_idx = lo - first_raw_pos;
+                    raw_count = hi - lo + 1u;
+                    if (raw_count > 256u) raw_count = 256u;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
+        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+    }
+    __syncthreads();
+
+    uint32_t comp_count = top_k < visible_comp ? top_k : visible_comp;
+    if (comp_count > 512u) comp_count = 512u;
+    const uint32_t n_score = raw_count + comp_count;
+    const float scale = rsqrtf((float)head_dim);
+    const float4 *q4 = valid_head
+        ? (const float4 *)(q +
+              ((uint64_t)t * n_head + head) * head_dim)
+        : NULL;
+    float4 q0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 q1 = q0, q2 = q0, q3 = q0;
+    if (valid_head) {
+        q0 = q4[lane + 0u];
+        q1 = q4[lane + 32u];
+        q2 = q4[lane + 64u];
+        q3 = q4[lane + 96u];
+    }
+
+    float max_s = -INFINITY;
+    float sum_s = 0.0f;
+    float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 o1 = o0, o2 = o0, o3 = o0;
+
+    for (uint32_t row0 = 0; row0 < n_score;
+         row0 += ROWS_PER_STAGE) {
+        const uint32_t nr =
+            n_score - row0 < ROWS_PER_STAGE
+                ? n_score - row0
+                : ROWS_PER_STAGE;
+        for (uint32_t off = threadIdx.x; off < nr * 128u;
+             off += blockDim.x) {
+            const uint32_t rr = off >> 7u;
+            const uint32_t c4 = off & 127u;
+            const uint32_t sr = row0 + rr;
+            const uint32_t comp_idx = sr < raw_count
+                ? 0u
+                : (uint32_t)topk[
+                      (uint64_t)t * top_k + (sr - raw_count)];
+            if (sr < raw_count) {
+                const float4 *src = (const float4 *)(
+                    raw_kv +
+                    (uint64_t)raw_rows[sr] * head_dim);
+                kv_shared[off] = src[c4];
+            } else {
+                kv_shared[off] =
+                    attention_comp_load4<COMP_F16>(
+                        comp_kv,
+                        (uint64_t)comp_idx * head_dim +
+                            (uint64_t)c4 * 4u);
+            }
+        }
+        __syncthreads();
+        if (valid_head) {
+            for (uint32_t rr = 0; rr < nr; rr++) {
+                const float4 *kv4 = kv_shared + rr * 128u;
+                const float4 k0 = kv4[lane + 0u];
+                const float4 k1 = kv4[lane + 32u];
+                const float4 k2 = kv4[lane + 64u];
+                const float4 k3 = kv4[lane + 96u];
+                float score = dot4_f32(q0, k0) +
+                              dot4_f32(q1, k1) +
+                              dot4_f32(q2, k2) +
+                              dot4_f32(q3, k3);
+                score = warp_sum_f32(score) * scale;
+                score = __shfl_sync(
+                    0xffffffffu, score, 0);
+
+                const float new_m = fmaxf(max_s, score);
+                const float old_scale =
+                    new_m == max_s ? 1.0f : expf(max_s - new_m);
+                const float row_scale =
+                    score == new_m ? 1.0f : expf(score - new_m);
+                sum_s = sum_s * old_scale + row_scale;
+                o0.x = o0.x * old_scale + k0.x * row_scale;
+                o0.y = o0.y * old_scale + k0.y * row_scale;
+                o0.z = o0.z * old_scale + k0.z * row_scale;
+                o0.w = o0.w * old_scale + k0.w * row_scale;
+                o1.x = o1.x * old_scale + k1.x * row_scale;
+                o1.y = o1.y * old_scale + k1.y * row_scale;
+                o1.z = o1.z * old_scale + k1.z * row_scale;
+                o1.w = o1.w * old_scale + k1.w * row_scale;
+                o2.x = o2.x * old_scale + k2.x * row_scale;
+                o2.y = o2.y * old_scale + k2.y * row_scale;
+                o2.z = o2.z * old_scale + k2.z * row_scale;
+                o2.w = o2.w * old_scale + k2.w * row_scale;
+                o3.x = o3.x * old_scale + k3.x * row_scale;
+                o3.y = o3.y * old_scale + k3.y * row_scale;
+                o3.z = o3.z * old_scale + k3.z * row_scale;
+                o3.w = o3.w * old_scale + k3.w * row_scale;
+                max_s = new_m;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (valid_head) {
+        const float sink = sinks[head];
+        const float new_m = fmaxf(max_s, sink);
+        const float old_scale =
+            new_m == max_s ? 1.0f : expf(max_s - new_m);
+        const float sink_scale = expf(sink - new_m);
+        sum_s = sum_s * old_scale + sink_scale;
+        o0.x *= old_scale; o0.y *= old_scale;
+        o0.z *= old_scale; o0.w *= old_scale;
+        o1.x *= old_scale; o1.y *= old_scale;
+        o1.z *= old_scale; o1.w *= old_scale;
+        o2.x *= old_scale; o2.y *= old_scale;
+        o2.z *= old_scale; o2.w *= old_scale;
+        o3.x *= old_scale; o3.y *= old_scale;
+        o3.z *= old_scale; o3.w *= old_scale;
+
+        const float inv_s =
+            sum_s == 0.0f ? 0.0f : 1.0f / sum_s;
+        o0.x *= inv_s; o0.y *= inv_s;
+        o0.z *= inv_s; o0.w *= inv_s;
+        o1.x *= inv_s; o1.y *= inv_s;
+        o1.z *= inv_s; o1.w *= inv_s;
+        o2.x *= inv_s; o2.y *= inv_s;
+        o2.z *= inv_s; o2.w *= inv_s;
+        o3.x *= inv_s; o3.y *= inv_s;
+        o3.z *= inv_s; o3.w *= inv_s;
+        float4 *out4 = (float4 *)(
+            heads + ((uint64_t)t * n_head + head) * head_dim);
+        out4[lane + 0u] = o0;
         out4[lane + 32u] = o1;
         out4[lane + 64u] = o2;
         out4[lane + 96u] = o3;
@@ -14094,7 +14551,7 @@ static int cuda_q8_batch_reuse_enabled(void) {
     if (enabled && !notice) {
         notice = 1;
         fprintf(stderr,
-                "ds4: CUDA Q8 tiny-batch weight reuse enabled (2..6 rows)\n");
+                "ds4: CUDA Q8 tiny-batch weight reuse enabled (2..8 rows)\n");
     }
     return enabled;
 }
@@ -14224,17 +14681,32 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
                 use_dp4a);
         return cuda_ok(cudaGetLastError(), "matmul_q8_0 batch warp launch");
     }
-    if (n_tok <= 6u && blocks > 32u && cuda_q8_batch_reuse_enabled()) {
-        matmul_q8_0_preq_batch_reuse_kernel<<<(unsigned)out_dim, 256>>>(
-                (float *)out->ptr,
-                reinterpret_cast<const unsigned char *>(wptr),
-                xq,
-                xscale,
-                in_dim,
-                out_dim,
-                (uint32_t)n_tok,
-                blocks,
-                use_dp4a);
+    if (n_tok <= 8u && blocks > 32u && cuda_q8_batch_reuse_enabled()) {
+        if (n_tok <= 6u) {
+            matmul_q8_0_preq_batch_reuse_kernel<6u>
+                    <<<(unsigned)out_dim, 256>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        xq,
+                        xscale,
+                        in_dim,
+                        out_dim,
+                        (uint32_t)n_tok,
+                        blocks,
+                        use_dp4a);
+        } else {
+            matmul_q8_0_preq_batch_reuse_kernel<8u>
+                    <<<(unsigned)out_dim, 256>>>(
+                        (float *)out->ptr,
+                        reinterpret_cast<const unsigned char *>(wptr),
+                        xq,
+                        xscale,
+                        in_dim,
+                        out_dim,
+                        (uint32_t)n_tok,
+                        blocks,
+                        use_dp4a);
+        }
         return cuda_ok(cudaGetLastError(),
                        "matmul_q8_0 tiny-batch reuse launch");
     }
@@ -17450,6 +17922,83 @@ extern "C" int ds4_gpu_attention_indexed_mixed_rn_ptrs_heads_tensor(
             model_map, sinks_offset,
             (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+    const int32_t *topk_ptr = (const int32_t *)topk->ptr;
+    if (row_count > 1u && top_k == 512u &&
+        getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
+        const uint64_t sort_bytes =
+            (uint64_t)row_count * top_k * sizeof(int32_t);
+        int32_t *sorted = (int32_t *)cuda_tmp_alloc(
+                sort_bytes, "physical R=n indexed attention topk sort");
+        if (!sorted) return 0;
+        indexed_topk_sort_512_asc_kernel<<<row_count, 512>>>(
+                sorted, topk_ptr, row_count);
+        if (!cuda_ok(cudaGetLastError(),
+                     "physical R=n indexed attention topk sort launch")) {
+            return 0;
+        }
+        topk_ptr = sorted;
+    }
+    if (head_dim == 512u && top_k <= 512u &&
+        getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
+        dim3 grouped_grid(
+                row_count,
+                (n_head + 15u) / 16u,
+                1u);
+        if (comp_kv_f16) {
+            attention_indexed_mixed_heads8_online_rn_kernel<
+                    8, 16, true><<<grouped_grid, 512>>>(
+                (float *)heads->ptr,
+                sinks,
+                (const float *)q->ptr,
+                (const float *const *)raw_cache_table->ptr,
+                (const void *const *)comp_cache_table->ptr,
+                topk_ptr,
+                (const uint32_t *)row_request->ptr,
+                (const uint32_t *)row_position->ptr,
+                (const uint32_t *)request_position->ptr,
+                (const uint32_t *)request_rows->ptr,
+                (const uint32_t *)request_n_raw->ptr,
+                (const uint32_t *)request_raw_start->ptr,
+                (const uint32_t *)request_n_comp->ptr,
+                row_count,
+                request_count,
+                raw_cap,
+                comp_cap,
+                top_k,
+                window,
+                ratio,
+                n_head,
+                head_dim);
+        } else {
+            attention_indexed_mixed_heads8_online_rn_kernel<
+                    8, 16, false><<<grouped_grid, 512>>>(
+                (float *)heads->ptr,
+                sinks,
+                (const float *)q->ptr,
+                (const float *const *)raw_cache_table->ptr,
+                (const void *const *)comp_cache_table->ptr,
+                topk_ptr,
+                (const uint32_t *)row_request->ptr,
+                (const uint32_t *)row_position->ptr,
+                (const uint32_t *)request_position->ptr,
+                (const uint32_t *)request_rows->ptr,
+                (const uint32_t *)request_n_raw->ptr,
+                (const uint32_t *)request_raw_start->ptr,
+                (const uint32_t *)request_n_comp->ptr,
+                row_count,
+                request_count,
+                raw_cap,
+                comp_cap,
+                top_k,
+                window,
+                ratio,
+                n_head,
+                head_dim);
+        }
+        return cuda_ok(
+                cudaGetLastError(),
+                "attention indexed physical R=n heads16 launch");
+    }
     dim3 grid(row_count, n_head, 1u);
     if (comp_kv_f16) {
         attention_indexed_mixed_rn_kernel<true, true><<<grid, 256>>>(
@@ -17460,7 +18009,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_rn_ptrs_heads_tensor(
             nullptr,
             (const float *const *)raw_cache_table->ptr,
             (const void *const *)comp_cache_table->ptr,
-            (const int32_t *)topk->ptr,
+            topk_ptr,
             (const uint32_t *)row_request->ptr,
             (const uint32_t *)row_position->ptr,
             (const uint32_t *)request_position->ptr,
@@ -17487,7 +18036,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_rn_ptrs_heads_tensor(
             nullptr,
             (const float *const *)raw_cache_table->ptr,
             (const void *const *)comp_cache_table->ptr,
-            (const int32_t *)topk->ptr,
+            topk_ptr,
             (const uint32_t *)row_request->ptr,
             (const uint32_t *)row_position->ptr,
             (const uint32_t *)request_position->ptr,
@@ -17508,6 +18057,118 @@ extern "C" int ds4_gpu_attention_indexed_mixed_rn_ptrs_heads_tensor(
     }
     return cuda_ok(cudaGetLastError(),
                    "attention indexed physical R=n pointer launch");
+}
+
+extern "C" int ds4_gpu_attention_mixed_rn_ptrs_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_cache_table,
+        const ds4_gpu_tensor *comp_cache_table,
+        uint32_t                comp_kv_f16,
+        const ds4_gpu_tensor *row_request,
+        const ds4_gpu_tensor *row_position,
+        const ds4_gpu_tensor *request_position,
+        const ds4_gpu_tensor *request_rows,
+        const ds4_gpu_tensor *request_n_raw,
+        const ds4_gpu_tensor *request_raw_start,
+        const ds4_gpu_tensor *request_n_comp,
+        uint32_t                row_count,
+        uint32_t                request_count,
+        uint32_t                raw_cap,
+        uint32_t                comp_cap,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    const uint64_t row_meta_bytes =
+        (uint64_t)row_count * sizeof(uint32_t);
+    const uint64_t request_meta_bytes =
+        (uint64_t)request_count * sizeof(uint32_t);
+    const uint64_t q_values =
+        (uint64_t)row_count * n_head * head_dim;
+    const uint64_t table_bytes =
+        (uint64_t)request_count * sizeof(void *);
+    if (comp_kv_f16 > 1u || !heads || !model_map || !q ||
+        !raw_cache_table || !comp_cache_table ||
+        !row_request || !row_position || !request_position ||
+        !request_rows || !request_n_raw || !request_raw_start ||
+        !request_n_comp || row_count == 0u || request_count == 0u ||
+        raw_cap == 0u || n_head == 0u || head_dim == 0u ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) >
+            model_size - sinks_offset ||
+        heads->bytes < q_values * sizeof(float) ||
+        q->bytes < q_values * sizeof(float) ||
+        raw_cache_table->bytes < table_bytes ||
+        comp_cache_table->bytes < table_bytes ||
+        row_request->bytes < row_meta_bytes ||
+        row_position->bytes < row_meta_bytes ||
+        request_position->bytes < request_meta_bytes ||
+        request_rows->bytes < request_meta_bytes ||
+        request_n_raw->bytes < request_meta_bytes ||
+        request_raw_start->bytes < request_meta_bytes ||
+        request_n_comp->bytes < request_meta_bytes) {
+        return 0;
+    }
+    const float *sinks = (const float *)cuda_model_range_ptr(
+            model_map, sinks_offset,
+            (uint64_t)n_head * sizeof(float), "attn_sinks");
+    if (!sinks) return 0;
+
+    dim3 grid(row_count, n_head, 1u);
+    if (comp_kv_f16) {
+        attention_decode_mixed_rn_ptrs_kernel<true>
+            <<<grid, 256>>>(
+                (float *)heads->ptr,
+                sinks,
+                (const float *)q->ptr,
+                (const float *const *)raw_cache_table->ptr,
+                (const void *const *)comp_cache_table->ptr,
+                (const uint32_t *)row_request->ptr,
+                (const uint32_t *)row_position->ptr,
+                (const uint32_t *)request_position->ptr,
+                (const uint32_t *)request_rows->ptr,
+                (const uint32_t *)request_n_raw->ptr,
+                (const uint32_t *)request_raw_start->ptr,
+                (const uint32_t *)request_n_comp->ptr,
+                row_count,
+                request_count,
+                raw_cap,
+                comp_cap,
+                window,
+                ratio,
+                n_head,
+                head_dim);
+    } else {
+        attention_decode_mixed_rn_ptrs_kernel<false>
+            <<<grid, 256>>>(
+                (float *)heads->ptr,
+                sinks,
+                (const float *)q->ptr,
+                (const float *const *)raw_cache_table->ptr,
+                (const void *const *)comp_cache_table->ptr,
+                (const uint32_t *)row_request->ptr,
+                (const uint32_t *)row_position->ptr,
+                (const uint32_t *)request_position->ptr,
+                (const uint32_t *)request_rows->ptr,
+                (const uint32_t *)request_n_raw->ptr,
+                (const uint32_t *)request_raw_start->ptr,
+                (const uint32_t *)request_n_comp->ptr,
+                row_count,
+                request_count,
+                raw_cap,
+                comp_cap,
+                window,
+                ratio,
+                n_head,
+                head_dim);
+    }
+    return cuda_ok(
+            cudaGetLastError(),
+            "attention dense physical R=n pointer launch");
 }
 
 static int attention_prefill_mixed_launch(
@@ -21478,7 +22139,7 @@ static int routed_moe_aligned_launch(
     bool output_summed = false;
     if (n_tokens <= 16u) {
         const bool use_gb10_small_batch =
-            n_tokens >= 2u && n_tokens <= 6u &&
+            n_tokens >= 2u && n_tokens <= 8u &&
             g_moe_gb10_sign_validation == 1;
         const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
         const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
@@ -22562,7 +23223,7 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
     std::vector<float> out_direct_host((uint64_t)16u * out_dim);
     std::vector<float> out_soa_prefix_host((uint64_t)16u * out_dim);
     std::vector<float> out_q8k_host((uint64_t)16u * out_dim);
-    std::vector<float> out_q8k_gb10_host((uint64_t)6u * out_dim);
+    std::vector<float> out_q8k_gb10_host((uint64_t)8u * out_dim);
     std::vector<float> out_ref_prefix_host((uint64_t)16u * out_dim);
     uint64_t q8k_gb10_bad = 0;
     double q8k_gb10_max_abs = 0.0;
@@ -22898,12 +23559,13 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
                (uint64_t)16u * out_dim * sizeof(float));
     }
 
-    /* Exercise every target-verifier width used by DSpark. The optimized
+    /* Exercise every target-verifier width used by DSpark and the first
+     * physical R=n width. The optimized
      * kernels retain the old aligned kernel above as their numerical oracle;
-     * all five shapes must agree at the same strict production tolerance. */
+     * all seven shapes must agree at the same strict production tolerance. */
     if (ok) ok = cuda_moe_gb10_validate_signs();
     for (uint32_t verifier_tokens = 2u;
-         ok && verifier_tokens <= 6u;
+         ok && verifier_tokens <= 8u;
          verifier_tokens++) {
         moe_gate_up_mid_aligned_q8K_gb10_kernel<<<
                 dim3((mid_dim + 255u) / 256u,
@@ -23080,7 +23742,7 @@ extern "C" int ds4_gpu_mmq_prefill_self_test(void) {
                 q8k_out_stats.max_abs,
                 (unsigned long long)q8k_out_stats.bad);
         fprintf(stderr,
-                "cuda-regression: GB10 aligned MoE verifier N=2..6 parity "
+                "cuda-regression: GB10 aligned MoE verifier N=2..8 parity "
                 "max=%.8g bad=%llu\n",
                 q8k_gb10_max_abs,
                 (unsigned long long)q8k_gb10_bad);

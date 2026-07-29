@@ -114,6 +114,36 @@ static void test_zero_prefix_and_ties(void) {
                  "K=0 must remain a valid hardware-aware decision");
 }
 
+static void test_hardware_minimum_prefix(void) {
+    ds4_dspark_schedule_request request[2];
+    memset(request, 0, sizeof(request));
+    request[0].minimum_prefix = request[1].minimum_prefix = 1;
+    request[0].max_prefix = request[1].max_prefix = 2;
+    request[0].conditional[0] = 0.90;
+    request[0].conditional[1] = 0.80;
+    request[1].conditional[0] = 0.70;
+    request[1].conditional[1] = 0.60;
+    const double sps[] =
+        {0.0, 0.0, 0.0, 0.0, 10.0, 9.0, 5.0};
+    ds4_dspark_schedule_result result;
+    require_true(ds4_dspark_hardware_schedule(
+                     request, 2, sps, 7, &result) == 0,
+                 "minimum-prefix schedule failed");
+    require_true(result.prefix[0] == 2 && result.prefix[1] == 1,
+                 "minimum-prefix allocation must choose A2/B1");
+    require_true(result.batch_size == 5,
+                 "minimum-prefix physical batch must be 5");
+    require_close(result.expected_tokens, 4.32,
+                  "minimum-prefix expected tokens");
+    require_close(result.baseline_throughput, 36.0,
+                  "minimum-prefix baseline throughput");
+
+    request[0].minimum_prefix = 3;
+    require_true(ds4_dspark_hardware_schedule(
+                     request, 2, sps, 7, &result) != 0,
+                 "minimum prefix above max must be rejected");
+}
+
 static void test_async_crosses_jagged_hardware_cliff(void) {
     ds4_dspark_schedule_request history = {
         .max_prefix = 3,
@@ -229,6 +259,39 @@ static void test_stateful_two_step_barrier(void) {
                  "third step must cross the two-step barrier");
     require_true(result.selected.prefix[0] == 2,
                  "historical capacity must be filled by current confidence");
+}
+
+static void test_history_reset_preserves_runtime_step(void) {
+    ds4_dspark_scheduler_state state;
+    ds4_dspark_scheduler_state_reset(&state);
+    const double sps[] = {0.0, 10.0, 8.0, 9.0};
+    ds4_dspark_schedule_step_result result;
+    ds4_dspark_schedule_item item = schedule_item(42, 0.90, 0.80);
+
+    for (int step = 0; step < 3; step++) {
+        require_true(ds4_dspark_hardware_schedule_step(
+                         &state, &item, 1, sps, 4, &result) == 0,
+                     "history-reset warmup failed");
+    }
+    require_true(state.step == 3u && state.entry_count == 1u,
+                 "history-reset warmup state");
+
+    ds4_dspark_scheduler_state_reset_history(&state);
+    require_true(state.step == 3u && state.entry_count == 0u,
+                 "history reset must preserve the global step only");
+
+    require_true(ds4_dspark_hardware_schedule_step(
+                     &state, &item, 1, sps, 4, &result) == 0 &&
+                 result.used_async == 0 && state.step == 4u,
+                 "first post-gap step must be causal");
+    require_true(ds4_dspark_hardware_schedule_step(
+                     &state, &item, 1, sps, 4, &result) == 0 &&
+                 result.used_async == 0 && state.step == 5u,
+                 "second post-gap step must be causal");
+    require_true(ds4_dspark_hardware_schedule_step(
+                     &state, &item, 1, sps, 4, &result) == 0 &&
+                 result.used_async == 1 && state.step == 6u,
+                 "third post-gap step must recover exact t-2 history");
 }
 
 static void test_stateful_cohort_reordering(void) {
@@ -542,10 +605,12 @@ int main(void) {
     test_causal_stop();
     test_two_request_global_allocation();
     test_zero_prefix_and_ties();
+    test_hardware_minimum_prefix();
     test_async_crosses_jagged_hardware_cliff();
     test_async_capacity_is_historical();
     test_async_current_confidence_cannot_expand_capacity();
     test_stateful_two_step_barrier();
+    test_history_reset_preserves_runtime_step();
     test_stateful_cohort_reordering();
     test_stateful_ties_follow_request_identity();
     test_stateful_join_and_forget();

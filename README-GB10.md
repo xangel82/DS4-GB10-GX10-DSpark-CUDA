@@ -373,7 +373,7 @@ superato la regressione, ma K=1 e' passato da 122,5 a 125,3 ms nel confronto
 end-to-end. L'estensione multi-riga e' stata quindi rimossa; resta soltanto il
 GVR exact a token singolo gia' validato.
 
-## Scheduler hardware-aware DSpark - 27-28 luglio 2026
+## Scheduler hardware-aware DSpark - 27-29 luglio 2026
 
 Il canary implementa ora direttamente l'Algoritmo 1 del paper
 [DSpark](https://arxiv.org/html/2607.05147v1), separato dal runtime CUDA in un
@@ -507,6 +507,16 @@ sceglie la forma fisica soltanto quando supera la previsione seriale di almeno
 l'1%; le forme sconosciute vengono sondate ogni 64 cicli. In caso contrario
 esegue i verifier per lane senza rigenerare il draft. Questa selezione non
 modifica logits, p/q rejection, RNG, KV o distribuzione del modello target.
+
+La stabilizzazione successiva (`cdfaaa3`) rende il profilo sensibile alla forma
+esatta: executor fisico o seriale, percorso neural o HybridLC, bucket di
+contesto, numero di richieste, righe e vettore dei prefissi. Ogni richiesta
+decode riceve inoltre un'identita' monotona valida per tutto il proprio
+lifecycle; al termine viene rimossa dalla storia dello scheduler. Questo evita
+che join, leave o il riuso di una lane contaminino le confidence ritardate di
+un'altra richiesta. Il percorso fisico supporta sia greedy sia rejection p/q
+stocastica con uniformi e RNG privati per lane; un errore prima del commit
+ripristina gli RNG interessati.
 
 Anche un cohort temporaneamente ridotto a `R=1` resta ora nel physical
 executor. Questo evita la cattura a freddo della famiglia CUDA Graph legacy
@@ -683,8 +693,8 @@ prefill. Un eventuale kernel attention misto dovra' seguire il principio di
 puo' essere sostituito da un normale kernel MHA.
 
 Il test host copre due verifier contemporaneamente in attesa: ogni handoff ne
-esegue esattamente uno e restituisce la proprieta' della GPU al prefill. Prima
-della promozione su Athena restano obbligatori tre gate:
+esegue esattamente uno e restituisce la proprieta' della GPU al prefill. La
+promozione su Athena e' stata subordinata a tre gate:
 
 - prefill R=1 senza contesa entro l'1% del baseline;
 - due richieste reali con assenza di stalli multi-secondo e throughput
@@ -696,6 +706,64 @@ La telemetria di un run concorrente riassume gli handoff a ogni chunk:
 ```text
 ds4-server: cooperative chunk scheduler lane=... chunk=... handoffs=... waited=...
 ```
+
+### Validazione finale del coordinatore - 29 luglio 2026
+
+Il primo test misto del routing cost-aware ha individuato due costi puramente
+di scheduling: 32 handoff su 42 avvenivano prima di produrre una frontier
+intermedia oppure dopo l'ultimo chunk, accumulando 6,82 secondi di attesa; un
+primo prompt di 167 token aveva inoltre sostituito il bootstrap da 900 t/s con
+una stima di 154 t/s. Il commit `e2036ae` limita quindi l'handoff ai soli
+checkpoint interni produttivi e pesa ogni campione prefill in proporzione a
+`interval_tokens / 8192`. Il prefill senza attesa e' rimasto circa 933 t/s,
+mentre nel run corretto i prompt da almeno 1K hanno misurato 904,63 t/s e gli
+handoff sono scesi a 18.
+
+I profili per forma richiedono normalmente due campioni prima di diventare
+maturi. Questa regola poteva pero' bloccare una forma R=2 promettente dopo il
+primo campione: il gate per i piccoli batch la rimandava al seriale e il secondo
+campione non arrivava mai. Il commit `09fa4c3` aggiunge un solo
+`confirm-probe` quando:
+
+- la coorte contiene almeno due richieste;
+- esiste esattamente un campione della stessa forma fisica;
+- quel campione supera la previsione seriale di almeno il 10%.
+
+Il secondo campione riporta immediatamente la forma alle normali regole di
+maturita'. R=1 e' escluso dal meccanismo. La tabella host dei profili passa da
+128 a 512 slot, circa 18 KiB per sessione; non vengono aggiunti buffer CUDA,
+copie KV o memoria proporzionale al contesto.
+
+Nel test operativo successivo, con sidecar Q2, due lane, contesto fisico 262K
+e lo stesso launcher di produzione:
+
+| Metrica | Coordinatore precedente | Con `confirm-probe` | Delta |
+| --- | ---: | ---: | ---: |
+| Throughput aggregato delle coorti | 23,101 t/s | 24,884 t/s | +7,7% |
+| Decode pesato per richiesta | 12,048 t/s | 13,578 t/s | +12,3% |
+| Prefill prompt >=1K | 904,632 t/s | 915,831 t/s | +1,2% |
+| R=2 fisico, segmenti attivi | 27,842 t/s | 37,947 t/s | dipende dalla forma |
+
+Nel nuovo run 18 conferme hanno sbloccato 504 decisioni fisiche R=2 previste.
+All'interno dello stesso carico, i segmenti R=2 fisici hanno misurato
+37,947 t/s aggregati e acceptance del 73,03%, contro 21,131 t/s e 67,18% del
+seriale. Il dato da usare per la prestazione end-to-end resta 24,884 t/s:
+37,947 t/s descrive soltanto i segmenti in cui entrambe le richieste sono
+effettivamente riunite nel verifier fisico.
+
+L'acceptance globale e' stata 66,77% contro 71,20% nel run precedente, ma i due
+carichi non contenevano lo stesso numero e la stessa composizione di risposte;
+non e' quindi un confronto di qualita'. Il target continua a verificare ogni
+token con la stessa regola lossless. R=1 non usa il nuovo probe e la coda
+operativa finale ha mantenuto 20,007 t/s. La macchina e' rimasta a circa
+117 GiB usati, 3,8 GiB disponibili e `VmSwap=0` per il processo.
+
+La KV append e' rimasta attiva: le continuation coerenti hanno processato
+soltanto la coda. Tre cambi di ramo hanno prodotto `token-mismatch`; quando era
+disponibile un checkpoint canonico, il turno finale ha ripreso da 14.407 token
+e ha eseguito il prefill soltanto fino a 19.760, invece di ripartire da zero.
+Regressione CUDA `sm_121a`, test scheduler, test server e `git diff --check`
+sono passati.
 
 ### STS offline autentico
 

@@ -23,6 +23,7 @@ DeepSeek-V4-Flash Q2/imatrix target:
 | HybridLC covered decode | up to 34.97 t/s, approximately 35 t/s |
 | HybridLC retrieval acceptance | 70.68%, 1022 / 1446 draft tokens |
 | Clean mixed coding session with compact Q2 sidecar | 20.88 t/s weighted |
+| Concurrent DSpark R=2 operational cohorts | 24.88 t/s aggregate, +7.7% |
 | Physical context enabled by default | 262144 tokens |
 | Experimental physical context | 1M tokens |
 | Sustained GB10 temperature observed in long runs | about 75 C |
@@ -44,12 +45,13 @@ measured long final answer, retrieval covered only 6.1% of cycles and cumulative
 decode was 16.37 t/s. No approximate token is committed: both paths preserve
 the target sampling distribution.
 
-The current release combines the compact Q2 DSpark and lossless HybridLC work
-validated on 26 July 2026 with the exact fused-D2R dispatch fix validated on
-27 July 2026. Q2 remains the default sidecar and HybridLC remains
-target-verified; the D2R fix only corrects the logical scratch span passed by
-the shared prefill arena. It does not change weights, routing, kernels,
-sampling, verifier behavior or persistent memory.
+The current release combines the compact Q2 DSpark and lossless HybridLC work,
+the exact fused-D2R dispatch fix and a hardware-aware multi-session scheduler
+validated on 29 July 2026. Q2 remains the default sidecar and HybridLC remains
+target-verified. The scheduler can coalesce two independent requests into one
+physical verifier cohort, while KV-aware routing and chunk-boundary handoffs
+keep long prefills from starving active decode. Target sampling and per-session
+KV, RNG and rejection state remain unchanged.
 
 ![Measured DS4 GB10 prefill and decode performance](docs/gb10-performance.svg)
 
@@ -75,6 +77,8 @@ or substantially adapted here; full lineage and license attribution are kept in
   boundary.
 - Canonical KV checkpoints and frontier reuse for append-only chat and
   tool-call workloads.
+- Hardware-aware DSpark R=2 cohorts with exact-shape cost profiles, KV-aware
+  routing and cooperative prefill/decode scheduling.
 - Pipelined model upload, compact Q2 DSpark packaging and release of copied
   GGUF pages.
 - GB10 memory profiles, 256k and experimental 1M launchers, reproducible CUDA
@@ -127,6 +131,7 @@ The major measured milestones on the same GB10 were:
 | Lossless HybridLC (`98c71c0`) | 851-907 t/s append | 26.89-34.97 t/s on covered retrieval widths |
 | Direct-F16 sparse attention beyond 131k | 836.16 t/s at 127.8k-180.8k | 19.89 t/s after 180.8k |
 | Shared-arena fused-D2R fix (`fb11333`) | 1001.94 t/s at 0-8k, 1006.61 t/s at 8k-16k | DSpark verifier unchanged |
+| Hardware-aware R=2 coordinator (`09fa4c3`) | 915.83 t/s on prompts >=1K | 24.88 t/s cohort aggregate, +7.7% |
 
 The HMMA transition improved a position-matched 57,344-token interval by
 25.88%. The direct-F16 capacity fix improved the measured deep append by

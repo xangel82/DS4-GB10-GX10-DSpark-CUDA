@@ -53,22 +53,46 @@ sampling, verifier behavior or persistent memory.
 
 ![Measured DS4 GB10 prefill and decode performance](docs/gb10-performance.svg)
 
-## What this fork delivers
+## What this fork adds
 
+This list is intentionally limited to work added by this fork. The imported
+Entrpi/ds4 CUDA prefill foundation is documented separately in
+[License and attribution](#license-and-attribution) and is not presented as a
+fork addition here.
+
+### Additions made on top of Entrpi/ds4
+
+The fast CUDA prefill path is built on
+[Entrpi/ds4](https://github.com/Entrpi/ds4), not reimplemented independently.
+The table distinguishes that imported foundation from the work subsequently
+added in this fork:
+
+| Entrpi/ds4 foundation used here | Added or substantially adapted in this fork |
+| --- | --- |
+| Routed-MoE D2R/MMQ tiers, aligned-SoA repack and DS4 MMQ adapters | Single-pass fused gate/up, token-bound stream-K scheduling, fused HC/RMS/RoPE/MoE epilogues, tail-aware dispatch and runtime numerical self-tests |
+| Token-tile HMMA prefill attention | Native SM121a MXFP4 indexer scoring, shape-specific exact Top-512 dispatch and the dynamic direct-F16 path beyond the earlier 131k boundary |
+| llama.cpp MMQ kernels vendored through the Entrpi integration | In-process GB10 model preparation and the memory, long-context, benchmarking and profiling integration required by this session-oriented DSpark server |
+
+The DSpark sidecar, lossless p/q verifier, HybridLC, canonical KV/frontier
+handling and multi-context launch profiles are separate additions of this fork;
+they are not claimed as part of the imported Entrpi prefill stack.
+
+- DeepSeek-V4-Flash DSpark GGUF sidecar conversion and loading.
 - Lossless DSpark speculative decoding with GPU-side p/q rejection sampling.
 - Lossless HybridLC suffix retrieval with Block Verification and exact residual
   correction.
-- Exact Top-512 compressed sparse attention with Blackwell SM121a kernels.
-- Routed-MoE D2R/MMQ prefill for IQ2_XXS gate/up and Q2_K down weights.
-- Token-tile HMMA attention and native MXFP4 indexer scoring.
-- Stable long-context prefill beyond the earlier 131k fast-path boundary.
-- Canonical KV checkpoints for append-only chat and tool-call workloads.
-- Pipelined model upload and release of copied GGUF pages.
-- Stable unified-memory use and sustained long-run temperatures around 75 C on
-  the measured GB10 system.
-- A 256k physical context with an 85% client-visible safety guard.
-- OpenAI, Responses and Anthropic-compatible HTTP endpoints.
-- Reproducible CUDA regressions, benchmark scripts and Nsight instrumentation.
+- Native SM121a MXFP4 indexer scoring and shape-specific exact Top-512
+  dispatch.
+- Single-pass fused gate/up with token-bound stream-K, plus fused
+  HC/RMS/RoPE/MoE epilogues and runtime parity self-tests.
+- Dynamic direct-F16 sparse attention beyond the earlier 131k fast-path
+  boundary.
+- Canonical KV checkpoints and frontier reuse for append-only chat and
+  tool-call workloads.
+- Pipelined model upload, compact Q2 DSpark packaging and release of copied
+  GGUF pages.
+- GB10 memory profiles, 256k and experimental 1M launchers, reproducible CUDA
+  regressions, benchmark scripts and Nsight instrumentation.
 
 The target model remains authoritative. DSpark drafts are accepted with
 `min(1, p(x) / q(x))`; rejected drafts are replaced from the positive residual
@@ -444,17 +468,43 @@ improvements.
 
 ## License and attribution
 
-This repository keeps the original `ds4` MIT license.
+This repository keeps the original MIT license and contains work from several
+clearly separated lineages:
 
-The GB10/GX10 DSpark CUDA modifications in this fork are:
+- [antirez/ds4](https://github.com/antirez/ds4), by Salvatore Sanfilippo, is
+  the original inference engine and server foundation.
+- [Entrpi/ds4](https://github.com/Entrpi/ds4) is the source of the CUDA prefill
+  foundation imported into this fork: routed-MoE D2R/MMQ tiers, aligned-SoA
+  repack machinery, token-tile HMMA attention, DS4 MMQ adapters and associated
+  tests/prototypes. Those components remain attributable to Entrpi/ds4 under
+  the MIT License.
+- The MMQ implementation under `cuda/mmq` also contains kernels from
+  [llama.cpp](https://github.com/ggml-org/llama.cpp), vendored through the
+  Entrpi integration. The exact upstream pin and per-file inventory are in
+  [`cuda/mmq/VENDOR.md`](cuda/mmq/VENDOR.md).
+- Marco Palaferri's original work in this fork includes the DSpark GGUF
+  sidecar integration and lossless p/q verifier, HybridLC, the native SM121a
+  MXFP4 indexer scorer, single-pass fused gate/up with token-bound stream-K,
+  fused HC/RMS/RoPE/MoE epilogues and self-tests, the dynamic direct-F16
+  long-context path, KV/frontier handling, GB10 launch profiles, profiling,
+  packaging and subsequent adaptations made on top of the shared prefill
+  stack.
 
-```text
-Copyright (c) 2026 Marco Palaferri
-Licensed under the MIT License
-```
+Source comments and commit history identify narrower adaptations, including
+the token-tile HMMA port from Entrpi/ds4 commits `47438d7` and `9de3044`.
+Detailed integration history, measurements and rejected experiments are in
+[`README-GB10.md`](README-GB10.md).
+
+This lineage was documented when the code entered the repository:
+[`4eb7441`](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA/commit/4eb74412670eb74e964123ed3ad60d9973056bdd)
+introduced the Entrpi MMQ backend with its llama.cpp provenance, and
+[`699245d`](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA/commit/699245dfa47707b5bfc6e26ff2dea426448dd32c)
+explicitly recorded the token-tile HMMA port and its Entrpi source commits.
+The current README makes the same separation prominent in English rather than
+leaving it only in the detailed integration history and runtime banner.
 
 The MIT License allows use, copy, modification, publication, distribution,
 sublicensing and sale of the software, provided that the copyright notice and
 license text are preserved in copies or substantial portions of the software.
-In practice: if you reuse the GB10/GX10 DSpark CUDA work from this fork, keep
-the Marco Palaferri attribution together with the MIT license notice.
+When reusing this repository, preserve the relevant upstream, Entrpi/ds4,
+llama.cpp and Marco Palaferri notices together with the MIT license.

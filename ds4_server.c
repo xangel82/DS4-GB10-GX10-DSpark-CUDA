@@ -8042,10 +8042,14 @@ struct server {
     pthread_cond_t cycle_cv;
     bool cycle_running;
     bool decode_active;
+    uint64_t active_request_id;
+    uint64_t dspark_request_seq;
+    uint64_t dspark_cohort_seq;
     struct {
         bool pending;
         bool done;
         int rc;
+        double enqueued_sec;
         ds4_speculative_request request;
         char err[160];
     } cycle[DS4_SERVER_DSPARK_MAX_LANES];
@@ -10832,13 +10836,24 @@ static uint32_t server_cohort_goal_locked(const server *root) {
     return goal;
 }
 
-static void server_set_decode_active(server *lane, bool active) {
+static uint64_t server_set_decode_active(server *lane, bool active) {
     server *root = server_root(lane);
-    if (root->lane_count <= 1u) return;
+    uint64_t retired_request_id = 0u;
     pthread_mutex_lock(&root->cycle_mu);
+    if (active && !lane->decode_active) {
+        root->dspark_request_seq++;
+        if (root->dspark_request_seq == 0u) {
+            root->dspark_request_seq++;
+        }
+        lane->active_request_id = root->dspark_request_seq;
+    } else if (!active && lane->decode_active) {
+        retired_request_id = lane->active_request_id;
+        lane->active_request_id = 0u;
+    }
     lane->decode_active = active;
     pthread_cond_broadcast(&root->cycle_cv);
     pthread_mutex_unlock(&root->cycle_mu);
+    return retired_request_id;
 }
 
 static int server_eval_speculative(
@@ -10875,7 +10890,7 @@ static int server_eval_speculative(
     }
     root->cycle[own].request = (ds4_speculative_request) {
         .session = lane->session,
-        .request_id = own + 1u,
+        .request_id = lane->active_request_id,
         .first_token = first_token,
         .max_tokens = max_tokens,
         .eos_token = eos_token,
@@ -10889,6 +10904,7 @@ static int server_eval_speculative(
         .result = -1,
     };
     root->cycle[own].err[0] = '\0';
+    root->cycle[own].enqueued_sec = now_sec();
     root->cycle[own].pending = true;
     pthread_cond_broadcast(&root->cycle_cv);
 
@@ -10945,20 +10961,44 @@ static int server_eval_speculative(
     if (leader) {
         ds4_speculative_request cohort[DS4_SERVER_DSPARK_MAX_LANES];
         root->cycle_running = true;
+        root->dspark_cohort_seq++;
+        if (root->dspark_cohort_seq == 0u) {
+            root->dspark_cohort_seq++;
+        }
+        const uint64_t cohort_id = root->dspark_cohort_seq;
+        const double rendezvous_done = now_sec();
+        double earliest_enqueue = rendezvous_done;
+        for (uint32_t i = 0; i < selected_count; i++) {
+            const uint32_t slot = selected[i];
+            if (root->cycle[slot].enqueued_sec < earliest_enqueue) {
+                earliest_enqueue = root->cycle[slot].enqueued_sec;
+            }
+        }
+        const uint64_t actual_wait_us =
+            rendezvous_done > earliest_enqueue
+                ? (uint64_t)((rendezvous_done - earliest_enqueue) *
+                             1000000.0)
+                : 0u;
         if (getenv("DS4_DSPARK_LOG") != NULL) {
             uint32_t active = 0u;
             for (uint32_t i = 0; i < root->lane_count; i++) {
                 if (root->lanes[i]->decode_active) active++;
             }
             server_log(DS4_LOG_GENERATION,
-                       "ds4-server: dspark coordinator cohort lanes=%u "
-                       "selected=%u active=%u wait_us=%ld",
-                       root->lane_count, selected_count, active, wait_us);
+                       "ds4-server: dspark coordinator cohort=%llu lanes=%u "
+                       "selected=%u active=%u configured_wait_us=%ld "
+                       "actual_wait_us=%llu",
+                       (unsigned long long)cohort_id,
+                       root->lane_count, selected_count, active, wait_us,
+                       (unsigned long long)actual_wait_us);
         }
         for (uint32_t i = 0; i < selected_count; i++) {
             const uint32_t slot = selected[i];
             root->cycle[slot].pending = false;
             cohort[i] = root->cycle[slot].request;
+            cohort[i].cohort_id = cohort_id;
+            cohort[i].rendezvous_wait_us = actual_wait_us;
+            cohort[i].requested_cohort_size = selected_count;
         }
         pthread_mutex_unlock(&root->cycle_mu);
 
@@ -11592,7 +11632,7 @@ decode_again:
     dsml_decode_tracker dsml_tracker;
     dsml_decode_tracker_init(&dsml_tracker);
 
-    server_set_decode_active(s, true);
+    (void)server_set_decode_active(s, true);
     while (!g_stop_requested && completion < max_tokens &&
            ds4_session_pos(s->session) < ds4_session_ctx(s->session)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
@@ -11894,10 +11934,15 @@ decode_again:
         }
         if (stop_decode) break;
     }
-    server_set_decode_active(s, false);
+    const uint64_t retired_request_id =
+        server_set_decode_active(s, false);
 
     server_gpu_enter(s);
     gpu_locked = true;
+    if (retired_request_id != 0u) {
+        ds4_session_forget_speculative_request(
+                s->session, retired_request_id);
+    }
 
     if (g_stop_requested && strcmp(finish, "error") != 0) {
         finish = "error";
@@ -17817,6 +17862,41 @@ static void test_gpu_frontier_text_ring_evicts_oldest(void) {
     TEST_ASSERT(matches == 1);
 }
 
+static void test_decode_request_identity_lifecycle(void) {
+    server root = {0};
+    server second = {0};
+    server *lanes[DS4_SERVER_DSPARK_MAX_LANES] = {
+        &root,
+        &second,
+        NULL,
+    };
+
+    root.root = &root;
+    root.lanes = lanes;
+    root.lane_count = 1u;
+    second.root = &root;
+    second.lane_id = 1u;
+    pthread_mutex_init(&root.cycle_mu, NULL);
+    pthread_cond_init(&root.cycle_cv, NULL);
+
+    TEST_ASSERT(server_set_decode_active(&root, true) == 0u);
+    TEST_ASSERT(root.decode_active);
+    TEST_ASSERT(root.active_request_id == 1u);
+    TEST_ASSERT(server_set_decode_active(&root, true) == 0u);
+    TEST_ASSERT(root.active_request_id == 1u);
+    TEST_ASSERT(server_set_decode_active(&root, false) == 1u);
+    TEST_ASSERT(!root.decode_active);
+    TEST_ASSERT(root.active_request_id == 0u);
+
+    root.lane_count = 2u;
+    TEST_ASSERT(server_set_decode_active(&second, true) == 0u);
+    TEST_ASSERT(second.active_request_id == 2u);
+    TEST_ASSERT(server_set_decode_active(&second, false) == 2u);
+
+    pthread_cond_destroy(&root.cycle_cv);
+    pthread_mutex_destroy(&root.cycle_mu);
+}
+
 static void test_coordinator_dispatches_by_prefix_and_tool_binding(void) {
     server root = {0};
     server second = {0};
@@ -17984,6 +18064,7 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_with_tools_preserves_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
     test_gpu_frontier_text_ring_evicts_oldest();
+    test_decode_request_identity_lifecycle();
     test_coordinator_dispatches_by_prefix_and_tool_binding();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();

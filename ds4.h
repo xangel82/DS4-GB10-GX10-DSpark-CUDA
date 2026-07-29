@@ -269,6 +269,9 @@ typedef struct {
 typedef struct {
     ds4_session *session;
     uint64_t request_id;
+    uint64_t cohort_id;
+    uint64_t rendezvous_wait_us;
+    uint32_t requested_cohort_size;
     int first_token;
     int max_tokens;
     int eos_token;
@@ -306,6 +309,12 @@ int ds4_sessions_eval_speculative_sample_rn(
         uint32_t request_count,
         char *err,
         size_t errlen);
+
+/* Retire delayed hardware-scheduler confidence for one completed request.
+ * Request identifiers must never be recycled without this lifecycle hook. */
+void ds4_session_forget_speculative_request(
+        ds4_session *session,
+        uint64_t request_id);
 
 /* Begin one CUDA target microbatch over independent speculative suffixes.
  * Attention and persistent KV remain session-local; dense/FFN/output work is

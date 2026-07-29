@@ -92,6 +92,61 @@ function text_value(prefix,    i,a) {
 /dspark scheduler bypass/ { bypass++ }
 /dspark pre-draft bypass/ { predraft_bypass++ }
 /dspark scheduler K0 cooldown=/ { k0_cooldowns++ }
+/dspark cohort timing/ {
+  cohort_n++
+  cohort_executor = text_value("executor")
+  if (cohort_executor == "") cohort_executor = "unknown"
+  cohort_fallback = text_value("fallback")
+  if (cohort_fallback == "") cohort_fallback = "none"
+  cohort_r = value("requested_r")
+  cohort_drafted_value = value("drafted")
+  cohort_committed_value = value("committed")
+  cohort_emitted_value = value("emitted")
+  cohort_rows_value = value("rows")
+  cohort_wait_value = value("wait_us")
+  cohort_draft_value = value("draft")
+  cohort_verify_value = value("verify")
+  cohort_total_value = value("total")
+  cohort_executor_n[cohort_executor]++
+  cohort_fallback_n[cohort_fallback]++
+  if (cohort_r > cohort_max_r) cohort_max_r = cohort_r
+  if (cohort_wait_value >= 0) {
+    cohort_wait_us += cohort_wait_value
+    cohort_wait_n++
+  }
+  if (cohort_drafted_value >= 0) {
+    cohort_drafted += cohort_drafted_value
+  }
+  if (cohort_committed_value >= 0) {
+    cohort_committed += cohort_committed_value
+  }
+  if (cohort_emitted_value >= 0) {
+    cohort_emitted += cohort_emitted_value
+  }
+  if (cohort_rows_value >= 0) cohort_rows += cohort_rows_value
+  if (cohort_draft_value >= 0) cohort_draft_ms += cohort_draft_value
+  if (cohort_verify_value >= 0) cohort_verify_ms += cohort_verify_value
+  if (cohort_total_value >= 0) cohort_total_ms += cohort_total_value
+  if (cohort_r > 0) {
+    cohort_key = cohort_executor SUBSEP cohort_r
+    cohort_by_key_n[cohort_key]++
+    if (cohort_emitted_value >= 0) {
+      cohort_by_key_emitted[cohort_key] += cohort_emitted_value
+    }
+    if (cohort_drafted_value >= 0) {
+      cohort_by_key_drafted[cohort_key] += cohort_drafted_value
+    }
+    if (cohort_committed_value >= 0) {
+      cohort_by_key_committed[cohort_key] += cohort_committed_value
+    }
+    if (cohort_rows_value >= 0) {
+      cohort_by_key_rows[cohort_key] += cohort_rows_value
+    }
+    if (cohort_total_value >= 0) {
+      cohort_by_key_total_ms[cohort_key] += cohort_total_value
+    }
+  }
+}
 /CUDA speculative graph launches=/ {
   v = value("launches"); if (v >= 0) graph_launches = v
   v = value("dspark_draft"); if (v >= 0) graph_draft = v
@@ -393,7 +448,56 @@ END {
              shadow_rate_sum / shadow_rate_n
     }
   }
-  if (timing_hardware_cycles > 0) {
+  if (cohort_n > 0) {
+    printf "Coordinator cohorts:       %d (physical=%d serial=%d target-only=%d fallback=%d)\n",
+           cohort_n,
+           cohort_executor_n["physical"],
+           cohort_executor_n["serial"],
+           cohort_executor_n["target-only"],
+           cohort_executor_n["fallback"]
+    if (cohort_wait_n > 0) {
+      printf "Mean coordinator wait:     %.3f ms\n",
+             cohort_wait_us / cohort_wait_n / 1000.0
+    }
+    if (cohort_drafted > 0) {
+      printf "Cohort acceptance:         %.2f%% (%d / %d)\n",
+             100.0 * cohort_committed / cohort_drafted,
+             cohort_committed, cohort_drafted
+    }
+    if (cohort_total_ms > 0) {
+      printf "Cohort aggregate throughput: %.3f t/s\n",
+             1000.0 * cohort_emitted / cohort_total_ms
+    }
+    for (rr = 1; rr <= cohort_max_r; rr++) {
+      for (executor_index = 1; executor_index <= 4; executor_index++) {
+        if (executor_index == 1) executor = "physical"
+        else if (executor_index == 2) executor = "serial"
+        else if (executor_index == 3) executor = "target-only"
+        else executor = "fallback"
+        cohort_key = executor SUBSEP rr
+        if (cohort_by_key_n[cohort_key] == 0) continue
+        aggregate_rate = 0.0
+        if (cohort_by_key_total_ms[cohort_key] > 0) {
+          aggregate_rate = 1000.0 * cohort_by_key_emitted[cohort_key] / cohort_by_key_total_ms[cohort_key]
+        }
+        accept_rate = 0.0
+        if (cohort_by_key_drafted[cohort_key] > 0) {
+          accept_rate = 100.0 * cohort_by_key_committed[cohort_key] / cohort_by_key_drafted[cohort_key]
+        }
+        average_rows = cohort_by_key_rows[cohort_key] / cohort_by_key_n[cohort_key]
+        printf "  %s R=%d n=%d aggregate=%.3ft/s accept=%.2f%% rows=%.3f\n",
+               executor, rr, cohort_by_key_n[cohort_key],
+               aggregate_rate, accept_rate, average_rows
+      }
+    }
+    printf "Cohort fallback reasons:"
+    for (reason in cohort_fallback_n) {
+      if (reason != "none") {
+        printf " %s=%d", reason, cohort_fallback_n[reason]
+      }
+    }
+    printf "\n"
+  } else if (timing_hardware_cycles > 0) {
     printf "Hardware scheduler mean R/batch: %.3f / %.3f (from timing)\n",
            timing_hardware_r_sum / timing_hardware_cycles,
            timing_hardware_batch_sum / timing_hardware_cycles
@@ -474,7 +578,15 @@ END {
     for (reason in fallback_reason) printf " %s=%d", reason, fallback_reason[reason]
     printf "\n"
   }
-  if (summary_n > 0 && summary_seconds > 0) printf "Weighted request decode:   %.3f t/s (%d summaries)\n", summary_tokens / summary_seconds, summary_n
+  if (summary_n > 0 && summary_seconds > 0) {
+    if (cohort_max_r > 1) {
+      printf "Per-request decode (overlap): %.3f t/s (%d summaries; not aggregate)\n",
+             summary_tokens / summary_seconds, summary_n
+    } else {
+      printf "Weighted request decode:   %.3f t/s (%d summaries)\n",
+             summary_tokens / summary_seconds, summary_n
+    }
+  }
   else if (last_tps > 0) printf "Final cumulative decode:   %.3f t/s (legacy log)\n", last_tps
 }
 ' "$LOG"

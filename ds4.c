@@ -25002,6 +25002,7 @@ typedef struct {
     int pending_token;
     uint32_t position;
     uint32_t proposal_tokens;
+    bool stochastic_rejection;
     float temperature;
     float min_p;
     const float *sample_uniforms;
@@ -25050,16 +25051,17 @@ static bool metal_graph_eval_dspark_draft_rn(
              state->dspark_markov_hidden &&
              state->dspark_markov_delta &&
              state->dspark_confidence &&
-             state->dspark_draft_probs &&
-             state->dspark_sample_uniforms &&
              request->pending_token >= 0 &&
              (uint32_t)request->pending_token < DS4_N_VOCAB &&
              request->proposal_tokens != 0u &&
              request->proposal_tokens <= block_tokens &&
-             request->temperature > 0.0f &&
+             request->temperature >= 0.0f &&
              request->min_p >= 0.0f && request->min_p <= 1.0f &&
-             request->sample_uniforms && request->drafts &&
-             request->confidence;
+             request->drafts && request->confidence &&
+             (!request->stochastic_rejection ||
+              (state->dspark_draft_probs &&
+               state->dspark_sample_uniforms &&
+               request->sample_uniforms));
         for (uint32_t prior = 0; ok && prior < r; prior++) {
             ds4_gpu_graph *other = requests[prior].state;
             ok = state->dspark_tokens != other->dspark_tokens &&
@@ -25085,7 +25087,7 @@ static bool metal_graph_eval_dspark_draft_rn(
         ok = ds4_gpu_tensor_write(
                 state->dspark_tokens, 0, token_ids,
                 sizeof(token_ids)) != 0;
-        if (ok) {
+        if (ok && request->stochastic_rejection) {
             ok = ds4_gpu_tensor_write(
                     state->dspark_sample_uniforms,
                     0,
@@ -25222,7 +25224,7 @@ static bool metal_graph_eval_dspark_draft_rn(
                     dspark_model,
                     dspark,
                     request->proposal_tokens,
-                    true,
+                    request->stochastic_rejection,
                     request->temperature,
                     request->min_p);
         }
@@ -27843,6 +27845,7 @@ static void ds4_acquire_instance_lock(void) {
 
 #define DS4_DSPARK_CONTEXT_BUCKETS 8u
 #define DS4_DSPARK_COST_WINDOW 9u
+#define DS4_DSPARK_RN_COST_SLOTS 128u
 
 typedef struct {
     double value[DS4_DSPARK_COST_WINDOW];
@@ -27850,6 +27853,19 @@ typedef struct {
     uint32_t count;
     uint32_t next;
 } ds4_dspark_cost_window;
+
+typedef struct {
+    uint64_t shape;
+    uint64_t last_seen;
+    double ewma;
+    uint64_t samples;
+    uint32_t rows;
+    uint16_t request_count;
+    uint8_t context_bucket;
+    uint8_t executor;
+    uint8_t path_class;
+    bool used;
+} ds4_dspark_rn_cost_profile;
 
 typedef enum {
     DS4_HYBRID_SOURCE_NEURAL = 0,
@@ -27970,6 +27986,9 @@ struct ds4_session {
         [DS4_DSPARK_SCHEDULER_MAX_ROWS + 1];
     uint64_t dspark_rn_serial_verify_samples
         [DS4_DSPARK_SCHEDULER_MAX_ROWS + 1];
+    ds4_dspark_rn_cost_profile
+        dspark_rn_cost_profile[DS4_DSPARK_RN_COST_SLOTS];
+    uint64_t dspark_rn_cost_clock;
     uint32_t dspark_last_early_stop;
     uint32_t dspark_last_champion;
     double dspark_anchor_ewma;
@@ -28051,6 +28070,16 @@ static void dspark_scheduler_reset_timeline(ds4_session *s) {
      */
     ds4_dspark_scheduler_state_reset_history(
             &owner->dspark_rn_hw_scheduler);
+}
+
+void ds4_session_forget_speculative_request(
+        ds4_session *session,
+        uint64_t request_id) {
+    if (!session || request_id == 0u) return;
+    ds4_session *owner =
+        session->scratch_owner ? session->scratch_owner : session;
+    (void)ds4_dspark_scheduler_state_forget(
+            &owner->dspark_rn_hw_scheduler, request_id);
 }
 
 static int ds4_session_materialize_logits_internal(
@@ -32436,6 +32465,7 @@ int ds4_sessions_prepare_dspark_rn(
         const ds4_session *request_owner = session
             ? (session->scratch_owner ? session->scratch_owner : session)
             : NULL;
+        const bool stochastic = request->temperature > 0.0f;
         if (!session || request_owner != owner ||
             session->engine != owner->engine ||
             !session->checkpoint_valid ||
@@ -32444,9 +32474,10 @@ int ds4_sessions_prepare_dspark_rn(
             (uint32_t)request->pending_token >= DS4_N_VOCAB ||
             request->proposal_count == 0u ||
             request->proposal_count > DS4_PHYSICAL_DSPARK_MAX_DRAFT ||
-            !(request->temperature > 0.0f) ||
+            request->temperature < 0.0f ||
             request->min_p < 0.0f || request->min_p > 1.0f ||
-            !request->rng || !session->graph.dspark_draft_probs) {
+            (stochastic &&
+             (!request->rng || !session->graph.dspark_draft_probs))) {
             if (err && errlen) {
                 snprintf(err, errlen,
                          "request %u has invalid DSpark preparation state", r);
@@ -32462,9 +32493,10 @@ int ds4_sessions_prepare_dspark_rn(
         physical[DS4_DSPARK_SCHEDULER_MAX_REQUESTS];
     memset(physical, 0, sizeof(physical));
     for (uint32_t r = 0; r < request_count; r++) {
-        saved_rng[r] = *requests[r].rng;
         ds4_physical_draft_request *request = &requests[r];
         ds4_session *session = request->session;
+        const bool stochastic = request->temperature > 0.0f;
+        if (request->rng) saved_rng[r] = *request->rng;
         memset(request->draft_tokens, 0,
                sizeof(request->draft_tokens));
         memset(request->confidence_logits, 0,
@@ -32473,18 +32505,22 @@ int ds4_sessions_prepare_dspark_rn(
                sizeof(request->accept_uniforms));
         memset(request->residual_uniforms, 0,
                sizeof(request->residual_uniforms));
-        for (uint32_t i = 0; i < request->proposal_count; i++) {
-            sample_uniforms[r][i] = sample_rng_f32(request->rng);
-            request->accept_uniforms[i] =
-                sample_rng_f32(request->rng);
-            request->residual_uniforms[i] =
-                sample_rng_f32(request->rng);
+        if (stochastic) {
+            for (uint32_t i = 0; i < request->proposal_count; i++) {
+                sample_uniforms[r][i] =
+                    sample_rng_f32(request->rng);
+                request->accept_uniforms[i] =
+                    sample_rng_f32(request->rng);
+                request->residual_uniforms[i] =
+                    sample_rng_f32(request->rng);
+            }
         }
         physical[r] = (metal_physical_draft_request) {
             .state = &session->graph,
             .pending_token = request->pending_token,
             .position = (uint32_t)session->checkpoint.len,
             .proposal_tokens = request->proposal_count,
+            .stochastic_rejection = stochastic,
             .temperature = request->temperature,
             .min_p = request->min_p,
             .sample_uniforms = sample_uniforms[r],
@@ -32523,7 +32559,7 @@ int ds4_sessions_prepare_dspark_rn(
                     (uint32_t)session->checkpoint.len,
                     DS4_DSPARK_BLOCK_SIZE,
                     request->proposal_count,
-                    true,
+                    request->temperature > 0.0f,
                     request->temperature,
                     request->min_p,
                     sample_uniforms[r],
@@ -32536,7 +32572,9 @@ int ds4_sessions_prepare_dspark_rn(
         for (uint32_t rollback = 0;
              rollback < request_count;
              rollback++) {
-            *requests[rollback].rng = saved_rng[rollback];
+            if (requests[rollback].rng) {
+                *requests[rollback].rng = saved_rng[rollback];
+            }
             memset(requests[rollback].draft_tokens, 0,
                    sizeof(requests[rollback].draft_tokens));
             memset(requests[rollback].confidence_logits, 0,
@@ -32777,14 +32815,17 @@ int ds4_sessions_verify_suffix_rn_reject(
         }
         const uint32_t draft_count =
             request->rows - 1u - request->shadow_tail_rows;
+        const bool greedy = item->temperature <= 0.0f;
         item->committed_drafts = 0u;
         item->correction_token = -1;
         if (!session || draft_count > DS4_HYBRID_LC_MAX_DRAFT ||
             (draft_count != 0u &&
-             (!item->accept_uniforms || !item->residual_uniforms ||
-              !(item->temperature > 0.0f) ||
-              item->min_p < 0.0f || item->min_p > 1.0f ||
-              !session->graph.dspark_draft_probs))) {
+             ((greedy && !request->row_tops) ||
+              (!greedy &&
+               (!item->accept_uniforms ||
+                !item->residual_uniforms ||
+                item->min_p < 0.0f || item->min_p > 1.0f ||
+                !session->graph.dspark_draft_probs))))) {
             if (err && errlen) {
                 snprintf(err, errlen,
                          "request %u has invalid rejection metadata", r);
@@ -32796,6 +32837,21 @@ int ds4_sessions_verify_suffix_rn_reject(
          * it and installs its continuation logits exactly like ordinary
          * one-token decode. */
         if (draft_count == 0u) continue;
+
+        if (greedy) {
+            while (item->committed_drafts < draft_count) {
+                const uint32_t i = item->committed_drafts;
+                const int draft_token =
+                    request->tokens->v[request->start + 1u + i];
+                const int target_token = request->row_tops[i];
+                if (target_token != draft_token) {
+                    item->correction_token = target_token;
+                    break;
+                }
+                item->committed_drafts++;
+            }
+            continue;
+        }
 
         int32_t token_ids[DS4_HYBRID_LC_MAX_ROWS];
         for (uint32_t row = 0; row < request->rows; row++) {
@@ -36687,7 +36743,185 @@ static int ds4_sessions_eval_speculative_sample_serial(
     return 0;
 }
 
+static void dspark_rn_log_cohort(
+        const ds4_speculative_request *requests,
+        uint32_t request_count,
+        const char *executor,
+        const char *fallback,
+        uint32_t drafted,
+        uint32_t committed,
+        uint32_t emitted,
+        uint32_t rows,
+        double draft_seconds,
+        double verify_seconds,
+        double total_seconds) {
+    if (!requests || request_count == 0u ||
+        (getenv("DS4_DSPARK_TIMING") == NULL &&
+         getenv("DS4_DSPARK_LOG") == NULL)) {
+        return;
+    }
+    uint64_t wait_us = 0u;
+    for (uint32_t r = 0; r < request_count; r++) {
+        if (requests[r].rendezvous_wait_us > wait_us) {
+            wait_us = requests[r].rendezvous_wait_us;
+        }
+    }
+    fprintf(stderr,
+            "ds4: dspark cohort timing cohort=%llu requested_r=%u "
+            "executor=%s fallback=%s drafted=%u committed=%u "
+            "emitted=%u rows=%u wait_us=%llu draft=%.3f ms "
+            "verify=%.3f ms total=%.3f ms\n",
+            (unsigned long long)requests[0].cohort_id,
+            request_count,
+            executor ? executor : "unknown",
+            fallback ? fallback : "none",
+            drafted,
+            committed,
+            emitted,
+            rows,
+            (unsigned long long)wait_us,
+            draft_seconds * 1000.0,
+            verify_seconds * 1000.0,
+            total_seconds * 1000.0);
+}
+
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+enum {
+    DS4_DSPARK_RN_EXEC_PHYSICAL = 1,
+    DS4_DSPARK_RN_EXEC_SERIAL = 2,
+    DS4_DSPARK_RN_PATH_NEURAL = 0,
+    DS4_DSPARK_RN_PATH_HYBRID = 1,
+};
+
+static uint64_t dspark_rn_shape_hash(
+        const uint32_t *prefix,
+        uint32_t request_count) {
+    uint8_t sorted[DS4_DSPARK_SCHEDULER_MAX_REQUESTS];
+    for (uint32_t r = 0; r < request_count; r++) {
+        uint32_t value = prefix ? prefix[r] : 0u;
+        if (value > UINT8_MAX) value = UINT8_MAX;
+        sorted[r] = (uint8_t)value;
+    }
+    for (uint32_t i = 1; i < request_count; i++) {
+        const uint8_t value = sorted[i];
+        uint32_t j = i;
+        while (j != 0u && sorted[j - 1u] > value) {
+            sorted[j] = sorted[j - 1u];
+            j--;
+        }
+        sorted[j] = value;
+    }
+    uint64_t hash = UINT64_C(1469598103934665603);
+    for (uint32_t r = 0; r < request_count; r++) {
+        hash ^= sorted[r];
+        hash *= UINT64_C(1099511628211);
+    }
+    hash ^= request_count;
+    hash *= UINT64_C(1099511628211);
+    return hash;
+}
+
+static uint8_t dspark_rn_context_bucket(
+        ds4_speculative_request *requests,
+        uint32_t request_count) {
+    uint32_t bucket = 0u;
+    for (uint32_t r = 0; r < request_count; r++) {
+        const uint32_t lane_bucket =
+            dspark_context_bucket(requests[r].session);
+        if (lane_bucket > bucket) bucket = lane_bucket;
+    }
+    return (uint8_t)bucket;
+}
+
+static bool dspark_rn_cost_profile_lookup(
+        ds4_session *owner,
+        uint8_t executor,
+        uint8_t path_class,
+        uint8_t context_bucket,
+        uint32_t request_count,
+        uint32_t rows,
+        uint64_t shape,
+        double *seconds,
+        uint64_t *samples_out) {
+    if (samples_out) *samples_out = 0u;
+    if (!owner) return false;
+    for (uint32_t i = 0; i < DS4_DSPARK_RN_COST_SLOTS; i++) {
+        ds4_dspark_rn_cost_profile *profile =
+            &owner->dspark_rn_cost_profile[i];
+        if (!profile->used ||
+            profile->executor != executor ||
+            profile->path_class != path_class ||
+            profile->context_bucket != context_bucket ||
+            profile->request_count != request_count ||
+            profile->rows != rows ||
+            profile->shape != shape) {
+            continue;
+        }
+        profile->last_seen = ++owner->dspark_rn_cost_clock;
+        if (samples_out) *samples_out = profile->samples;
+        if (seconds) *seconds = profile->ewma;
+        return profile->samples >= 2u && profile->ewma > 0.0;
+    }
+    return false;
+}
+
+static void dspark_rn_cost_profile_note(
+        ds4_session *owner,
+        uint8_t executor,
+        uint8_t path_class,
+        uint8_t context_bucket,
+        uint32_t request_count,
+        uint32_t rows,
+        uint64_t shape,
+        double seconds) {
+    if (!owner || !(seconds > 0.0)) return;
+    ds4_dspark_rn_cost_profile *selected = NULL;
+    ds4_dspark_rn_cost_profile *oldest =
+        &owner->dspark_rn_cost_profile[0];
+    for (uint32_t i = 0; i < DS4_DSPARK_RN_COST_SLOTS; i++) {
+        ds4_dspark_rn_cost_profile *profile =
+            &owner->dspark_rn_cost_profile[i];
+        if (profile->used &&
+            profile->executor == executor &&
+            profile->path_class == path_class &&
+            profile->context_bucket == context_bucket &&
+            profile->request_count == request_count &&
+            profile->rows == rows &&
+            profile->shape == shape) {
+            selected = profile;
+            break;
+        }
+        if (!profile->used) {
+            selected = profile;
+            break;
+        }
+        if (profile->last_seen < oldest->last_seen) oldest = profile;
+    }
+    if (!selected) selected = oldest;
+    if (!selected->used ||
+        selected->executor != executor ||
+        selected->path_class != path_class ||
+        selected->context_bucket != context_bucket ||
+        selected->request_count != request_count ||
+        selected->rows != rows ||
+        selected->shape != shape) {
+        memset(selected, 0, sizeof(*selected));
+        selected->used = true;
+        selected->executor = executor;
+        selected->path_class = path_class;
+        selected->context_bucket = context_bucket;
+        selected->request_count = (uint16_t)request_count;
+        selected->rows = rows;
+        selected->shape = shape;
+    }
+    const double alpha = selected->samples < 4u ? 0.5 : 0.15;
+    selected->ewma = selected->samples == 0u
+        ? seconds
+        : selected->ewma * (1.0 - alpha) + seconds * alpha;
+    selected->samples++;
+    selected->last_seen = ++owner->dspark_rn_cost_clock;
+}
+
 static void dspark_rn_finalize_lane(
         ds4_speculative_request *request,
         const ds4_physical_draft_request *neural,
@@ -36726,7 +36960,9 @@ static void dspark_rn_finalize_lane(
     }
     request->result = (int)emitted;
     session->dspark_pending_valid = false;
-    if (committed < drafted && rejection->correction_token >= 0) {
+    if (request->temperature > 0.0f &&
+        committed < drafted &&
+        rejection->correction_token >= 0) {
         session->dspark_pending_token = rejection->correction_token;
         session->dspark_pending_valid = true;
     }
@@ -36780,12 +37016,13 @@ static void dspark_rn_finalize_lane(
                 "verify=%.3f ms verify_begin=%.3f ms "
                 "verify_reject=%.3f ms verify_finish=%.3f ms "
                 "total=%.3f ms fused=1 noreplay=1 "
-                "rejection=1 residual=%d hybrid=%d neural=%u "
+                "rejection=%d residual=%d hybrid=%d neural=%u "
                 "retrieval=%u retrieval_committed=%u "
                 "suffix=%u transition=%u width=%u match=%u "
                 "occurrences=%u blockv=%d hw_r=%u hw_batch=%u "
                 "attn_phys=%u attn_local=%u attn_indexed=%u "
-                "attn_dense=%u "
+                "attn_dense=%u cohort=%llu request=%llu "
+                "requested_r=%u "
                 "coordinator=%s\n",
                 drafted,
                 verify->rows,
@@ -36797,7 +37034,9 @@ static void dspark_rn_finalize_lane(
                 verify_reject_seconds * 1000.0,
                 verify_finish_seconds * 1000.0,
                 cycle_seconds * 1000.0,
-                committed < drafted ? 1 : 0,
+                request->temperature > 0.0f ? 1 : 0,
+                request->temperature > 0.0f &&
+                    committed < drafted ? 1 : 0,
                 retrieval_n != 0u ? 1 : 0,
                 neural_drafted,
                 retrieval_n,
@@ -36814,6 +37053,10 @@ static void dspark_rn_finalize_lane(
                 attn_local_layers,
                 attn_indexed_layers,
                 attn_dense_layers,
+                (unsigned long long)request->cohort_id,
+                (unsigned long long)request->request_id,
+                request->requested_cohort_size
+                    ? request->requested_cohort_size : hw_r,
                 physical ? "physical" : "serial");
     }
 }
@@ -36837,6 +37080,7 @@ int ds4_sessions_eval_speculative_sample_rn(
     for (uint32_t r = 0; r < request_count; r++) {
         requests[r].result = -1;
     }
+    const double cohort_t0 = now_sec();
     const char *coordinator_mode =
         getenv("DS4_DSPARK_COORDINATOR_MODE");
     const bool force_serial =
@@ -36858,13 +37102,34 @@ int ds4_sessions_eval_speculative_sample_rn(
             ds4_dspark_scheduler_state_reset_history(
                     &owner->dspark_rn_hw_scheduler);
         }
-        return ds4_sessions_eval_speculative_sample_serial(
+        const int serial_rc = ds4_sessions_eval_speculative_sample_serial(
                 requests, request_count, err, errlen);
+        uint32_t emitted = 0u;
+        if (serial_rc == 0 && requests[0].result > 0) {
+            emitted = (uint32_t)requests[0].result;
+        }
+        const double elapsed = now_sec() - cohort_t0;
+        dspark_rn_log_cohort(
+                requests, request_count, "fallback",
+                "forced-serial-singleton", 0u, 0u, emitted, 0u,
+                0.0, elapsed, elapsed);
+        return serial_rc;
     }
 
 #if defined(DS4_NO_GPU) || defined(__APPLE__) || defined(DS4_ROCM_BUILD)
-    return ds4_sessions_eval_speculative_sample_serial(
+    const int serial_rc = ds4_sessions_eval_speculative_sample_serial(
             requests, request_count, err, errlen);
+    uint32_t emitted = 0u;
+    for (uint32_t r = 0; serial_rc == 0 && r < request_count; r++) {
+        if (requests[r].result > 0) {
+            emitted += (uint32_t)requests[r].result;
+        }
+    }
+    const double elapsed = now_sec() - cohort_t0;
+    dspark_rn_log_cohort(
+            requests, request_count, "fallback", "non-cuda",
+            0u, 0u, emitted, 0u, 0.0, elapsed, elapsed);
+    return serial_rc;
 #else
     const bool force_physical =
         coordinator_mode &&
@@ -36873,10 +37138,21 @@ int ds4_sessions_eval_speculative_sample_rn(
     ds4_session *owner = first
         ? (first->scratch_owner ? first->scratch_owner : first)
         : NULL;
-    bool compatible = owner && owner->engine &&
-        owner->engine->dspark_ready &&
-        getenv("DS4_DSPARK_SPEC_DISABLE") == NULL &&
-        getenv("DS4_DSPARK_EXACT_VERIFY") == NULL;
+    const char *fallback_reason = NULL;
+    bool compatible = true;
+    if (!owner || !owner->engine) {
+        compatible = false;
+        fallback_reason = "missing-owner";
+    } else if (!owner->engine->dspark_ready) {
+        compatible = false;
+        fallback_reason = "dspark-unavailable";
+    } else if (getenv("DS4_DSPARK_SPEC_DISABLE") != NULL) {
+        compatible = false;
+        fallback_reason = "dspark-disabled";
+    } else if (getenv("DS4_DSPARK_EXACT_VERIFY") != NULL) {
+        compatible = false;
+        fallback_reason = "exact-verify";
+    }
     uint32_t verify_cap[DS4_DSPARK_SCHEDULER_MAX_REQUESTS] = {0};
     uint64_t saved_rng[DS4_DSPARK_SCHEDULER_MAX_REQUESTS] = {0};
     for (uint32_t r = 0; compatible && r < request_count; r++) {
@@ -36894,24 +37170,47 @@ int ds4_sessions_eval_speculative_sample_rn(
             cap = request->accepted_cap - 1;
         }
         if (cap > room - 1) cap = room - 1;
-        const bool full_vocab_policy = request->top_k <= 0 &&
-            (request->top_p <= 0.0f || request->top_p >= 1.0f);
-        compatible =
-            session && request_owner == owner &&
-            session->engine == owner->engine &&
-            session->checkpoint_valid &&
-            session->graph.dspark_enabled &&
-            request->temperature > 0.0f &&
-            request->rng && request->accepted &&
-            request->accepted_cap > 1 &&
-            request->max_tokens > 1 &&
-            request->min_p >= 0.0f && request->min_p <= 1.0f &&
-            full_vocab_policy && cap > 0 &&
-            session->dspark_bypass_left == 0u &&
-            !session->dspark_sts_capture;
+        const bool greedy = request->temperature <= 0.0f;
+        const bool full_vocab_policy = greedy ||
+            (request->top_k <= 0 &&
+             (request->top_p <= 0.0f || request->top_p >= 1.0f));
+        if (!session || request_owner != owner ||
+            session->engine != owner->engine) {
+            compatible = false;
+            fallback_reason = "foreign-session";
+        } else if (!session->checkpoint_valid) {
+            compatible = false;
+            fallback_reason = "invalid-checkpoint";
+        } else if (!session->graph.dspark_enabled) {
+            compatible = false;
+            fallback_reason = "lane-dspark-disabled";
+        } else if (request->temperature < 0.0f ||
+                   (!greedy && !request->rng)) {
+            compatible = false;
+            fallback_reason = "sampling-policy";
+        } else if (!request->accepted ||
+                   request->accepted_cap <= 1 ||
+                   request->max_tokens <= 1) {
+            compatible = false;
+            fallback_reason = "output-boundary";
+        } else if (request->min_p < 0.0f ||
+                   request->min_p > 1.0f ||
+                   !full_vocab_policy) {
+            compatible = false;
+            fallback_reason = "sampling-policy";
+        } else if (cap <= 0) {
+            compatible = false;
+            fallback_reason = "context-boundary";
+        } else if (session->dspark_bypass_left != 0u) {
+            compatible = false;
+            fallback_reason = "lane-bypass";
+        } else if (session->dspark_sts_capture) {
+            compatible = false;
+            fallback_reason = "sts-capture";
+        }
         if (compatible) {
             verify_cap[r] = (uint32_t)cap;
-            saved_rng[r] = *request->rng;
+            if (request->rng) saved_rng[r] = *request->rng;
         }
     }
     if (!compatible) {
@@ -36919,8 +37218,49 @@ int ds4_sessions_eval_speculative_sample_rn(
             ds4_dspark_scheduler_state_reset_history(
                     &owner->dspark_rn_hw_scheduler);
         }
-        return ds4_sessions_eval_speculative_sample_serial(
+        const int serial_rc = ds4_sessions_eval_speculative_sample_serial(
                 requests, request_count, err, errlen);
+        uint32_t emitted = 0u;
+        for (uint32_t r = 0; serial_rc == 0 && r < request_count; r++) {
+            if (requests[r].result > 0) {
+                emitted += (uint32_t)requests[r].result;
+            }
+        }
+        const double elapsed = now_sec() - cohort_t0;
+        dspark_rn_log_cohort(
+                requests, request_count, "fallback",
+                fallback_reason ? fallback_reason : "incompatible",
+                0u, 0u, emitted, 0u, 0.0, elapsed, elapsed);
+        return serial_rc;
+    }
+
+    if (request_count == 1u && !force_physical) {
+        uint32_t historical_champion = 0u;
+        double historical_rate = 0.0;
+        if (!dspark_should_start_draft(
+                requests[0].session,
+                verify_cap[0],
+                &historical_champion,
+                &historical_rate)) {
+            requests[0].result = dspark_eval_current_only(
+                    requests[0].session,
+                    requests[0].first_token,
+                    requests[0].accepted,
+                    0u,
+                    0.0,
+                    cohort_t0,
+                    "rn-historical",
+                    err,
+                    errlen);
+            const double elapsed = now_sec() - cohort_t0;
+            dspark_rn_log_cohort(
+                    requests, request_count, "target-only",
+                    "historical", 0u, 0u,
+                    requests[0].result > 0
+                        ? (uint32_t)requests[0].result : 0u,
+                    1u, 0.0, elapsed, elapsed);
+            return requests[0].result >= 0 ? 0 : 1;
+        }
     }
 
     const bool decode_trace = cuda_prefill_nvtx_enabled();
@@ -36946,6 +37286,7 @@ int ds4_sessions_eval_speculative_sample_rn(
     ds4_physical_rejection_request rejection[request_count];
     ds4_hybrid_draft hybrid[request_count];
     int final_draft_tokens[request_count][DS4_HYBRID_LC_MAX_DRAFT];
+    int greedy_row_tops[request_count][DS4_HYBRID_LC_MAX_DRAFT];
     float final_accept_uniforms[request_count][DS4_HYBRID_LC_MAX_DRAFT];
     float final_residual_uniforms[request_count][DS4_HYBRID_LC_MAX_DRAFT];
     uint32_t active_index[request_count];
@@ -36963,12 +37304,14 @@ int ds4_sessions_eval_speculative_sample_rn(
     bool hybrid_lc[request_count];
     bool hybrid_shadow[request_count];
     bool lane_finalized[request_count];
+    bool planned_hybrid_path = false;
     memset(draft, 0, sizeof(draft));
     memset(items, 0, sizeof(items));
     memset(verify, 0, sizeof(verify));
     memset(rejection, 0, sizeof(rejection));
     memset(hybrid, 0, sizeof(hybrid));
     memset(final_draft_tokens, 0, sizeof(final_draft_tokens));
+    memset(greedy_row_tops, 0, sizeof(greedy_row_tops));
     memset(final_accept_uniforms, 0, sizeof(final_accept_uniforms));
     memset(final_residual_uniforms, 0, sizeof(final_residual_uniforms));
     memset(active_index, 0, sizeof(active_index));
@@ -36995,6 +37338,8 @@ int ds4_sessions_eval_speculative_sample_rn(
         session->dspark_pending_valid = false;
         hybrid_lc[r] = dspark_hybrid_lc_enabled(session);
         hybrid_shadow[r] = dspark_hybrid_lc_shadow_enabled(session);
+        planned_hybrid_path =
+            planned_hybrid_path || hybrid_lc[r];
         hybrid_rng_before[r] = session->hybrid_lc_rng;
         hybrid_shadow_rng_before[r] = session->hybrid_lc_shadow_rng;
         if (hybrid_lc[r] &&
@@ -37018,11 +37363,27 @@ int ds4_sessions_eval_speculative_sample_rn(
     const double cohort_draft_seconds = draft_done - cycle_t0;
     if (rc != 0) {
         for (uint32_t r = 0; r < request_count; r++) {
-            *requests[r].rng = saved_rng[r];
+            if (requests[r].rng) {
+                *requests[r].rng = saved_rng[r];
+            }
         }
         if (decode_trace) ds4_gpu_nsys_decode_cycle_end(0u);
-        return ds4_sessions_eval_speculative_sample_serial(
+        const int serial_rc = ds4_sessions_eval_speculative_sample_serial(
                 requests, request_count, err, errlen);
+        uint32_t emitted = 0u;
+        for (uint32_t r = 0; serial_rc == 0 && r < request_count; r++) {
+            if (requests[r].result > 0) {
+                emitted += (uint32_t)requests[r].result;
+            }
+        }
+        const double elapsed = now_sec() - cohort_t0;
+        dspark_rn_log_cohort(
+                requests, request_count, "fallback", "draft-failed",
+                0u, 0u, emitted, 0u,
+                cohort_draft_seconds,
+                elapsed - cohort_draft_seconds,
+                elapsed);
+        return serial_rc;
     }
 
     const double lane_draft_seconds =
@@ -37051,10 +37412,10 @@ int ds4_sessions_eval_speculative_sample_rn(
         items[r].position =
             (uint32_t)requests[r].session->checkpoint.len;
         items[r].request.identity = items[r].request_id;
-        /* A one-row lane selects a different target MoE kernel on GB10. K1
-         * costs the same physical rows as the former K0 shadow workaround, so
-         * make it useful verified work and expose that floor to the scheduler. */
-        items[r].request.minimum_prefix = 1u;
+        /* K=0 is a real scheduler choice. Physical cohorts can retain a
+         * launch-shape-only shadow row, but it must never force target work
+         * into the statistical admission decision. */
+        items[r].request.minimum_prefix = 0u;
         items[r].request.max_prefix = verify_cap[r];
         for (uint32_t i = 0; i < verify_cap[r]; i++) {
             items[r].request.conditional[i] =
@@ -37103,6 +37464,10 @@ int ds4_sessions_eval_speculative_sample_rn(
             max_rows + 1u,
             &schedule_step);
     if (rc != 0) {
+        schedule_step.selected.request_count = request_count;
+        schedule_step.selected.batch_size = request_count;
+        schedule_step.selected.expected_tokens =
+            (double)request_count;
         for (uint32_t r = 0; r < request_count; r++) {
             schedule_step.selected.prefix[r] =
                 (uint32_t)dspark_choose_verify_len(
@@ -37115,11 +37480,23 @@ int ds4_sessions_eval_speculative_sample_rn(
                 schedule_step.selected.prefix[r] =
                     items[r].request.minimum_prefix;
             }
+            double survival = 1.0;
+            for (uint32_t i = 0;
+                 i < schedule_step.selected.prefix[r]; i++) {
+                survival *= items[r].request.conditional[i];
+                schedule_step.selected.expected_tokens += survival;
+            }
+            schedule_step.selected.batch_size +=
+                schedule_step.selected.prefix[r];
         }
+        schedule_step.selected.throughput =
+            schedule_step.selected.expected_tokens *
+            sps[schedule_step.selected.batch_size];
         rc = 0;
     }
 
     uint32_t serial_rows = request_count;
+    uint32_t serial_profile_rows = request_count;
     double serial_expected = (double)request_count;
     double serial_verify_seconds = 0.0;
     for (uint32_t r = 0; r < request_count; r++) {
@@ -37134,6 +37511,7 @@ int ds4_sessions_eval_speculative_sample_rn(
         if (selected > verify_cap[r]) selected = verify_cap[r];
         serial_prefix[r] = selected;
         serial_rows += selected;
+        serial_profile_rows += selected != 0u ? selected : 1u;
         double survival = 1.0;
         for (uint32_t i = 0; i < selected; i++) {
             survival *= items[r].request.conditional[i];
@@ -37142,7 +37520,27 @@ int ds4_sessions_eval_speculative_sample_rn(
         serial_verify_seconds += dspark_verify_cost_estimate(
                 requests[r].session, selected);
     }
-    if (serial_rows <= DS4_DSPARK_SCHEDULER_MAX_ROWS &&
+    const uint8_t cost_context_bucket =
+        dspark_rn_context_bucket(requests, request_count);
+    const uint8_t cost_path_class = planned_hybrid_path
+        ? DS4_DSPARK_RN_PATH_HYBRID
+        : DS4_DSPARK_RN_PATH_NEURAL;
+    const uint64_t serial_shape =
+        dspark_rn_shape_hash(serial_prefix, request_count);
+    uint64_t serial_profile_samples = 0u;
+    double serial_profile_seconds = 0.0;
+    if (dspark_rn_cost_profile_lookup(
+            owner,
+            DS4_DSPARK_RN_EXEC_SERIAL,
+            cost_path_class,
+            cost_context_bucket,
+            request_count,
+            serial_profile_rows,
+            serial_shape,
+            &serial_profile_seconds,
+            &serial_profile_samples)) {
+        serial_verify_seconds = serial_profile_seconds;
+    } else if (serial_rows <= DS4_DSPARK_SCHEDULER_MAX_ROWS &&
         owner->dspark_rn_serial_verify_samples[serial_rows] >= 2u) {
         serial_verify_seconds =
             owner->dspark_rn_serial_verify_ewma[serial_rows];
@@ -37153,12 +37551,43 @@ int ds4_sessions_eval_speculative_sample_rn(
         ? serial_expected / serial_predicted_seconds : 0.0;
 
     const uint32_t scheduled_rows = schedule_step.selected.batch_size;
-    const double physical_rate = schedule_step.selected.throughput;
+    uint32_t physical_profile_rows = scheduled_rows;
+    for (uint32_t r = 0; r < request_count; r++) {
+        if (schedule_step.selected.prefix[r] == 0u) {
+            physical_profile_rows++;
+        }
+    }
+    const uint64_t physical_shape = dspark_rn_shape_hash(
+            schedule_step.selected.prefix, request_count);
+    uint64_t physical_profile_samples = 0u;
+    double physical_profile_seconds = 0.0;
+    double physical_rate = schedule_step.selected.throughput;
+    const bool physical_profile_ready =
+        dspark_rn_cost_profile_lookup(
+            owner,
+            DS4_DSPARK_RN_EXEC_PHYSICAL,
+            cost_path_class,
+            cost_context_bucket,
+            request_count,
+            physical_profile_rows,
+            physical_shape,
+            &physical_profile_seconds,
+            &physical_profile_samples);
+    if (physical_profile_ready &&
+        physical_profile_seconds > 0.0) {
+        const double seconds =
+            cohort_draft_seconds + physical_profile_seconds;
+        physical_rate = seconds > 0.0
+            ? schedule_step.selected.expected_tokens / seconds
+            : 0.0;
+    }
     const uint64_t coordinator_step = owner->dspark_rn_hw_scheduler.step;
     const uint64_t warmup_cycles = 8u;
     const uint64_t probe_interval = 64u;
     const bool periodic_probe =
         coordinator_step % probe_interval == 0u;
+    const bool physical_shape_mature =
+        physical_profile_samples >= 2u;
     uint32_t min_physical_rows = 10u;
     const char *min_rows_env =
         getenv("DS4_DSPARK_RN_MIN_PHYSICAL_ROWS");
@@ -37189,6 +37618,7 @@ int ds4_sessions_eval_speculative_sample_rn(
                request_count > 1u &&
                !periodic_probe &&
                coordinator_step > warmup_cycles &&
+               !physical_shape_mature &&
                scheduled_rows < min_physical_rows) {
         use_physical = false;
         decision_reason = "small-batch-serial";
@@ -37204,7 +37634,9 @@ int ds4_sessions_eval_speculative_sample_rn(
                 "scheduled_batch=%u physical_rate=%.2f "
                 "serial_batch=%u serial_rate=%.2f "
                 "physical_samples=%llu serial_samples=%llu "
-                "step=%llu reason=%s\n",
+                "physical_shape_samples=%llu "
+                "serial_shape_samples=%llu bucket=%u "
+                "shape_mature=%u step=%llu reason=%s\n",
                 use_physical ? "physical" : "serial",
                 request_count,
                 scheduled_rows,
@@ -37219,8 +37651,43 @@ int ds4_sessions_eval_speculative_sample_rn(
                     serial_rows <= DS4_DSPARK_SCHEDULER_MAX_ROWS
                         ? owner->dspark_rn_serial_verify_samples[serial_rows]
                         : 0u),
+                (unsigned long long)physical_profile_samples,
+                (unsigned long long)serial_profile_samples,
+                cost_context_bucket,
+                physical_shape_mature ? 1u : 0u,
                 (unsigned long long)coordinator_step,
                 decision_reason);
+    }
+
+    if (request_count == 1u &&
+        schedule_step.selected.prefix[0] == 0u &&
+        !force_physical &&
+        !hybrid_lc[0]) {
+        requests[0].result = dspark_eval_current_only(
+                requests[0].session,
+                requests[0].first_token,
+                requests[0].accepted,
+                verify_cap[0],
+                cohort_draft_seconds,
+                cycle_t0,
+                "rn-scheduler-k0",
+                err,
+                errlen);
+        const double elapsed = now_sec() - cycle_t0;
+        if (decode_trace) {
+            ds4_gpu_nsys_decode_cycle_end(
+                    requests[0].result > 0
+                        ? (uint32_t)requests[0].result : 0u);
+        }
+        dspark_rn_log_cohort(
+                requests, request_count, "target-only",
+                "scheduler-k0", verify_cap[0], 0u,
+                requests[0].result > 0
+                    ? (uint32_t)requests[0].result : 0u,
+                1u, cohort_draft_seconds,
+                elapsed - cohort_draft_seconds,
+                elapsed);
+        return requests[0].result >= 0 ? 0 : 1;
     }
 
     uint32_t active_count = 0u;
@@ -37265,9 +37732,11 @@ int ds4_sessions_eval_speculative_sample_rn(
                     selected,
                     total_cap,
                     requests[r].eos_token,
-                    hybrid_lc[r]
-                        ? &session->hybrid_lc_rng
-                        : &session->hybrid_lc_shadow_rng,
+                    requests[r].temperature > 0.0f
+                        ? (hybrid_lc[r]
+                           ? &session->hybrid_lc_rng
+                           : &session->hybrid_lc_shadow_rng)
+                        : NULL,
                     &hybrid[r]);
             if (hybrid_shadow[r]) {
                 session->hybrid_lc_shadow_queries++;
@@ -37281,7 +37750,10 @@ int ds4_sessions_eval_speculative_sample_rn(
         }
 
         if (hybrid_lc[r] && hybrid[r].n > selected) {
-            const uint64_t target_rng_before_tail = *requests[r].rng;
+            const bool stochastic =
+                requests[r].temperature > 0.0f;
+            const uint64_t target_rng_before_tail =
+                requests[r].rng ? *requests[r].rng : 0u;
             uint32_t rows =
                 dspark_hybrid_lc_select_rows(session, &hybrid[r]);
             if (rows > hybrid[r].n + 1u) rows = hybrid[r].n + 1u;
@@ -37289,13 +37761,16 @@ int ds4_sessions_eval_speculative_sample_rn(
             for (uint32_t i = 0; i < hybrid_drafts; i++) {
                 final_draft_tokens[r][i] = hybrid[r].token[i];
             }
-            for (uint32_t i = selected; i < hybrid_drafts; i++) {
-                final_accept_uniforms[r][i] =
-                    sample_rng_f32(requests[r].rng);
-                final_residual_uniforms[r][i] =
-                    sample_rng_f32(requests[r].rng);
+            if (stochastic) {
+                for (uint32_t i = selected; i < hybrid_drafts; i++) {
+                    final_accept_uniforms[r][i] =
+                        sample_rng_f32(requests[r].rng);
+                    final_residual_uniforms[r][i] =
+                        sample_rng_f32(requests[r].rng);
+                }
             }
-            bool hybrid_ok = hybrid_drafts == selected ||
+            bool hybrid_ok = !stochastic ||
+                hybrid_drafts == selected ||
                 ds4_gpu_dspark_sparse_draft_rows_tensor(
                         session->graph.dspark_draft_probs,
                         selected,
@@ -37321,7 +37796,9 @@ int ds4_sessions_eval_speculative_sample_rn(
                     }
                 }
             } else {
-                *requests[r].rng = target_rng_before_tail;
+                if (requests[r].rng) {
+                    *requests[r].rng = target_rng_before_tail;
+                }
                 session->hybrid_lc_rng = hybrid_rng_before[r];
                 hybrid[r].n = selected;
                 hybrid[r].suffix_n = 0u;
@@ -37377,13 +37854,16 @@ int ds4_sessions_eval_speculative_sample_rn(
             .rows = rows,
             .capture_prefixes = physical_drafts,
             .shadow_tail_rows = shadow_tail,
+            .row_tops = requests[r].temperature <= 0.0f
+                ? greedy_row_tops[r] : NULL,
         };
         rejection[a] = (ds4_physical_rejection_request) {
             .accept_uniforms = final_accept_uniforms[r],
             .residual_uniforms = final_residual_uniforms[r],
             .temperature = requests[r].temperature,
             .min_p = requests[r].min_p,
-            .block_verify = hybrid_lc[r],
+            .block_verify =
+                hybrid_lc[r] && requests[r].temperature > 0.0f,
         };
         physical_rows += rows;
     }
@@ -37492,31 +37972,60 @@ int ds4_sessions_eval_speculative_sample_rn(
     if (decode_trace) ds4_gpu_nvtx_range_pop();
     const double verify_seconds = done - verify_t0;
     const double cycle_seconds = done - cycle_t0;
+    bool pure_neural_cohort = true;
+    for (uint32_t r = 0; r < request_count; r++) {
+        if (total_drafted[r] != neural_drafted[r]) {
+            pure_neural_cohort = false;
+            break;
+        }
+    }
 
     if (use_physical && rc == 0 && active_count != 0u) {
-        const uint64_t samples =
-            owner->dspark_rn_verify_samples[physical_rows];
-        const double alpha = samples < 4u ? 0.5 : 0.15;
-        owner->dspark_rn_verify_ewma[physical_rows] =
-            samples == 0u
-                ? verify_seconds
-                : owner->dspark_rn_verify_ewma[physical_rows] *
-                      (1.0 - alpha) +
-                  verify_seconds * alpha;
-        owner->dspark_rn_verify_samples[physical_rows]++;
+        if (pure_neural_cohort) {
+            const uint64_t samples =
+                owner->dspark_rn_verify_samples[physical_rows];
+            const double alpha = samples < 4u ? 0.5 : 0.15;
+            owner->dspark_rn_verify_ewma[physical_rows] =
+                samples == 0u
+                    ? verify_seconds
+                    : owner->dspark_rn_verify_ewma[physical_rows] *
+                          (1.0 - alpha) +
+                      verify_seconds * alpha;
+            owner->dspark_rn_verify_samples[physical_rows]++;
+        }
+        dspark_rn_cost_profile_note(
+                owner,
+                DS4_DSPARK_RN_EXEC_PHYSICAL,
+                cost_path_class,
+                cost_context_bucket,
+                request_count,
+                physical_profile_rows,
+                physical_shape,
+                verify_seconds);
     }
-    if (!use_physical && rc == 0 &&
-        serial_rows <= DS4_DSPARK_SCHEDULER_MAX_ROWS) {
-        const uint64_t samples =
-            owner->dspark_rn_serial_verify_samples[serial_rows];
-        const double alpha = samples < 4u ? 0.5 : 0.15;
-        owner->dspark_rn_serial_verify_ewma[serial_rows] =
-            samples == 0u
-                ? verify_seconds
-                : owner->dspark_rn_serial_verify_ewma[serial_rows] *
-                      (1.0 - alpha) +
-                  verify_seconds * alpha;
-        owner->dspark_rn_serial_verify_samples[serial_rows]++;
+    if (!use_physical && rc == 0) {
+        if (pure_neural_cohort &&
+            serial_rows <= DS4_DSPARK_SCHEDULER_MAX_ROWS) {
+            const uint64_t samples =
+                owner->dspark_rn_serial_verify_samples[serial_rows];
+            const double alpha = samples < 4u ? 0.5 : 0.15;
+            owner->dspark_rn_serial_verify_ewma[serial_rows] =
+                samples == 0u
+                    ? verify_seconds
+                    : owner->dspark_rn_serial_verify_ewma[serial_rows] *
+                          (1.0 - alpha) +
+                      verify_seconds * alpha;
+            owner->dspark_rn_serial_verify_samples[serial_rows]++;
+        }
+        dspark_rn_cost_profile_note(
+                owner,
+                DS4_DSPARK_RN_EXEC_SERIAL,
+                cost_path_class,
+                cost_context_bucket,
+                request_count,
+                serial_profile_rows,
+                serial_shape,
+                verify_seconds);
     }
 
     for (uint32_t a = 0; rc == 0 && a < active_count; a++) {
@@ -37568,11 +38077,15 @@ int ds4_sessions_eval_speculative_sample_rn(
         lane_finalized[a] = true;
     }
 
+    bool verifier_fallback = false;
     if (rc != 0) {
+        verifier_fallback = true;
         bool fallback_ok = true;
         for (uint32_t r = 0; r < request_count; r++) {
             if (requests[r].result >= 0) continue;
-            *requests[r].rng = saved_rng[r];
+            if (requests[r].rng) {
+                *requests[r].rng = saved_rng[r];
+            }
             requests[r].session->hybrid_lc_rng =
                 hybrid_rng_before[r];
             requests[r].session->hybrid_lc_shadow_rng =
@@ -37594,6 +38107,34 @@ int ds4_sessions_eval_speculative_sample_rn(
         }
         if (fallback_ok) rc = 0;
     }
+
+    uint32_t cohort_drafted = 0u;
+    uint32_t cohort_committed = 0u;
+    uint32_t cohort_emitted = 0u;
+    for (uint32_t r = 0; r < request_count; r++) {
+        cohort_drafted += total_drafted[r];
+        if (!verifier_fallback) {
+            cohort_committed += rejection[r].committed_drafts;
+        }
+        if (requests[r].result > 0) {
+            cohort_emitted += (uint32_t)requests[r].result;
+        }
+    }
+    const double cohort_total_seconds = now_sec() - cycle_t0;
+    dspark_rn_log_cohort(
+            requests,
+            request_count,
+            verifier_fallback
+                ? "fallback"
+                : (use_physical ? "physical" : "serial"),
+            verifier_fallback ? "verifier-failed" : "none",
+            cohort_drafted,
+            cohort_committed,
+            cohort_emitted,
+            physical_rows,
+            cohort_draft_seconds,
+            cohort_total_seconds - cohort_draft_seconds,
+            cohort_total_seconds);
 
     if (decode_trace) {
         uint32_t emitted = 0u;

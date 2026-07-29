@@ -24,6 +24,7 @@ DeepSeek-V4-Flash Q2/imatrix target:
 | HybridLC retrieval acceptance | 70.68%, 1022 / 1446 draft tokens |
 | Clean mixed coding session with compact Q2 sidecar | 20.88 t/s weighted |
 | Concurrent DSpark R=2 operational cohorts | 24.88 t/s aggregate, +7.7% |
+| Elastic R=3 agent run | 24.38 t/s overall; 35.39 t/s in physical R=3 cohorts |
 | Physical context enabled by default | 262144 tokens |
 | Experimental physical context | 1M tokens |
 | Sustained GB10 temperature observed in long runs | about 75 C |
@@ -52,6 +53,17 @@ target-verified. The scheduler can coalesce two independent requests into one
 physical verifier cohort, while KV-aware routing and chunk-boundary handoffs
 keep long prefills from starving active decode. Target sampling and per-session
 KV, RNG and rejection state remain unchanged.
+
+Multi-session serving is deliberately conservative on a 128 GB GB10: the
+promoted profile starts with two independent KV frontiers and activates a third
+lane on demand only when unified-memory headroom remains above an explicit
+reserve. Reported rates are aggregate across clients, not per-client scaling.
+Dense verifier stages are physically batched together with compatible attention
+shapes; KV/frontier state, part of compressor/indexer preparation, rejection
+and commit remain session-local. Unmatched tool, prefill or completion phases
+continue safely as R=1. Conversations beyond the resident lanes use disk
+checkpoints and replay, and prefill/decode interleaving occurs only at complete
+8192-token chunk boundaries.
 
 ![Measured DS4 GB10 prefill and decode performance](docs/gb10-performance.svg)
 

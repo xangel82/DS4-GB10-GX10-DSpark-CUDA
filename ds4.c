@@ -27939,6 +27939,11 @@ struct ds4_session {
     bool shared_scratch_lane;
 #ifndef DS4_NO_GPU
     ds4_gpu_graph graph;
+    /* Non-owning graph blueprint captured before the first shared lane starts.
+     * Elastic lanes may be allocated after the owner has advanced; cloning this
+     * pristine host description avoids inheriting mutable counters or swapped
+     * scratch aliases from the live owner. */
+    ds4_gpu_graph *shared_lane_template;
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
@@ -32355,7 +32360,13 @@ int ds4_session_create_shared(ds4_session **out, ds4_session *owner) {
     s->shared_scratch_lane = true;
     s->ctx_size = owner->ctx_size;
     s->prefill_cap = owner->prefill_cap;
-    if (!metal_graph_alloc_shared_lane(&s->graph, &owner->graph)) {
+    if (!owner->shared_lane_template) {
+        owner->shared_lane_template =
+            xmalloc(sizeof(owner->shared_lane_template[0]));
+        *owner->shared_lane_template = owner->graph;
+    }
+    if (!metal_graph_alloc_shared_lane(
+            &s->graph, owner->shared_lane_template)) {
         free(s);
         return 1;
     }
@@ -33129,6 +33140,7 @@ void ds4_session_free(ds4_session *s) {
 #endif
         metal_graph_free(&s->graph);
     }
+    free(s->shared_lane_template);
 #endif
     token_vec_free(&s->checkpoint);
     token_vec_free(&s->physical_tokens);

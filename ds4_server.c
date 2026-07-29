@@ -7991,7 +7991,10 @@ typedef struct {
 
 #define DS4_SERVER_GPU_FRONTIER_SLOTS 4u
 #define DS4_SERVER_DSPARK_DEFAULT_LANES 2u
+#define DS4_SERVER_DSPARK_DEFAULT_HOT_LANES 2u
 #define DS4_SERVER_DSPARK_MAX_LANES 3u
+#define DS4_SERVER_DSPARK_LANE_RESERVE_MB 1536u
+#define DS4_SERVER_DSPARK_LANE_RETRY_SEC 5.0
 #define DS4_SERVER_ROUTE_PREFILL_TPS 900.0
 #define DS4_SERVER_ROUTE_SERVICE_INITIAL_SEC 12.0
 #define DS4_SERVER_ROUTE_SERVICE_EWMA_ALPHA 0.20
@@ -8013,6 +8016,12 @@ struct server {
     struct server *root;
     struct server **lanes;
     uint32_t lane_count;
+    uint32_t lane_capacity;
+    uint32_t lane_hot_count;
+    bool lane_activation_in_progress;
+    double lane_activation_retry_sec;
+    uint64_t lane_private_device_bytes;
+    uint64_t lane_memory_reserve_bytes;
     uint32_t lane_id;
     uint32_t assigned_jobs;
     bool worker_active;
@@ -12655,6 +12664,129 @@ static double lane_route_wait_sec_locked(const server *root,
     return residual + (double)queued * service;
 }
 
+static uint64_t server_env_mb(const char *name, uint64_t fallback,
+                              uint64_t maximum) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return fallback;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (end == value || *end != '\0' || parsed > maximum) return fallback;
+    return (uint64_t)parsed;
+}
+
+static uint64_t server_memory_available_bytes(void) {
+#if defined(__linux__)
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) return 0;
+    char line[256];
+    uint64_t available_kib = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        unsigned long long value = 0;
+        if (sscanf(line, "MemAvailable: %llu kB", &value) == 1) {
+            available_kib = (uint64_t)value;
+            break;
+        }
+    }
+    fclose(fp);
+    if (available_kib > UINT64_MAX / 1024u) return UINT64_MAX;
+    return available_kib * 1024u;
+#else
+    return 0;
+#endif
+}
+
+static bool server_lane_memory_fits(uint64_t available,
+                                    uint64_t lane_bytes,
+                                    uint64_t reserve_bytes) {
+    if (available == 0u || lane_bytes == 0u) return false;
+    if (lane_bytes > UINT64_MAX - reserve_bytes) return false;
+    return available >= lane_bytes + reserve_bytes;
+}
+
+static bool server_lane_activation_pressure_locked(const server *root) {
+    if (!root || root->lane_count == 0u ||
+        root->lane_count >= root->lane_capacity) {
+        return false;
+    }
+    for (uint32_t i = 0; i < root->lane_count; i++) {
+        const server *lane = root->lanes ? root->lanes[i] : root;
+        if (!lane || lane->assigned_jobs == 0u) return false;
+    }
+    return true;
+}
+
+/* The first two lanes remain hot. A configured third lane is only materialized
+ * when every resident lane already owns work and unified memory can absorb its
+ * private KV/compressor state while retaining an explicit OS reserve. CUDA
+ * allocations are serialized with inference, but root->mu is released while
+ * the comparatively expensive session allocation runs. */
+static void server_maybe_activate_lane(server *s) {
+    server *root = server_root(s);
+    if (!root) return;
+
+    pthread_mutex_lock(&root->mu);
+    const double now = now_sec();
+    if (root->stopping || root->lane_activation_in_progress ||
+        now < root->lane_activation_retry_sec ||
+        !server_lane_activation_pressure_locked(root)) {
+        pthread_mutex_unlock(&root->mu);
+        return;
+    }
+    const uint32_t lane_id = root->lane_count;
+    server *lane = root->lanes ? root->lanes[lane_id] : NULL;
+    root->lane_activation_in_progress = true;
+    pthread_mutex_unlock(&root->mu);
+
+    const uint64_t available = server_memory_available_bytes();
+    const uint64_t lane_bytes = root->lane_private_device_bytes;
+    const uint64_t reserve = root->lane_memory_reserve_bytes;
+    ds4_session *shared = NULL;
+    bool memory_ok =
+        lane && server_lane_memory_fits(available, lane_bytes, reserve);
+    if (memory_ok) {
+        server_gpu_enter(root);
+        const uint64_t available_now = server_memory_available_bytes();
+        memory_ok = server_lane_memory_fits(
+            available_now, lane_bytes, reserve);
+        if (memory_ok &&
+            ds4_session_create_shared(&shared, root->session) != 0) {
+            memory_ok = false;
+        }
+        server_gpu_leave(root);
+    }
+
+    pthread_mutex_lock(&root->mu);
+    if (shared && lane && root->lane_count == lane_id) {
+        lane->session = shared;
+        root->lane_count = lane_id + 1u;
+        root->lane_private_device_bytes =
+            ds4_session_private_device_bytes(shared);
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: elastic DSpark lane %u activated "
+                   "(resident=%u/%u private=%.2f MiB available=%.2f MiB "
+                   "reserve=%.2f MiB)",
+                   lane_id, root->lane_count, root->lane_capacity,
+                   (double)root->lane_private_device_bytes / 1048576.0,
+                   (double)available / 1048576.0,
+                   (double)reserve / 1048576.0);
+    } else {
+        ds4_session_free(shared);
+        root->lane_activation_retry_sec =
+            now_sec() + DS4_SERVER_DSPARK_LANE_RETRY_SEC;
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: elastic DSpark lane %u deferred "
+                   "(resident=%u/%u need=%.2f MiB reserve=%.2f MiB "
+                   "available=%.2f MiB)",
+                   lane_id, root->lane_count, root->lane_capacity,
+                   (double)lane_bytes / 1048576.0,
+                   (double)reserve / 1048576.0,
+                   (double)available / 1048576.0);
+    }
+    root->lane_activation_in_progress = false;
+    pthread_cond_broadcast(&root->cv);
+    pthread_mutex_unlock(&root->mu);
+}
+
 static lane_route_choice lane_route_cost_locked(const server *root,
                                                 const server *lane,
                                                 const request *req) {
@@ -12728,6 +12860,7 @@ static uint32_t select_lane_locked(server *root, const request *req) {
 
 static bool enqueue(server *s, job *j) {
     server *root = server_root(s);
+    server_maybe_activate_lane(root);
     pthread_mutex_lock(&root->mu);
     if (root->stopping) {
         pthread_mutex_unlock(&root->mu);
@@ -13298,7 +13431,9 @@ static void server_close_resources(server *s) {
     }
     ds4_tokens_free(&s->affinity);
     if (s->lanes) {
-        for (uint32_t lane_id = 1; lane_id < s->lane_count; lane_id++) {
+        const uint32_t lane_capacity =
+            s->lane_capacity ? s->lane_capacity : s->lane_count;
+        for (uint32_t lane_id = 1; lane_id < lane_capacity; lane_id++) {
             server *lane = s->lanes[lane_id];
             if (!lane) continue;
             live_tool_state_free(&lane->chat_live);
@@ -13598,6 +13733,8 @@ int main(int argc, char **argv) {
     memset(&s, 0, sizeof(s));
     s.root = &s;
     s.lane_count = 1u;
+    s.lane_capacity = 1u;
+    s.lane_hot_count = 1u;
     s.lanes = xmalloc(
             DS4_SERVER_DSPARK_MAX_LANES * sizeof(s.lanes[0]));
     memset(s.lanes, 0,
@@ -13655,11 +13792,48 @@ int main(int argc, char **argv) {
             requested_lanes = (uint32_t)parsed;
         }
     }
+    const char *hot_lane_env = getenv("DS4_SERVER_DSPARK_HOT_LANES");
+    uint32_t requested_hot_lanes =
+        requested_lanes < DS4_SERVER_DSPARK_DEFAULT_HOT_LANES
+            ? requested_lanes
+            : DS4_SERVER_DSPARK_DEFAULT_HOT_LANES;
+    if (hot_lane_env && hot_lane_env[0]) {
+        char *end = NULL;
+        const unsigned long parsed = strtoul(hot_lane_env, &end, 10);
+        if (end != hot_lane_env && *end == '\0' &&
+            parsed >= 1u && parsed <= requested_lanes) {
+            requested_hot_lanes = (uint32_t)parsed;
+        }
+    }
+    if (requested_lanes > 1u && requested_hot_lanes < 2u) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: elastic DSpark serving requires two "
+                   "pristine hot lanes; using hot=2");
+        requested_hot_lanes = 2u;
+    }
     if (requested_lanes > 1u &&
         ds4_engine_has_dspark(engine) &&
         cfg.engine.backend == DS4_BACKEND_CUDA) {
+        s.lane_capacity = requested_lanes;
+        s.lane_hot_count = requested_hot_lanes;
+        s.lane_memory_reserve_bytes = server_env_mb(
+            "DS4_SERVER_DSPARK_LANE_RESERVE_MB",
+            DS4_SERVER_DSPARK_LANE_RESERVE_MB, 65536u) * 1048576u;
+        for (uint32_t lane_id = 1u; lane_id < requested_lanes; lane_id++) {
+            server *lane = xmalloc(sizeof(*lane));
+            memset(lane, 0, sizeof(*lane));
+            lane->root = &s;
+            lane->lane_id = lane_id;
+            lane->engine = engine;
+            lane->default_tokens = s.default_tokens;
+            lane->advertised_ctx_size = s.advertised_ctx_size;
+            lane->disable_exact_dsml_tool_replay =
+                s.disable_exact_dsml_tool_replay;
+            lane->enable_cors = s.enable_cors;
+            s.lanes[lane_id] = lane;
+        }
         for (uint32_t lane_id = 1u;
-             lane_id < requested_lanes;
+             lane_id < requested_hot_lanes;
              lane_id++) {
             ds4_session *shared = NULL;
             if (ds4_session_create_shared(&shared, session) != 0) {
@@ -13667,28 +13841,37 @@ int main(int argc, char **argv) {
                            "ds4-server: shared DSpark lane %u unavailable; "
                            "continuing with %u lane(s)",
                            lane_id, s.lane_count);
+                s.lane_capacity = s.lane_count;
+                s.lane_hot_count = s.lane_count;
                 break;
             }
-            server *lane = xmalloc(sizeof(*lane));
-            memset(lane, 0, sizeof(*lane));
-            lane->root = &s;
-            lane->lane_id = lane_id;
-            lane->engine = engine;
+            server *lane = s.lanes[lane_id];
             lane->session = shared;
-            lane->default_tokens = s.default_tokens;
-            lane->advertised_ctx_size = s.advertised_ctx_size;
-            lane->disable_exact_dsml_tool_replay =
-                s.disable_exact_dsml_tool_replay;
-            lane->enable_cors = s.enable_cors;
-            s.lanes[lane_id] = lane;
             s.lane_count = lane_id + 1u;
+            s.lane_private_device_bytes =
+                ds4_session_private_device_bytes(shared);
+        }
+        for (uint32_t lane_id = s.lane_capacity;
+             lane_id < requested_lanes;
+             lane_id++) {
+            free(s.lanes[lane_id]);
+            s.lanes[lane_id] = NULL;
         }
         if (s.lane_count > 1u) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: DSpark cohort coordinator active "
-                       "(lanes=%u, coalesce=%ldus, "
+                       "(resident=%u max=%u hot=%u, coalesce=%ldus, "
                        "KV-cost-aware dispatch, physical R=1..%u)",
-                       s.lane_count, server_coalesce_us(), s.lane_count);
+                       s.lane_count, s.lane_capacity, s.lane_hot_count,
+                       server_coalesce_us(), s.lane_capacity);
+            if (s.lane_capacity > s.lane_count) {
+                server_log(DS4_LOG_DEFAULT,
+                           "ds4-server: elastic DSpark lane budget active "
+                           "(private=%.2f MiB reserve=%.2f MiB, "
+                           "Linux swap is not used as a CUDA capacity tier)",
+                           (double)s.lane_private_device_bytes / 1048576.0,
+                           (double)s.lane_memory_reserve_bytes / 1048576.0);
+            }
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: cooperative prefill/verifier scheduler active "
                        "(8192-token MoE chunks, durable chunk boundaries, "
@@ -13698,7 +13881,7 @@ int main(int argc, char **argv) {
 
     pthread_t workers[DS4_SERVER_DSPARK_MAX_LANES];
     memset(workers, 0, sizeof(workers));
-    for (uint32_t i = 0; i < s.lane_count; i++) {
+    for (uint32_t i = 0; i < s.lane_capacity; i++) {
         if (pthread_create(&workers[i], NULL,
                            worker_main, s.lanes[i]) != 0) {
             die("failed to start worker");
@@ -13712,7 +13895,7 @@ int main(int argc, char **argv) {
         s.stopping = true;
         pthread_cond_broadcast(&s.cv);
         pthread_mutex_unlock(&s.mu);
-        for (uint32_t i = 0; i < s.lane_count; i++) {
+        for (uint32_t i = 0; i < s.lane_capacity; i++) {
             pthread_join(workers[i], NULL);
         }
         server_close_resources(&s);
@@ -13763,7 +13946,7 @@ int main(int argc, char **argv) {
     s.stopping = true;
     pthread_cond_broadcast(&s.cv);
     pthread_mutex_unlock(&s.mu);
-    for (uint32_t i = 0; i < s.lane_count; i++) {
+    for (uint32_t i = 0; i < s.lane_capacity; i++) {
         pthread_join(workers[i], NULL);
     }
     pthread_mutex_lock(&s.mu);
@@ -18449,6 +18632,39 @@ static void test_coordinator_dispatches_by_prefix_and_tool_binding(void) {
     pthread_mutex_destroy(&root.tool_mu);
 }
 
+static void test_elastic_lane_pressure_and_memory_guard(void) {
+    server root = {0};
+    server second = {0};
+    server third = {0};
+    server *lanes[DS4_SERVER_DSPARK_MAX_LANES] = {
+        &root,
+        &second,
+        &third,
+    };
+    root.root = &root;
+    root.lanes = lanes;
+    root.lane_count = 2u;
+    root.lane_capacity = 3u;
+    second.root = &root;
+    second.lane_id = 1u;
+    third.root = &root;
+    third.lane_id = 2u;
+
+    TEST_ASSERT(!server_lane_activation_pressure_locked(&root));
+    root.assigned_jobs = 1u;
+    TEST_ASSERT(!server_lane_activation_pressure_locked(&root));
+    second.assigned_jobs = 1u;
+    TEST_ASSERT(server_lane_activation_pressure_locked(&root));
+    root.lane_count = 3u;
+    TEST_ASSERT(!server_lane_activation_pressure_locked(&root));
+
+    const uint64_t gib = UINT64_C(1024) * 1024u * 1024u;
+    TEST_ASSERT(server_lane_memory_fits(4u * gib, 2u * gib, 1u * gib));
+    TEST_ASSERT(!server_lane_memory_fits(3u * gib - 1u, 2u * gib, 1u * gib));
+    TEST_ASSERT(!server_lane_memory_fits(0u, 2u * gib, 1u * gib));
+    TEST_ASSERT(!server_lane_memory_fits(4u * gib, 0u, 1u * gib));
+}
+
 static void ds4_server_unit_tests_run(void) {
     test_request_defaults_use_min_p_filtering();
     test_thinking_sampling_respects_explicit_client_values();
@@ -18528,6 +18744,7 @@ static void ds4_server_unit_tests_run(void) {
     test_route_prefill_ewma_weights_first_short_sample();
     test_prefill_handoff_runs_exactly_one_waiting_decode();
     test_coordinator_dispatches_by_prefix_and_tool_binding();
+    test_elastic_lane_pressure_and_memory_guard();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();
     test_stop_list_parses_all_sequences();

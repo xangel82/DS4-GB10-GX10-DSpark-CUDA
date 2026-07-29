@@ -616,6 +616,65 @@ richiesto circa 2,25 GiB di stato privato. Il coordinatore accetta anche
 profilo, mentre `R=4` resta escluso perche' non lascia un margine UMA sicuro sul
 GB10 da 128 GiB.
 
+#### Stato operativo e limiti della release
+
+La configurazione promossa parte con due lane residenti e una capacita' massima
+di tre. La terza lane viene materializzata soltanto quando entrambe le lane
+calde hanno gia' lavoro assegnato e `MemAvailable` puo' contenere il suo stato
+privato piu' una riserva esplicita. Sul profilo misurato richiede
+`2368,66 MiB`; il launcher conserva per default altri `1536 MiB` e non usa lo
+swap Linux come tier di capacita' CUDA. `R=4` non e' considerato sicuro con il
+margine UMA osservato su Athena. Pesi, cache Q8->F16 e arena transiente sono
+condivisi, mentre ogni lane conserva il proprio stato di conversazione.
+
+```bash
+DS4_SERVER_DSPARK_LANES=3
+DS4_SERVER_DSPARK_HOT_LANES=2
+DS4_SERVER_DSPARK_LANE_RESERVE_MB=1536
+```
+
+Nel test operativo finale con tre agenti la lane elastica e' stata attivata una
+sola volta e il server ha completato 7.123 cicli DSpark senza fallback
+ordinari, errori CUDA, OOM o swap del processo. Le 3.622 coorti comprendevano
+1.467 esecuzioni fisiche e 2.155 seriali: il throughput aggregato complessivo
+e' stato `24,383 t/s`. Le coorti `R=3` fisiche hanno raggiunto
+`35,391 t/s`, contro `23,154 t/s` per la corrispondente forma seriale
+(`+52,8%`); `R=2` fisico ha misurato `21,432 t/s`, contro `19,043 t/s`
+seriali (`+12,6%`). L'acceptance complessiva e' stata `66,62%`.
+
+La quota fisica e' quindi ancora circa il 40,5%. In media 13,70 dei 43 layer
+attention per ciclo sono passati dal percorso fisico e 29,30 sono rimasti
+locali: e' il principale margine ancora aperto per aumentare lo scaling
+aggregato senza modificare la distribuzione target.
+
+Il batching fisico e' ancora parziale. QKV, FFN, output, vocabulary head e le
+forme CSA/HCA compatibili possono lavorare sul batch appiattito; ogni lane
+mantiene pero' KV e frontier proprie, mentre parte della preparazione
+compressor/indexer, rejection sampling e commit rimane per-sessione. Questa
+separazione e' necessaria per mantenere esatte posizione, RNG e distribuzione
+target, ma spiega perche' `R=2` aumenta il throughput aggregato senza
+raddoppiarlo.
+
+Le coorti si formano soltanto quando due richieste raggiungono insieme un
+confine speculativo. Se una lane esegue una tool call o un prefill, oppure una
+richiesta termina prima, l'altra continua correttamente come `R=1`; non viene
+trattenuta artificialmente per mantenere pieno il batch.
+
+All'avvio sono calde due frontier KV indipendenti; dopo l'attivazione elastica
+la terza lane conserva la propria frontier finche' il server resta in
+esecuzione. Le conversazioni oltre le lane residenti usano checkpoint su disco
+e replay; una
+canonicalizzazione che cambia la coda puo' ancora produrre `token-mismatch` e
+richiedere il ripristino del miglior checkpoint compatibile. Il disco e' il
+tier freddo gestito dall'applicazione: lo swap Linux non viene considerato un
+tier affidabile per lo stato CUDA attivo, perche' introdurrebbe stall e rischio
+OOM non prevedibili.
+
+Infine, prefill e decode vengono interleaved soltanto ai confini completi dei
+chunk da 8192 token. Una preemption fra layer non e' ancora corretta con gli
+scratch condivisi; il kernel prefill R=1 resta quindi invariato e il verifier
+ottiene la GPU solo quando KV e checkpoint della lane sono consistenti.
+
 ### Routing KV cost-aware e scheduling prefill/verifier
 
 Il dispatcher multi-lane non usa piu' il solo conteggio dei job. Le

@@ -159,6 +159,18 @@ int ds4_dspark_hardware_schedule_step(
         uint32_t sps_count,
         ds4_dspark_schedule_step_result *result);
 
+/* A single exact-shape timing is not mature enough for normal exploitation,
+ * but it can justify one bounded confirmation probe. observed_rate receives
+ * the measured physical rate when the inputs are valid. */
+int ds4_dspark_should_confirm_physical(
+        uint64_t profile_samples,
+        double draft_seconds,
+        double verify_seconds,
+        double expected_tokens,
+        double serial_rate,
+        double required_gain,
+        double *observed_rate);
+
 int ds4_dspark_schedule_flatten(
         const ds4_dspark_schedule_result *schedule,
         const ds4_dspark_schedule_item *items,

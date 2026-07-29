@@ -27845,7 +27845,8 @@ static void ds4_acquire_instance_lock(void) {
 
 #define DS4_DSPARK_CONTEXT_BUCKETS 8u
 #define DS4_DSPARK_COST_WINDOW 9u
-#define DS4_DSPARK_RN_COST_SLOTS 128u
+#define DS4_DSPARK_RN_COST_SLOTS 512u
+#define DS4_DSPARK_RN_CONFIRM_GAIN 1.10
 
 typedef struct {
     double value[DS4_DSPARK_COST_WINDOW];
@@ -37581,6 +37582,22 @@ int ds4_sessions_eval_speculative_sample_rn(
             ? schedule_step.selected.expected_tokens / seconds
             : 0.0;
     }
+    double physical_single_sample_rate = 0.0;
+    const bool physical_confirmation_probe =
+        request_count > 1u &&
+        !physical_profile_ready &&
+        ds4_dspark_should_confirm_physical(
+                physical_profile_samples,
+                cohort_draft_seconds,
+                physical_profile_seconds,
+                schedule_step.selected.expected_tokens,
+                serial_rate,
+                DS4_DSPARK_RN_CONFIRM_GAIN,
+                &physical_single_sample_rate);
+    if (!physical_profile_ready &&
+        physical_single_sample_rate > 0.0) {
+        physical_rate = physical_single_sample_rate;
+    }
     const uint64_t coordinator_step = owner->dspark_rn_hw_scheduler.step;
     const uint64_t warmup_cycles = 8u;
     const uint64_t probe_interval = 64u;
@@ -37602,10 +37619,16 @@ int ds4_sessions_eval_speculative_sample_rn(
     bool use_physical =
         coordinator_step <= warmup_cycles ||
         periodic_probe ||
+        physical_confirmation_probe ||
         physical_rate >= serial_rate * 1.01;
     const char *decision_reason =
         coordinator_step <= warmup_cycles ? "warmup" :
         periodic_probe ? "probe" : "predicted";
+    if (physical_confirmation_probe &&
+        coordinator_step > warmup_cycles &&
+        !periodic_probe) {
+        decision_reason = "confirm-probe";
+    }
     if (force_physical) {
         use_physical = true;
         decision_reason = request_count == 1u
@@ -37617,6 +37640,7 @@ int ds4_sessions_eval_speculative_sample_rn(
     } else if (use_physical &&
                request_count > 1u &&
                !periodic_probe &&
+               !physical_confirmation_probe &&
                coordinator_step > warmup_cycles &&
                !physical_shape_mature &&
                scheduled_rows < min_physical_rows) {

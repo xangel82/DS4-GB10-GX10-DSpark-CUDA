@@ -294,6 +294,33 @@ static void test_history_reset_preserves_runtime_step(void) {
                  "third post-gap step must recover exact t-2 history");
 }
 
+static void test_physical_confirmation_probe(void) {
+    double observed = -1.0;
+    require_true(!ds4_dspark_should_confirm_physical(
+                     0, 0.02, 0.18, 4.0, 17.0, 1.10, &observed),
+                 "an unmeasured shape must not request confirmation");
+    require_close(observed, 0.0,
+                  "an unmeasured shape must not expose a rate");
+
+    require_true(ds4_dspark_should_confirm_physical(
+                     1, 0.02, 0.18, 4.0, 17.0, 1.10, &observed),
+                 "a strong first sample must request confirmation");
+    require_close(observed, 20.0,
+                  "confirmation must report the observed physical rate");
+
+    require_true(!ds4_dspark_should_confirm_physical(
+                     1, 0.02, 0.18, 4.0, 19.0, 1.10, &observed),
+                 "a marginal first sample must retain the serial gate");
+    require_close(observed, 20.0,
+                  "a marginal valid sample still reports its rate");
+
+    require_true(!ds4_dspark_should_confirm_physical(
+                     2, 0.02, 0.18, 4.0, 17.0, 1.10, &observed),
+                 "a mature profile must use normal exploitation");
+    require_close(observed, 0.0,
+                  "a mature profile is not a confirmation sample");
+}
+
 static void test_stateful_cohort_reordering(void) {
     ds4_dspark_scheduler_state state;
     ds4_dspark_scheduler_state_reset(&state);
@@ -611,6 +638,7 @@ int main(void) {
     test_async_current_confidence_cannot_expand_capacity();
     test_stateful_two_step_barrier();
     test_history_reset_preserves_runtime_step();
+    test_physical_confirmation_probe();
     test_stateful_cohort_reordering();
     test_stateful_ties_follow_request_identity();
     test_stateful_join_and_forget();

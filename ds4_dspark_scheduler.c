@@ -290,6 +290,31 @@ void ds4_dspark_scheduler_state_reset_history(
     state->step = step;
 }
 
+int ds4_dspark_should_confirm_physical(
+        uint64_t profile_samples,
+        double draft_seconds,
+        double verify_seconds,
+        double expected_tokens,
+        double serial_rate,
+        double required_gain,
+        double *observed_rate) {
+    if (observed_rate) *observed_rate = 0.0;
+    if (profile_samples != 1u ||
+        !(draft_seconds >= 0.0) || !isfinite(draft_seconds) ||
+        !(verify_seconds > 0.0) || !isfinite(verify_seconds) ||
+        !(expected_tokens > 0.0) || !isfinite(expected_tokens) ||
+        !(serial_rate > 0.0) || !isfinite(serial_rate) ||
+        !(required_gain >= 1.0) || !isfinite(required_gain)) {
+        return 0;
+    }
+    const double seconds = draft_seconds + verify_seconds;
+    if (!(seconds > 0.0) || !isfinite(seconds)) return 0;
+    const double rate = expected_tokens / seconds;
+    if (!(rate > 0.0) || !isfinite(rate)) return 0;
+    if (observed_rate) *observed_rate = rate;
+    return rate >= serial_rate * required_gain;
+}
+
 static ds4_dspark_scheduler_entry *ds4_dspark_scheduler_find(
         ds4_dspark_scheduler_state *state,
         uint64_t request_id) {

@@ -10945,6 +10945,16 @@ static int server_eval_speculative(
     if (leader) {
         ds4_speculative_request cohort[DS4_SERVER_DSPARK_MAX_LANES];
         root->cycle_running = true;
+        if (getenv("DS4_DSPARK_LOG") != NULL) {
+            uint32_t active = 0u;
+            for (uint32_t i = 0; i < root->lane_count; i++) {
+                if (root->lanes[i]->decode_active) active++;
+            }
+            server_log(DS4_LOG_GENERATION,
+                       "ds4-server: dspark coordinator cohort lanes=%u "
+                       "selected=%u active=%u wait_us=%ld",
+                       root->lane_count, selected_count, active, wait_us);
+        }
         for (uint32_t i = 0; i < selected_count; i++) {
             const uint32_t slot = selected[i];
             root->cycle[slot].pending = false;

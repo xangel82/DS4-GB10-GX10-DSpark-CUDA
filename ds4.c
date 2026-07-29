@@ -24112,6 +24112,13 @@ typedef struct {
     uint32_t owned_count;
 } metal_graph_physical_attention_plan;
 
+typedef struct {
+    uint32_t physical_attention_layers;
+    uint32_t request_local_attention_layers;
+    uint32_t indexed_attention_layers;
+    uint32_t dense_attention_layers;
+} metal_physical_verify_stats;
+
 static void metal_graph_physical_attention_plan_free(
         metal_graph_physical_attention_plan *plan) {
     if (!plan) return;
@@ -24598,7 +24605,8 @@ static bool metal_graph_verify_suffix_rn(
         const ds4_weights *weights,
         metal_physical_verify_request *requests,
         uint32_t request_count,
-        ds4_gpu_tensor **output_logits) {
+        ds4_gpu_tensor **output_logits,
+        metal_physical_verify_stats *stats) {
 #if defined(__APPLE__) || defined(DS4_ROCM_BUILD) || defined(DS4_NO_GPU)
     (void)scratch;
     (void)model;
@@ -24611,6 +24619,7 @@ static bool metal_graph_verify_suffix_rn(
     const char *failure_stage = "validate";
     int32_t failure_layer = -1;
     if (output_logits) *output_logits = NULL;
+    if (stats) memset(stats, 0, sizeof(*stats));
     if (!scratch || !model || !weights || !requests ||
         request_count == 0u) {
         return false;
@@ -24743,6 +24752,14 @@ static bool metal_graph_verify_suffix_rn(
             attention_plan.enabled &&
             attention_plan.layer_enabled[il];
         if (physical_indexed) {
+            if (stats) {
+                stats->physical_attention_layers++;
+                if (attention_plan.layer_indexed[il]) {
+                    stats->indexed_attention_layers++;
+                } else {
+                    stats->dense_attention_layers++;
+                }
+            }
             failure_stage = "attention-prepare-physical";
             metal_graph_attention_row_view
                 views[DS4_PHYSICAL_ATTN_MAX_REQUESTS];
@@ -24804,6 +24821,7 @@ static bool metal_graph_verify_suffix_rn(
                 metal_graph_attention_row_view_free(&views[r]);
             }
         } else {
+            if (stats) stats->request_local_attention_layers++;
             failure_stage = "attention-request-local";
             for (uint32_t r = 0; ok && r < request_count; r++) {
                 metal_physical_verify_request *request = &requests[r];
@@ -32370,6 +32388,7 @@ struct ds4_physical_verify_txn {
     uint32_t saved_raw[DS4_DSPARK_SCHEDULER_MAX_REQUESTS];
     uint32_t saved_capture[DS4_DSPARK_SCHEDULER_MAX_REQUESTS];
     ds4_gpu_tensor *output_logits;
+    metal_physical_verify_stats stats;
 #else
     int unsupported;
 #endif
@@ -32685,7 +32704,8 @@ int ds4_sessions_verify_suffix_rn_begin(
                 &owner->engine->weights,
                 txn->physical,
                 request_count,
-                &txn->output_logits)) {
+                &txn->output_logits,
+                &txn->stats)) {
         if (err && errlen) {
             snprintf(err, errlen,
                      "physical CUDA R=n verifier failed");
@@ -36681,10 +36701,17 @@ static void dspark_rn_finalize_lane(
         bool hybrid_shadow,
         double draft_seconds,
         double verify_seconds,
+        double verify_begin_seconds,
+        double verify_reject_seconds,
+        double verify_finish_seconds,
         double cycle_seconds,
         bool physical,
         uint32_t hw_r,
-        uint32_t hw_batch) {
+        uint32_t hw_batch,
+        uint32_t attn_physical_layers,
+        uint32_t attn_local_layers,
+        uint32_t attn_indexed_layers,
+        uint32_t attn_dense_layers) {
     ds4_session *session = request->session;
     const uint32_t committed = rejection->committed_drafts;
     const uint32_t emitted = 1u + committed;
@@ -36750,11 +36777,15 @@ static void dspark_rn_finalize_lane(
         fprintf(stderr,
                 "ds4: dspark timing drafted=%u target_rows=%u "
                 "committed=%u emitted=%u draft=%.3f ms "
-                "verify=%.3f ms total=%.3f ms fused=1 noreplay=1 "
+                "verify=%.3f ms verify_begin=%.3f ms "
+                "verify_reject=%.3f ms verify_finish=%.3f ms "
+                "total=%.3f ms fused=1 noreplay=1 "
                 "rejection=1 residual=%d hybrid=%d neural=%u "
                 "retrieval=%u retrieval_committed=%u "
                 "suffix=%u transition=%u width=%u match=%u "
                 "occurrences=%u blockv=%d hw_r=%u hw_batch=%u "
+                "attn_phys=%u attn_local=%u attn_indexed=%u "
+                "attn_dense=%u "
                 "coordinator=%s\n",
                 drafted,
                 verify->rows,
@@ -36762,6 +36793,9 @@ static void dspark_rn_finalize_lane(
                 emitted,
                 draft_seconds * 1000.0,
                 verify_seconds * 1000.0,
+                verify_begin_seconds * 1000.0,
+                verify_reject_seconds * 1000.0,
+                verify_finish_seconds * 1000.0,
                 cycle_seconds * 1000.0,
                 committed < drafted ? 1 : 0,
                 retrieval_n != 0u ? 1 : 0,
@@ -36776,6 +36810,10 @@ static void dspark_rn_finalize_lane(
                 hybrid_lc ? 1 : 0,
                 hw_r,
                 hw_batch,
+                attn_physical_layers,
+                attn_local_layers,
+                attn_indexed_layers,
+                attn_dense_layers,
                 physical ? "physical" : "serial");
     }
 }
@@ -36916,6 +36954,10 @@ int ds4_sessions_eval_speculative_sample_rn(
     uint32_t neural_drafted[request_count];
     uint32_t total_drafted[request_count];
     double lane_verify_seconds[request_count];
+    double lane_verify_begin_seconds[request_count];
+    double lane_verify_reject_seconds[request_count];
+    double lane_verify_finish_seconds[request_count];
+    metal_physical_verify_stats lane_verify_stats[request_count];
     uint64_t hybrid_rng_before[request_count];
     uint64_t hybrid_shadow_rng_before[request_count];
     bool hybrid_lc[request_count];
@@ -36935,6 +36977,13 @@ int ds4_sessions_eval_speculative_sample_rn(
     memset(neural_drafted, 0, sizeof(neural_drafted));
     memset(total_drafted, 0, sizeof(total_drafted));
     memset(lane_verify_seconds, 0, sizeof(lane_verify_seconds));
+    memset(lane_verify_begin_seconds, 0,
+           sizeof(lane_verify_begin_seconds));
+    memset(lane_verify_reject_seconds, 0,
+           sizeof(lane_verify_reject_seconds));
+    memset(lane_verify_finish_seconds, 0,
+           sizeof(lane_verify_finish_seconds));
+    memset(lane_verify_stats, 0, sizeof(lane_verify_stats));
     memset(hybrid_rng_before, 0, sizeof(hybrid_rng_before));
     memset(hybrid_shadow_rng_before, 0, sizeof(hybrid_shadow_rng_before));
     memset(hybrid_lc, 0, sizeof(hybrid_lc));
@@ -37110,6 +37159,17 @@ int ds4_sessions_eval_speculative_sample_rn(
     const uint64_t probe_interval = 64u;
     const bool periodic_probe =
         coordinator_step % probe_interval == 0u;
+    uint32_t min_physical_rows = 10u;
+    const char *min_rows_env =
+        getenv("DS4_DSPARK_RN_MIN_PHYSICAL_ROWS");
+    if (min_rows_env && min_rows_env[0]) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(min_rows_env, &end, 10);
+        if (end != min_rows_env && *end == '\0' &&
+            parsed <= DS4_DSPARK_SCHEDULER_MAX_ROWS) {
+            min_physical_rows = (uint32_t)parsed;
+        }
+    }
     bool use_physical =
         coordinator_step <= warmup_cycles ||
         periodic_probe ||
@@ -37125,6 +37185,13 @@ int ds4_sessions_eval_speculative_sample_rn(
     } else if (force_serial) {
         use_physical = false;
         decision_reason = "forced-serial";
+    } else if (use_physical &&
+               request_count > 1u &&
+               !periodic_probe &&
+               coordinator_step > warmup_cycles &&
+               scheduled_rows < min_physical_rows) {
+        use_physical = false;
+        decision_reason = "small-batch-serial";
     }
     if (!use_physical) {
         for (uint32_t r = 0; r < request_count; r++) {
@@ -37323,6 +37390,11 @@ int ds4_sessions_eval_speculative_sample_rn(
 
     ds4_physical_verify_txn *txn = NULL;
     const double verify_t0 = now_sec();
+    double verify_begin_seconds = 0.0;
+    double verify_reject_seconds = 0.0;
+    double verify_finish_seconds = 0.0;
+    metal_physical_verify_stats verify_stats;
+    memset(&verify_stats, 0, sizeof(verify_stats));
     if (decode_trace) {
         ds4_gpu_nvtx_range_push(
                 "ds4/decode/dspark/rn/verify",
@@ -37330,34 +37402,48 @@ int ds4_sessions_eval_speculative_sample_rn(
                         active_count, physical_rows));
     }
     if (use_physical && rc == 0 && active_count != 0u) {
+        const double stage_t0 = now_sec();
         rc = ds4_sessions_verify_suffix_rn_begin(
                 verify, active_count, &txn, err, errlen);
+        verify_begin_seconds = now_sec() - stage_t0;
+        if (rc == 0 && txn) verify_stats = txn->stats;
     }
     if (use_physical && rc == 0 && active_count != 0u) {
+        const double stage_t0 = now_sec();
         rc = ds4_sessions_verify_suffix_rn_reject(
                 txn, rejection, err, errlen);
+        verify_reject_seconds = now_sec() - stage_t0;
     }
     if (use_physical && rc == 0 && active_count != 0u) {
         for (uint32_t a = 0; a < active_count; a++) {
             keep_rows[a] = 1u + rejection[a].committed_drafts;
         }
+        const double stage_t0 = now_sec();
         rc = ds4_sessions_verify_suffix_rn_finish(
                 txn, keep_rows, err, errlen);
+        verify_finish_seconds = now_sec() - stage_t0;
         txn = NULL;
     }
     if (!use_physical && rc == 0) {
         for (uint32_t a = 0; rc == 0 && a < active_count; a++) {
             const double lane_t0 = now_sec();
+            double stage_t0 = now_sec();
             rc = ds4_sessions_verify_suffix_rn_begin(
                     &verify[a], 1u, &txn, err, errlen);
+            lane_verify_begin_seconds[a] = now_sec() - stage_t0;
+            if (rc == 0 && txn) lane_verify_stats[a] = txn->stats;
             if (rc == 0) {
+                stage_t0 = now_sec();
                 rc = ds4_sessions_verify_suffix_rn_reject(
                         txn, &rejection[a], err, errlen);
+                lane_verify_reject_seconds[a] = now_sec() - stage_t0;
             }
             if (rc == 0) {
                 keep_rows[a] = 1u + rejection[a].committed_drafts;
+                stage_t0 = now_sec();
                 rc = ds4_sessions_verify_suffix_rn_finish(
                         txn, &keep_rows[a], err, errlen);
+                lane_verify_finish_seconds[a] = now_sec() - stage_t0;
                 txn = NULL;
             }
             if (txn) {
@@ -37381,10 +37467,18 @@ int ds4_sessions_eval_speculative_sample_rn(
                         hybrid_shadow[r],
                         lane_draft_seconds,
                         lane_verify_seconds[a],
+                        lane_verify_begin_seconds[a],
+                        lane_verify_reject_seconds[a],
+                        lane_verify_finish_seconds[a],
                         lane_draft_seconds + lane_verify_seconds[a],
                         false,
                         1u,
-                        verify[a].rows);
+                        verify[a].rows,
+                        lane_verify_stats[a].physical_attention_layers,
+                        lane_verify_stats[a]
+                            .request_local_attention_layers,
+                        lane_verify_stats[a].indexed_attention_layers,
+                        lane_verify_stats[a].dense_attention_layers);
                 lane_finalized[a] = true;
             }
         }
@@ -37444,11 +37538,33 @@ int ds4_sessions_eval_speculative_sample_rn(
                 use_physical
                     ? verify_seconds : lane_verify_seconds[a],
                 use_physical
+                    ? verify_begin_seconds
+                    : lane_verify_begin_seconds[a],
+                use_physical
+                    ? verify_reject_seconds
+                    : lane_verify_reject_seconds[a],
+                use_physical
+                    ? verify_finish_seconds
+                    : lane_verify_finish_seconds[a],
+                use_physical
                     ? cycle_seconds
                     : lane_draft_seconds + lane_verify_seconds[a],
                 use_physical,
                 use_physical ? active_count : 1u,
-                use_physical ? physical_rows : verify[a].rows);
+                use_physical ? physical_rows : verify[a].rows,
+                use_physical
+                    ? verify_stats.physical_attention_layers
+                    : lane_verify_stats[a].physical_attention_layers,
+                use_physical
+                    ? verify_stats.request_local_attention_layers
+                    : lane_verify_stats[a]
+                        .request_local_attention_layers,
+                use_physical
+                    ? verify_stats.indexed_attention_layers
+                    : lane_verify_stats[a].indexed_attention_layers,
+                use_physical
+                    ? verify_stats.dense_attention_layers
+                    : lane_verify_stats[a].dense_attention_layers);
         lane_finalized[a] = true;
     }
 

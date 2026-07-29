@@ -559,11 +559,44 @@ ring, MXFP4 score + exact Top-K, compressor frontier, attention indicizzata,
 Q8 weight-reuse e MoE aligned; non sono stati aggiunti buffer permanenti oltre
 allo stato privato delle lane configurate.
 
+Un test operativo lungo con agenti reali ha chiarito perche' lo scaling non e'
+lineare. R=2 era realmente attivo, ma e' un batching fisico parziale: QKV,
+FFN, output e vocab vengono appiattiti, mentre KV, compressor, frontier,
+rejection e commit restano request-local per preservare la distribuzione
+target. Nel run osservato R=1 ha misurato circa `19,23 t/s`; R=2 e' sceso a
+`11,40 t/s` per lane ma `22,80 t/s` aggregati, cioe' circa +18,6% invece di
+2x. I batch HybridLC larghi possono superare i 40 t/s aggregati, ma sono rari
+nei testi liberi.
+
+Da questa modifica la telemetria distingue `verify_begin`, `verify_reject`
+e `verify_finish` nelle righe `dspark timing`. Registra inoltre
+`attn_phys`, `attn_local`, `attn_indexed` e `attn_dense`, cosi' si vede quanti
+layer di attention passano davvero dal path fisico e quanti ricadono sul
+percorso request-local. `analyze-dspark-log.sh` usa ora `hw_r` e `hw_batch`
+dalle righe timing, non solo dalle righe scheduler, e stampa rate lane e rate
+aggregato della coorte. Il server, con `DS4_TELEMETRY=1`, registra anche la
+dimensione del rendezvous (`cohort selected`, lane attive e wait_us).
+
+Per evitare che microbatch troppo piccoli peggiorino la latenza, il
+coordinatore applica una soglia minima di righe fisiche prima di preferire
+R=n fuori da warmup/probe:
+
+```bash
+DS4_DSPARK_RN_MIN_PHYSICAL_ROWS=10
+```
+
+Il valore `10` e' il default conservativo scelto dai log: i batch fisici sotto
+10 righe erano spesso equivalenti o peggiori del seriale; sopra 12-14 righe il
+rate aggregato iniziava a essere visibilmente utile. `0` disabilita il gate per
+profilazione, mentre `DS4_DSPARK_COORDINATOR_MODE=physical` forza comunque il
+path fisico.
+
 Il default e':
 
 ```bash
 DS4_SERVER_DSPARK_LANES=2
 DS4_SERVER_DSPARK_COALESCE_US=500
+DS4_DSPARK_RN_MIN_PHYSICAL_ROWS=10
 ```
 
 `DS4_SERVER_DSPARK_LANES=1` ripristina il worker seriale consolidato. La seconda

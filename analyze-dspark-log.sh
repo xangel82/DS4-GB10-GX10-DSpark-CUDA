@@ -113,6 +113,9 @@ function text_value(prefix,    i,a) {
   if (vr < 0) vr = value("verify-replay")
   if (vr < 0) vr = value("verify-commit")
   total = value("total")
+  verify_begin = value("verify_begin")
+  verify_reject = value("verify_reject")
+  verify_finish = value("verify_finish")
   rejection = value("rejection")
   residual = value("residual")
   hybrid = value("hybrid")
@@ -138,6 +141,12 @@ function text_value(prefix,    i,a) {
   oracle_rebuilds = value("oracle_rebuilds")
   self_checks = value("self_checks")
   self_check_failures = value("self_check_failures")
+  hwr = value("hw_r")
+  hwb = value("hw_batch")
+  attn_phys = value("attn_phys")
+  attn_local = value("attn_local")
+  attn_indexed = value("attn_indexed")
+  attn_dense = value("attn_dense")
   if (rejection == 1) rejection_cycles++
   if (residual == 1) residual_cycles++
   if (hybrid == 1) hybrid_cycles++
@@ -199,7 +208,41 @@ function text_value(prefix,    i,a) {
     verifier_rows += r
     verifier_draft_ms += dr
     verifier_verify_ms += vr
+    if (verify_begin >= 0) {
+      verifier_begin_ms += verify_begin
+      verifier_begin_n++
+    }
+    if (verify_reject >= 0) {
+      verifier_reject_ms += verify_reject
+      verifier_reject_n++
+    }
+    if (verify_finish >= 0) {
+      verifier_finish_ms += verify_finish
+      verifier_finish_n++
+    }
     verifier_total_ms += total
+    if (hwr > 0 && hwb >= hwr) {
+      timing_hardware_cycles++
+      timing_hardware_r_sum += hwr
+      timing_hardware_batch_sum += hwb
+      timing_hardware_emitted += e
+      if (total > 0) {
+        timing_hardware_lane_ms += total
+        timing_hardware_cohort_ms += total / hwr
+      }
+      timing_hardware_by_r_n[hwr]++
+      timing_hardware_by_r_emitted[hwr] += e
+      timing_hardware_by_r_total_ms[hwr] += total
+      timing_hardware_by_r_cohort_ms[hwr] += total / hwr
+      timing_hardware_by_r_batch[hwr] += hwb
+    }
+    if (attn_phys >= 0 || attn_local >= 0) {
+      verifier_attn_n++
+      if (attn_phys >= 0) verifier_attn_phys += attn_phys
+      if (attn_local >= 0) verifier_attn_local += attn_local
+      if (attn_indexed >= 0) verifier_attn_indexed += attn_indexed
+      if (attn_dense >= 0) verifier_attn_dense += attn_dense
+    }
     if (k >= 1 && k <= 5) {
       kn[k]++
       kd[k] += d
@@ -350,7 +393,30 @@ END {
              shadow_rate_sum / shadow_rate_n
     }
   }
-  if (hardware_cycles > 0) {
+  if (timing_hardware_cycles > 0) {
+    printf "Hardware scheduler mean R/batch: %.3f / %.3f (from timing)\n",
+           timing_hardware_r_sum / timing_hardware_cycles,
+           timing_hardware_batch_sum / timing_hardware_cycles
+    if (timing_hardware_lane_ms > 0) {
+      printf "Hardware timing lane/aggregate: %.3f / %.3f t/s\n",
+             1000.0 * timing_hardware_emitted / timing_hardware_lane_ms,
+             1000.0 * timing_hardware_emitted / timing_hardware_cohort_ms
+    }
+    for (rr = 1; rr <= 8; rr++) if (timing_hardware_by_r_n[rr] > 0) {
+      lane_rate = 0.0
+      aggregate_rate = 0.0
+      avg_batch = timing_hardware_by_r_batch[rr] / timing_hardware_by_r_n[rr]
+      if (timing_hardware_by_r_total_ms[rr] > 0) {
+        lane_rate = 1000.0 * timing_hardware_by_r_emitted[rr] / timing_hardware_by_r_total_ms[rr]
+      }
+      if (timing_hardware_by_r_cohort_ms[rr] > 0) {
+        aggregate_rate = 1000.0 * timing_hardware_by_r_emitted[rr] / timing_hardware_by_r_cohort_ms[rr]
+      }
+      printf "  R=%d n=%d lane=%.3ft/s aggregate=%.3ft/s batch=%.3f\n",
+             rr, timing_hardware_by_r_n[rr], lane_rate,
+             aggregate_rate, avg_batch
+    }
+  } else if (hardware_cycles > 0) {
     printf "Hardware scheduler mean R/batch: %.3f / %.3f\n",
            hardware_r_sum / hardware_cycles,
            hardware_batch_sum / hardware_cycles
@@ -379,6 +445,21 @@ END {
     printf "Mean verifier target rows: %.3f\n", verifier_rows / verifier_cycles
     printf "Mean verifier draft time:  %.3f ms\n", verifier_draft_ms / verifier_cycles
     printf "Mean verifier target time: %.3f ms\n", verifier_verify_ms / verifier_cycles
+    if (verifier_begin_n > 0 || verifier_reject_n > 0 ||
+        verifier_finish_n > 0) {
+      mean_begin = verifier_begin_n > 0 ? verifier_begin_ms / verifier_begin_n : 0.0
+      mean_reject = verifier_reject_n > 0 ? verifier_reject_ms / verifier_reject_n : 0.0
+      mean_finish = verifier_finish_n > 0 ? verifier_finish_ms / verifier_finish_n : 0.0
+      printf "Mean verifier begin/reject/finish: %.3f / %.3f / %.3f ms\n",
+             mean_begin, mean_reject, mean_finish
+    }
+    if (verifier_attn_n > 0) {
+      printf "Physical attention layers/cycle: %.2f physical, %.2f local (indexed=%.2f dense=%.2f)\n",
+             verifier_attn_phys / verifier_attn_n,
+             verifier_attn_local / verifier_attn_n,
+             verifier_attn_indexed / verifier_attn_n,
+             verifier_attn_dense / verifier_attn_n
+    }
     printf "Mean fused cycle:          %.3f ms\n", verifier_total_ms / verifier_cycles
     if (verifier_total_ms > 0) printf "Verifier-cycle throughput: %.3f t/s\n", 1000.0 * verifier_emitted / verifier_total_ms
     for (k = 1; k <= 5; k++) if (kn[k] > 0) {

@@ -7992,6 +7992,11 @@ typedef struct {
 #define DS4_SERVER_GPU_FRONTIER_SLOTS 4u
 #define DS4_SERVER_DSPARK_DEFAULT_LANES 2u
 #define DS4_SERVER_DSPARK_MAX_LANES 3u
+#define DS4_SERVER_ROUTE_PREFILL_TPS 900.0
+#define DS4_SERVER_ROUTE_SERVICE_INITIAL_SEC 12.0
+#define DS4_SERVER_ROUTE_SERVICE_EWMA_ALPHA 0.20
+#define DS4_SERVER_ROUTE_PREFILL_REFERENCE_TOKENS 8192.0
+#define DS4_SERVER_ROUTE_ACTIVE_RESIDUAL_FLOOR 0.50
 
 typedef struct {
     uint64_t snapshot_id;
@@ -8010,6 +8015,12 @@ struct server {
     uint32_t lane_count;
     uint32_t lane_id;
     uint32_t assigned_jobs;
+    bool worker_active;
+    double worker_started_sec;
+    double route_service_ewma_sec;
+    uint64_t route_service_samples;
+    double route_prefill_tps_ewma;
+    uint64_t route_prefill_samples;
     ds4_tokens affinity;
     ds4_engine *engine;
     ds4_session *session;
@@ -8038,6 +8049,15 @@ struct server {
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
     pthread_mutex_t gpu_mu;
+    pthread_cond_t gpu_cv;
+    bool gpu_busy;
+    bool gpu_owner_decode;
+    bool gpu_prefill_handoff;
+    uint32_t gpu_decode_waiters;
+    uint32_t gpu_prefill_waiters;
+    uint32_t gpu_resume_waiters;
+    uint64_t gpu_prefill_yields;
+    double gpu_prefill_yield_sec;
     pthread_mutex_t cycle_mu;
     pthread_cond_t cycle_cv;
     bool cycle_running;
@@ -8112,12 +8132,90 @@ static pthread_mutex_t *server_trace_mutex(server *s) {
     return root ? &root->trace_mu : NULL;
 }
 
+static bool server_gpu_request_is_decode(const server *s) {
+    return s &&
+        __atomic_load_n(&s->decode_active, __ATOMIC_ACQUIRE);
+}
+
 static void server_gpu_enter(server *s) {
-    pthread_mutex_lock(&server_root(s)->gpu_mu);
+    server *root = server_root(s);
+    const bool decode = server_gpu_request_is_decode(s);
+    pthread_mutex_lock(&root->gpu_mu);
+    if (decode) root->gpu_decode_waiters++;
+    else root->gpu_prefill_waiters++;
+    while (root->gpu_busy ||
+           (decode &&
+            root->gpu_prefill_handoff &&
+            (root->gpu_prefill_waiters > 0u ||
+             root->gpu_resume_waiters > 0u)) ||
+           (!decode &&
+            (root->gpu_resume_waiters > 0u ||
+             (root->gpu_decode_waiters > 0u &&
+              !root->gpu_prefill_handoff)))) {
+        pthread_cond_wait(&root->gpu_cv, &root->gpu_mu);
+    }
+    if (decode) root->gpu_decode_waiters--;
+    else root->gpu_prefill_waiters--;
+    root->gpu_busy = true;
+    root->gpu_owner_decode = decode;
+    if (!decode) root->gpu_prefill_handoff = false;
+    pthread_mutex_unlock(&root->gpu_mu);
 }
 
 static void server_gpu_leave(server *s) {
-    pthread_mutex_unlock(&server_root(s)->gpu_mu);
+    server *root = server_root(s);
+    pthread_mutex_lock(&root->gpu_mu);
+    const bool decode = root->gpu_owner_decode;
+    root->gpu_busy = false;
+    root->gpu_owner_decode = false;
+    if (decode && root->gpu_resume_waiters > 0u) {
+        root->gpu_prefill_handoff = true;
+    }
+    pthread_cond_broadcast(&root->gpu_cv);
+    pthread_mutex_unlock(&root->gpu_mu);
+}
+
+/* Long prefills already expose exact KV checkpoints at configured chunk
+ * boundaries. Hand the device to exactly one waiting verifier cycle, then
+ * resume this prefill before admitting another ordinary prefill. The fast
+ * 8192-token MoE chunk and all model math remain unchanged. */
+static double server_gpu_yield_prefill_to_decode(server *s,
+                                                  uint32_t *waiters_seen) {
+    server *root = server_root(s);
+    if (waiters_seen) *waiters_seen = 0u;
+    if (!root || root->lane_count <= 1u ||
+        server_gpu_request_is_decode(s)) {
+        return 0.0;
+    }
+
+    pthread_mutex_lock(&root->gpu_mu);
+    const uint32_t waiters = root->gpu_decode_waiters;
+    if (waiters == 0u || !root->gpu_busy ||
+        root->gpu_owner_decode) {
+        pthread_mutex_unlock(&root->gpu_mu);
+        return 0.0;
+    }
+    if (waiters_seen) *waiters_seen = waiters;
+
+    const double t0 = now_sec();
+    root->gpu_resume_waiters++;
+    root->gpu_busy = false;
+    root->gpu_owner_decode = false;
+    root->gpu_prefill_handoff = false;
+    pthread_cond_broadcast(&root->gpu_cv);
+    while (root->gpu_busy || !root->gpu_prefill_handoff) {
+        pthread_cond_wait(&root->gpu_cv, &root->gpu_mu);
+    }
+    root->gpu_resume_waiters--;
+    root->gpu_busy = true;
+    root->gpu_owner_decode = false;
+    root->gpu_prefill_handoff = false;
+    const double elapsed = now_sec() - t0;
+    root->gpu_prefill_yields++;
+    root->gpu_prefill_yield_sec += elapsed;
+    pthread_cond_broadcast(&root->gpu_cv);
+    pthread_mutex_unlock(&root->gpu_mu);
+    return elapsed;
 }
 
 static int token_prefix_len(const ds4_tokens *a, const ds4_tokens *b) {
@@ -10051,6 +10149,10 @@ typedef struct {
     bool stream_failed;
     double last_keepalive;
     bool kv_canonical_only;
+    uint64_t mixed_yields;
+    uint64_t mixed_yields_reported;
+    double mixed_yield_sec;
+    double mixed_yield_sec_reported;
 } server_prefill_progress;
 
 typedef enum {
@@ -10353,6 +10455,45 @@ static void log_tool_calls_summary(const char *ctx, const tool_calls *calls,
     buf_free(&names);
 }
 
+/* Caller holds root->mu. Keep the measured replay rate anchored to the
+ * conservative startup estimate until enough full-size chunks have been
+ * observed. In particular, a tiny first fringe must not replace the entire
+ * estimate with launch-dominated throughput. */
+static void route_note_prefill_sample_locked(server *root,
+                                             int interval_tokens,
+                                             double chunk_tps) {
+    if (!root || interval_tokens <= 0 || chunk_tps <= 0.0 ||
+        !isfinite(chunk_tps)) {
+        return;
+    }
+    double sample_weight =
+        (double)interval_tokens /
+        DS4_SERVER_ROUTE_PREFILL_REFERENCE_TOKENS;
+    if (sample_weight > 1.0) sample_weight = 1.0;
+    if (sample_weight <= 0.0) return;
+    const double alpha =
+        DS4_SERVER_ROUTE_SERVICE_EWMA_ALPHA * sample_weight;
+    const double prior =
+        root->route_prefill_samples > 0u &&
+        root->route_prefill_tps_ewma > 0.0
+            ? root->route_prefill_tps_ewma
+            : DS4_SERVER_ROUTE_PREFILL_TPS;
+    root->route_prefill_tps_ewma =
+        (1.0 - alpha) * prior + alpha * chunk_tps;
+    root->route_prefill_samples++;
+}
+
+static bool prefill_handoff_is_productive(
+        const server_prefill_progress *progress,
+        int current,
+        int total,
+        int interval_tokens) {
+    return progress &&
+        interval_tokens > 0 &&
+        current > progress->cached_tokens &&
+        current < total;
+}
+
 static void server_progress_cb(void *ud, const char *event, int current, int total) {
     server_prefill_progress *p = ud;
     if (!p || !event) return;
@@ -10408,6 +10549,14 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
     if (interval_tokens < 0) interval_tokens = 0;
     double interval_s = p->seen ? now - p->last_t : 0.0;
     double chunk_tps = interval_s > 0.0 ? (double)interval_tokens / interval_s : 0.0;
+    if (p->srv && interval_tokens > 0 && chunk_tps > 0.0 &&
+        isfinite(chunk_tps)) {
+        server *root = server_root(p->srv);
+        pthread_mutex_lock(&root->mu);
+        route_note_prefill_sample_locked(
+            root, interval_tokens, chunk_tps);
+        pthread_mutex_unlock(&root->mu);
+    }
     p->last_current = current;
     p->last_t = now;
     p->seen = true;
@@ -10430,6 +10579,36 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
                elapsed);
     if (p->srv && current > p->cached_tokens && !p->kv_canonical_only) {
         kv_cache_maybe_store_continued(p->srv);
+    }
+    if (p->srv &&
+        prefill_handoff_is_productive(
+            p, current, total, interval_tokens)) {
+        uint32_t waiters = 0u;
+        const double yielded =
+            server_gpu_yield_prefill_to_decode(p->srv, &waiters);
+        if (yielded > 0.0) {
+            p->mixed_yields++;
+            p->mixed_yield_sec += yielded;
+        }
+        if (p->mixed_yields > p->mixed_yields_reported) {
+            const uint64_t delta_yields =
+                p->mixed_yields - p->mixed_yields_reported;
+            const double delta_sec =
+                p->mixed_yield_sec - p->mixed_yield_sec_reported;
+            server_log(DS4_LOG_PREFILL,
+                       "ds4-server: cooperative chunk scheduler lane=%u "
+                       "chunk=%d/%d handoffs=%llu waited=%.3fms "
+                       "request_handoffs=%llu request_wait=%.3fs",
+                       p->srv->lane_id,
+                       current,
+                       total,
+                       (unsigned long long)delta_yields,
+                       delta_sec * 1000.0,
+                       (unsigned long long)p->mixed_yields,
+                       p->mixed_yield_sec);
+            p->mixed_yields_reported = p->mixed_yields;
+            p->mixed_yield_sec_reported = p->mixed_yield_sec;
+        }
     }
 }
 
@@ -10850,7 +11029,7 @@ static uint64_t server_set_decode_active(server *lane, bool active) {
         retired_request_id = lane->active_request_id;
         lane->active_request_id = 0u;
     }
-    lane->decode_active = active;
+    __atomic_store_n(&lane->decode_active, active, __ATOMIC_RELEASE);
     pthread_cond_broadcast(&root->cycle_cv);
     pthread_mutex_unlock(&root->cycle_mu);
     return retired_request_id;
@@ -12429,12 +12608,77 @@ static bool lane_has_live_binding_locked(const server *lane,
     return true;
 }
 
+typedef struct {
+    uint32_t lane_id;
+    int prefix_tokens;
+    int replay_tokens;
+    double wait_sec;
+    double replay_sec;
+    double total_sec;
+    bool protocol_binding;
+} lane_route_choice;
+
+static double route_service_ewma_locked(const server *root) {
+    return root->route_service_samples > 0u &&
+           root->route_service_ewma_sec > 0.0
+        ? root->route_service_ewma_sec
+        : DS4_SERVER_ROUTE_SERVICE_INITIAL_SEC;
+}
+
+static double route_prefill_tps_locked(const server *root) {
+    return root->route_prefill_samples > 0u &&
+           root->route_prefill_tps_ewma > 0.0
+        ? root->route_prefill_tps_ewma
+        : DS4_SERVER_ROUTE_PREFILL_TPS;
+}
+
+/* assigned_jobs includes the active request. Decay its modeled residual by
+ * elapsed service time, but keep a half-EWMA floor because output length is
+ * unknown and a long reasoning request must not suddenly look free. Queued
+ * requests retain one full interval each. */
+static double lane_route_wait_sec_locked(const server *root,
+                                         const server *lane) {
+    if (!lane || lane->assigned_jobs == 0u) return 0.0;
+    const double service = route_service_ewma_locked(root);
+    if (!lane->worker_active) {
+        return (double)lane->assigned_jobs * service;
+    }
+    double elapsed = lane->worker_started_sec > 0.0
+        ? now_sec() - lane->worker_started_sec
+        : 0.0;
+    if (elapsed < 0.0) elapsed = 0.0;
+    double residual = service - elapsed;
+    const double floor =
+        DS4_SERVER_ROUTE_ACTIVE_RESIDUAL_FLOOR * service;
+    if (residual < floor) residual = floor;
+    const uint32_t queued = lane->assigned_jobs - 1u;
+    return residual + (double)queued * service;
+}
+
+static lane_route_choice lane_route_cost_locked(const server *root,
+                                                const server *lane,
+                                                const request *req) {
+    lane_route_choice choice = {0};
+    choice.lane_id = lane ? lane->lane_id : 0u;
+    choice.prefix_tokens = lane
+        ? token_prefix_len(&lane->affinity, &req->prompt)
+        : 0;
+    choice.replay_tokens = req->prompt.len - choice.prefix_tokens;
+    if (choice.replay_tokens < 0) choice.replay_tokens = 0;
+    choice.wait_sec = lane_route_wait_sec_locked(root, lane);
+    choice.replay_sec =
+        (double)choice.replay_tokens / route_prefill_tps_locked(root);
+    choice.total_sec = choice.wait_sec + choice.replay_sec;
+    return choice;
+}
+
 /* Select a lane while root->mu is held. Protocol call ids are authoritative:
  * a tool-result-only continuation may contain almost no prompt prefix, but it
  * must return to the lane that owns the corresponding hidden/live frontier. */
-static uint32_t select_lane_locked(server *root, const request *req) {
-    uint32_t selected = 0u;
-    int best_prefix = -1;
+static lane_route_choice select_lane_cost_locked(server *root,
+                                                 const request *req) {
+    lane_route_choice best = {0};
+    bool have_best = false;
     uint32_t best_load = UINT32_MAX;
     const uint32_t lane_count =
         root->lane_count ? root->lane_count : 1u;
@@ -12445,32 +12689,42 @@ static uint32_t select_lane_locked(server *root, const request *req) {
         server *lane = root->lanes ? root->lanes[i] : root;
         if (!lane_has_live_binding_locked(lane, req)) continue;
         if (!found_binding || lane->assigned_jobs < best_load) {
-            selected = i;
+            best = lane_route_cost_locked(root, lane, req);
+            best.lane_id = i;
+            best.protocol_binding = true;
             best_load = lane->assigned_jobs;
             found_binding = true;
         }
     }
     pthread_mutex_unlock(server_tool_mutex(root));
-    if (found_binding) return selected;
+    if (found_binding) return best;
 
     for (uint32_t i = 0; i < lane_count; i++) {
         server *lane = root->lanes ? root->lanes[i] : root;
-        if (lane->assigned_jobs < best_load) {
+        lane_route_choice candidate =
+            lane_route_cost_locked(root, lane, req);
+        candidate.lane_id = i;
+        const bool lower_cost =
+            !have_best || candidate.total_sec < best.total_sec - 1e-9;
+        const bool equal_cost =
+            have_best && fabs(candidate.total_sec - best.total_sec) <= 1e-9;
+        if (lower_cost ||
+            (equal_cost && lane->assigned_jobs < best_load) ||
+            (equal_cost && lane->assigned_jobs == best_load &&
+             candidate.prefix_tokens > best.prefix_tokens)) {
+            best = candidate;
             best_load = lane->assigned_jobs;
+            have_best = true;
         }
     }
-    for (uint32_t i = 0; i < lane_count; i++) {
-        server *lane = root->lanes ? root->lanes[i] : root;
-        if (lane->assigned_jobs != best_load) continue;
-        const int prefix =
-            token_prefix_len(&lane->affinity, &req->prompt);
-        if (prefix > best_prefix) {
-            selected = i;
-            best_prefix = prefix;
-        }
-    }
-    return selected;
+    return best;
 }
+
+#ifdef DS4_SERVER_TEST
+static uint32_t select_lane_locked(server *root, const request *req) {
+    return select_lane_cost_locked(root, req).lane_id;
+}
+#endif
 
 static bool enqueue(server *s, job *j) {
     server *root = server_root(s);
@@ -12479,16 +12733,27 @@ static bool enqueue(server *s, job *j) {
         pthread_mutex_unlock(&root->mu);
         return false;
     }
-    const uint32_t selected = select_lane_locked(root, &j->req);
+    const lane_route_choice route =
+        select_lane_cost_locked(root, &j->req);
+    const uint32_t selected = route.lane_id;
     j->lane_id = selected;
     server *lane = root->lanes ? root->lanes[selected] : root;
     if (getenv("DS4_DSPARK_LOG") != NULL && root->lane_count > 1u) {
         fprintf(stderr,
-                "ds4-server: coordinator dispatch lane=%u load=%u "
-                "prefix=%d prompt=%d\n",
+                "ds4-server: coordinator dispatch lane=%u reason=%s load=%u "
+                "prefix=%d replay=%d wait=%.3fs replay_cost=%.3fs "
+                "total=%.3fs service_ewma=%.3fs prefill_ewma=%.2f "
+                "prompt=%d\n",
                 selected,
+                route.protocol_binding ? "binding" : "kv-cost",
                 lane->assigned_jobs,
-                token_prefix_len(&lane->affinity, &j->req.prompt),
+                route.prefix_tokens,
+                route.replay_tokens,
+                route.wait_sec,
+                route.replay_sec,
+                route.total_sec,
+                route_service_ewma_locked(root),
+                route_prefill_tps_locked(root),
                 j->req.prompt.len);
     }
     lane->assigned_jobs++;
@@ -12531,9 +12796,28 @@ static void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue(lane);
         if (!j) break;
+        const double job_t0 = now_sec();
+        pthread_mutex_lock(&root->mu);
+        lane->worker_active = true;
+        lane->worker_started_sec = job_t0;
+        pthread_mutex_unlock(&root->mu);
         generate_job(lane, j);
         server_lane_update_affinity(lane);
+        const double service_sec = now_sec() - job_t0;
         pthread_mutex_lock(&root->mu);
+        lane->worker_active = false;
+        lane->worker_started_sec = 0.0;
+        if (service_sec > 0.0 && isfinite(service_sec)) {
+            if (root->route_service_samples == 0u) {
+                root->route_service_ewma_sec = service_sec;
+            } else {
+                root->route_service_ewma_sec =
+                    (1.0 - DS4_SERVER_ROUTE_SERVICE_EWMA_ALPHA) *
+                        root->route_service_ewma_sec +
+                    DS4_SERVER_ROUTE_SERVICE_EWMA_ALPHA * service_sec;
+            }
+            root->route_service_samples++;
+        }
         if (lane->assigned_jobs > 0u) lane->assigned_jobs--;
         pthread_mutex_unlock(&root->mu);
         pthread_mutex_lock(&j->mu);
@@ -13033,6 +13317,7 @@ static void server_close_resources(server *s) {
     pthread_mutex_destroy(&s->trace_mu);
     pthread_cond_destroy(&s->cycle_cv);
     pthread_mutex_destroy(&s->cycle_mu);
+    pthread_cond_destroy(&s->gpu_cv);
     pthread_mutex_destroy(&s->gpu_mu);
     pthread_cond_destroy(&s->clients_cv);
     pthread_cond_destroy(&s->cv);
@@ -13345,6 +13630,7 @@ int main(int argc, char **argv) {
     pthread_mutex_init(&s.tool_mu, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
     pthread_mutex_init(&s.gpu_mu, NULL);
+    pthread_cond_init(&s.gpu_cv, NULL);
     pthread_mutex_init(&s.cycle_mu, NULL);
     pthread_cond_init(&s.cycle_cv, NULL);
     if (cfg.trace_path) {
@@ -13401,8 +13687,12 @@ int main(int argc, char **argv) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: DSpark cohort coordinator active "
                        "(lanes=%u, coalesce=%ldus, "
-                       "load-aware prefix dispatch, physical R=1..%u)",
+                       "KV-cost-aware dispatch, physical R=1..%u)",
                        s.lane_count, server_coalesce_us(), s.lane_count);
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: cooperative prefill/verifier scheduler active "
+                       "(8192-token MoE chunks, durable chunk boundaries, "
+                       "one decode cycle per handoff)");
         }
     }
 
@@ -17897,6 +18187,130 @@ static void test_decode_request_identity_lifecycle(void) {
     pthread_mutex_destroy(&root.cycle_mu);
 }
 
+typedef struct {
+    server *lane;
+    uint32_t *acquired_count;
+} gpu_handoff_test;
+
+static void *test_gpu_handoff_decode_main(void *ud) {
+    gpu_handoff_test *test = ud;
+    server_gpu_enter(test->lane);
+    __atomic_add_fetch(test->acquired_count, 1u, __ATOMIC_RELEASE);
+    server_gpu_leave(test->lane);
+    return NULL;
+}
+
+static void test_prefill_handoff_only_uses_interior_progress(void) {
+    server_prefill_progress progress = {
+        .cached_tokens = 5065,
+    };
+    TEST_ASSERT(!prefill_handoff_is_productive(
+                &progress, 5065, 8425, 0));
+    TEST_ASSERT(prefill_handoff_is_productive(
+                &progress, 8192, 8425, 3127));
+    TEST_ASSERT(!prefill_handoff_is_productive(
+                &progress, 8425, 8425, 233));
+}
+
+static void test_route_prefill_ewma_weights_first_short_sample(void) {
+    server root = {0};
+    const int short_tokens = 167;
+    const double short_tps = 154.44;
+    const double short_alpha =
+        DS4_SERVER_ROUTE_SERVICE_EWMA_ALPHA *
+        (double)short_tokens /
+        DS4_SERVER_ROUTE_PREFILL_REFERENCE_TOKENS;
+    const double expected_short =
+        (1.0 - short_alpha) * DS4_SERVER_ROUTE_PREFILL_TPS +
+        short_alpha * short_tps;
+
+    route_note_prefill_sample_locked(
+        &root, short_tokens, short_tps);
+    TEST_ASSERT(root.route_prefill_samples == 1u);
+    TEST_ASSERT(fabs(root.route_prefill_tps_ewma -
+                     expected_short) < 1e-9);
+    TEST_ASSERT(root.route_prefill_tps_ewma > 896.0);
+
+    const double expected_full =
+        (1.0 - DS4_SERVER_ROUTE_SERVICE_EWMA_ALPHA) *
+            expected_short +
+        DS4_SERVER_ROUTE_SERVICE_EWMA_ALPHA * 1000.0;
+    route_note_prefill_sample_locked(&root, 8192, 1000.0);
+    TEST_ASSERT(root.route_prefill_samples == 2u);
+    TEST_ASSERT(fabs(root.route_prefill_tps_ewma -
+                     expected_full) < 1e-9);
+}
+
+static void test_prefill_handoff_runs_exactly_one_waiting_decode(void) {
+    server root = {0};
+    server decode_a = {0};
+    server decode_b = {0};
+    root.root = &root;
+    root.lane_count = 3u;
+    decode_a.root = &root;
+    decode_a.lane_id = 1u;
+    decode_a.decode_active = true;
+    decode_b.root = &root;
+    decode_b.lane_id = 2u;
+    decode_b.decode_active = true;
+    pthread_mutex_init(&root.gpu_mu, NULL);
+    pthread_cond_init(&root.gpu_cv, NULL);
+
+    server_gpu_enter(&root);
+    uint32_t acquired_count = 0u;
+    gpu_handoff_test tests[2] = {
+        {
+            .lane = &decode_a,
+            .acquired_count = &acquired_count,
+        },
+        {
+            .lane = &decode_b,
+            .acquired_count = &acquired_count,
+        },
+    };
+    pthread_t threads[2];
+    TEST_ASSERT(pthread_create(
+                &threads[0], NULL,
+                test_gpu_handoff_decode_main, &tests[0]) == 0);
+    TEST_ASSERT(pthread_create(
+                &threads[1], NULL,
+                test_gpu_handoff_decode_main, &tests[1]) == 0);
+
+    bool waiting = false;
+    for (int retry = 0; retry < 1000 && !waiting; retry++) {
+        pthread_mutex_lock(&root.gpu_mu);
+        waiting = root.gpu_decode_waiters == 2u;
+        pthread_mutex_unlock(&root.gpu_mu);
+        if (!waiting) usleep(100);
+    }
+    TEST_ASSERT(waiting);
+
+    uint32_t waiters = 0u;
+    (void)server_gpu_yield_prefill_to_decode(&root, &waiters);
+    TEST_ASSERT(waiters == 2u);
+    TEST_ASSERT(__atomic_load_n(
+                &acquired_count, __ATOMIC_ACQUIRE) == 1u);
+
+    pthread_mutex_lock(&root.gpu_mu);
+    TEST_ASSERT(root.gpu_busy);
+    TEST_ASSERT(!root.gpu_owner_decode);
+    TEST_ASSERT(root.gpu_prefill_yields == 1u);
+    TEST_ASSERT(root.gpu_decode_waiters == 1u);
+    pthread_mutex_unlock(&root.gpu_mu);
+
+    (void)server_gpu_yield_prefill_to_decode(&root, &waiters);
+    TEST_ASSERT(waiters == 1u);
+    TEST_ASSERT(__atomic_load_n(
+                &acquired_count, __ATOMIC_ACQUIRE) == 2u);
+    TEST_ASSERT(root.gpu_prefill_yields == 2u);
+    server_gpu_leave(&root);
+
+    TEST_ASSERT(pthread_join(threads[0], NULL) == 0);
+    TEST_ASSERT(pthread_join(threads[1], NULL) == 0);
+    pthread_cond_destroy(&root.gpu_cv);
+    pthread_mutex_destroy(&root.gpu_mu);
+}
+
 static void test_coordinator_dispatches_by_prefix_and_tool_binding(void) {
     server root = {0};
     server second = {0};
@@ -17935,15 +18349,59 @@ static void test_coordinator_dispatches_by_prefix_and_tool_binding(void) {
 
     TEST_ASSERT(select_lane_locked(&root, &req) == 1u);
 
-    /* Prefix affinity is a tie-breaker, not permission to serialize unrelated
-     * active clients onto one lane. Keep an idle lane available for a second
-     * live frontier instead of forcing disk-KV swaps through the busy lane. */
+    /* A tiny prefix saving cannot justify waiting behind a running request. */
     root.assigned_jobs = 1u;
+    root.worker_active = true;
     second.assigned_jobs = 0u;
     req.prompt.v = affinity0;
     TEST_ASSERT(select_lane_locked(&root, &req) == 1u);
     req.prompt.v = prompt_tokens;
     root.assigned_jobs = 0u;
+    root.worker_active = false;
+
+    /* Active-load accounting decays with elapsed service time but never below
+     * half of the measured interval while the request is still running. */
+    root.route_service_ewma_sec = 10.0;
+    root.route_service_samples = 1u;
+    root.assigned_jobs = 1u;
+    root.worker_active = true;
+    root.worker_started_sec = now_sec() - 2.0;
+    double active_wait = lane_route_wait_sec_locked(&root, &root);
+    TEST_ASSERT(active_wait > 7.8 && active_wait < 8.2);
+    root.worker_started_sec = now_sec() - 20.0;
+    active_wait = lane_route_wait_sec_locked(&root, &root);
+    TEST_ASSERT(active_wait > 4.9 && active_wait < 5.1);
+    root.assigned_jobs = 0u;
+    root.worker_active = false;
+    root.worker_started_sec = 0.0;
+
+    /* A long resident frontier can be cheaper than replaying the prompt on an
+     * idle lane. Once the resident lane has enough work queued, routing moves
+     * back to the cold idle lane. */
+    const int long_len = 16384;
+    int *long_prompt = xmalloc((size_t)long_len * sizeof(long_prompt[0]));
+    for (int i = 0; i < long_len; i++) long_prompt[i] = i + 100;
+    root.affinity = (ds4_tokens) {
+        .v = long_prompt,
+        .len = long_len,
+        .cap = long_len,
+    };
+    req.prompt = root.affinity;
+    root.route_service_ewma_sec = 4.0;
+    root.route_service_samples = 1u;
+    root.assigned_jobs = 1u;
+    root.worker_active = true;
+    second.assigned_jobs = 0u;
+    TEST_ASSERT(select_lane_locked(&root, &req) == 0u);
+    root.assigned_jobs = 7u;
+    TEST_ASSERT(select_lane_locked(&root, &req) == 1u);
+    root.assigned_jobs = 0u;
+    root.worker_active = false;
+    req.prompt = (ds4_tokens) {
+        .v = prompt_tokens,
+        .len = 4,
+        .cap = 4,
+    };
 
     req.api = API_RESPONSES;
     id_list_push_unique(&req.responses_live_call_ids, "call-lane-0");
@@ -17987,6 +18445,7 @@ static void test_coordinator_dispatches_by_prefix_and_tool_binding(void) {
     second.decode_active = false;
     TEST_ASSERT(server_cohort_goal_locked(&root) == 2u);
 
+    free(long_prompt);
     pthread_mutex_destroy(&root.tool_mu);
 }
 
@@ -18065,6 +18524,9 @@ static void ds4_server_unit_tests_run(void) {
     test_thinking_canonical_non_thinking_mode_noop();
     test_gpu_frontier_text_ring_evicts_oldest();
     test_decode_request_identity_lifecycle();
+    test_prefill_handoff_only_uses_interior_progress();
+    test_route_prefill_ewma_weights_first_short_sample();
+    test_prefill_handoff_runs_exactly_one_waiting_decode();
     test_coordinator_dispatches_by_prefix_and_tool_binding();
     test_tool_separator_whitespace_is_not_content();
     test_dsml_prompt_escapes_tool_supplied_text();

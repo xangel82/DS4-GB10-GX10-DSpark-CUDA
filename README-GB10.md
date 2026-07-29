@@ -606,6 +606,97 @@ richiesto circa 2,25 GiB di stato privato. Il coordinatore accetta anche
 profilo, mentre `R=4` resta escluso perche' non lascia un margine UMA sicuro sul
 GB10 da 128 GiB.
 
+### Routing KV cost-aware e scheduling prefill/verifier
+
+Il dispatcher multi-lane non usa piu' il solo conteggio dei job. Le
+continuation legate a un `call_id` restano vincolate alla sessione che possiede
+la frontier corretta; per tutte le altre richieste viene minimizzato:
+
+```text
+costo_lane = attesa_stimata + token_da_riprodurre / prefill_tps_misurato
+token_da_riprodurre = prompt_tokens - prefisso_KV_residente
+```
+
+L'attesa comprende i job in coda e il residuo della richiesta attiva. Il
+residuo decresce con il tempo gia' trascorso, ma conserva un pavimento pari a
+meta' dell'intervallo di servizio EWMA: una risposta reasoning lunga non puo'
+quindi apparire improvvisamente gratuita soltanto perche' ha superato la durata
+media. La velocita' di replay viene aggiornata dai chunk reali; i piccoli tail
+finali hanno peso proporzionale e non deformano la stima quanto un chunk pieno.
+Anche il primo campione viene fuso con il bootstrap conservativo da 900 t/s:
+un fringe di poche centinaia di token, dominato dalla latenza di lancio, non
+puo' sostituire da solo l'intera stima.
+I pareggi restano deterministici: costo, carico, prefisso piu' lungo e infine
+indice della lane. Con `DS4_TELEMETRY=1`, `coordinator dispatch` espone
+prefisso, replay, attesa, costo di replay, costo totale ed entrambe le EWMA.
+E' lo stesso principio del
+[KV-aware cost model di NVIDIA Dynamo](https://docs.nvidia.com/dynamo/latest/components/router/routing-concepts):
+localita' della cache e lavoro attivo vengono valutati insieme, invece di
+massimizzare il solo cache hit.
+
+Il secondo intervento porta nel coordinatore il principio di chunked prefill di
+[SARATHI](https://arxiv.org/abs/2308.16369), conservando il chunk MoE da
+8192 che ha dato il throughput migliore sul GB10. Al termine di un chunk
+intermedio completo la KV e il checkpoint della sessione sono validi; se
+esiste un verifier in attesa, il prefill:
+
+1. cede la GPU a un solo ciclo decode/verifier;
+2. conserva inalterata la KV privata della sessione;
+3. riprende prima di un altro prefill o di un secondo verifier;
+4. ripete l'handoff soltanto al successivo checkpoint di chunk.
+
+I callback iniziale, senza avanzamento, e finale non cedono la GPU: il primo
+non ha ancora prodotto lavoro riutilizzabile, mentre dopo il secondo il prefill
+sta gia' per rilasciare normalmente l'executor. Questo mantiene gratuiti i
+prompt che non attraversano una frontier interna.
+
+Senza decode concorrenti non avviene alcun handoff GPU; con una sola lane il
+controllo ritorna prima di acquisire il mutex. Non vengono aggiunti buffer CUDA,
+copie KV, logits o approssimazioni: Top-K, attention, RNG, rejection p/q e
+distribuzione del target restano identici.
+
+E' stata esclusa deliberatamente la preemption a ogni layer. Le lane R=n
+mantengono private KV e frontiere, ma condividono gli scratch transitori
+`batch_cur_hc` e `batch_next_hc`; un verifier fra due layer potrebbe quindi
+sovrascrivere l'attivazione del prefill. La tecnica di
+[Layered Prefill](https://arxiv.org/abs/2510.08055), specifica per MoE, resta
+interessante ma richiede un'arena privata o un executor fisico unico prima di
+essere corretta in questa architettura.
+
+Le proposte piu' recenti del 2026 rafforzano la scelta di un costo misurato
+anziche' di un budget statico. Il lavoro
+[Fairness-Aware and Latency-Controllable Scheduling](https://arxiv.org/abs/2606.09061)
+usa tempo di attesa, lavoro rimanente e previsione della latenza; il successivo
+[Load-Aware Prefill Deflection](https://arxiv.org/abs/2607.02043) cerca il
+massimo lavoro prefill che non violi il TBT dei decode attivi. Entrambi sono
+studiati soprattutto per serving disaggregato o per acceleratori con piu'
+capacita'. Su una singola GB10 non conviene introdurre trasferimenti KV o pool
+prefill/decode separati: adottiamo il criterio cost/SLO, ma manteniamo dati e
+calcolo sul device locale.
+
+Questa prima integrazione e' un interleaving temporale ai confini dei chunk, non
+ancora un singolo GEMM fisico contenente righe prefill e verifier. Fondere anche
+le operazioni dense richiedera' di mantenere attention e KV request-local e di
+calcolare il vocabulary head soltanto sulle righe verifier e sull'ultima riga
+prefill. Un eventuale kernel attention misto dovra' seguire il principio di
+[POD-Attention](https://arxiv.org/abs/2410.18038), adattato a CSA/HCA, e non
+puo' essere sostituito da un normale kernel MHA.
+
+Il test host copre due verifier contemporaneamente in attesa: ogni handoff ne
+esegue esattamente uno e restituisce la proprieta' della GPU al prefill. Prima
+della promozione su Athena restano obbligatori tre gate:
+
+- prefill R=1 senza contesa entro l'1% del baseline;
+- due richieste reali con assenza di stalli multi-secondo e throughput
+  aggregato non inferiore al coordinatore precedente;
+- hash greedy, acceptance DSpark, RAM e swap invariati.
+
+La telemetria di un run concorrente riassume gli handoff a ogni chunk:
+
+```text
+ds4-server: cooperative chunk scheduler lane=... chunk=... handoffs=... waited=...
+```
+
 ### STS offline autentico
 
 Il paper richiede temperature immutabili calibrate su un held-out set, da

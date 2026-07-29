@@ -55,27 +55,13 @@ sampling, verifier behavior or persistent memory.
 
 ## What this fork adds
 
-This list is intentionally limited to work added by this fork. The imported
-Entrpi/ds4 CUDA prefill foundation is documented separately in
-[License and attribution](#license-and-attribution) and is not presented as a
-fork addition here.
+This fork brings the GB10/GX10 CUDA path, DSpark sidecar integration, lossless
+HybridLC, long-context profiles and the measured single-machine workflow into a
+practical DS4 build. The highlights below focus on the work added, integrated
+or substantially adapted here; full lineage and license attribution are kept in
+[License and attribution](#license-and-attribution).
 
-### Additions made on top of Entrpi/ds4
-
-The fast CUDA prefill path is built on
-[Entrpi/ds4](https://github.com/Entrpi/ds4), not reimplemented independently.
-The table distinguishes that imported foundation from the work subsequently
-added in this fork:
-
-| Entrpi/ds4 foundation used here | Added or substantially adapted in this fork |
-| --- | --- |
-| Routed-MoE D2R/MMQ tiers, aligned-SoA repack and DS4 MMQ adapters | Single-pass fused gate/up, token-bound stream-K scheduling, fused HC/RMS/RoPE/MoE epilogues, tail-aware dispatch and runtime numerical self-tests |
-| Token-tile HMMA prefill attention | Native SM121a MXFP4 indexer scoring, shape-specific exact Top-512 dispatch and the dynamic direct-F16 path beyond the earlier 131k boundary |
-| llama.cpp MMQ kernels vendored through the Entrpi integration | In-process GB10 model preparation and the memory, long-context, benchmarking and profiling integration required by this session-oriented DSpark server |
-
-The DSpark sidecar, lossless p/q verifier, HybridLC, canonical KV/frontier
-handling and multi-context launch profiles are separate additions of this fork;
-they are not claimed as part of the imported Entrpi prefill stack.
+### Highlights
 
 - DeepSeek-V4-Flash DSpark GGUF sidecar conversion and loading.
 - Lossless DSpark speculative decoding with GPU-side p/q rejection sampling.
@@ -467,15 +453,6 @@ spirit: small codebase, direct experimentation, and measurable local inference
 improvements.
 
 ## License and attribution
-
-This fork keeps upstream `ds4`'s MIT license. Original GB10/GX10 and DSpark
-modifications authored in this fork are:
-
-```text
-Copyright (c) 2026 Marco Palaferri
-Licensed under the MIT License
-```
-
 Project and maintainer information is available at
 [www.palaferri.com](https://www.palaferri.com). The code in this tree has
 several clearly separated lineages so that reusers can tell who built what:
@@ -516,5 +493,5 @@ leaving it only in the detailed integration history and runtime banner.
 The MIT License allows use, copy, modification, publication, distribution,
 sublicensing and sale of the software, provided that the copyright notice and
 license text are preserved in copies or substantial portions of the software.
-When reusing this repository, preserve the relevant upstream, Entrpi/ds4,
+When reusing this repository, preserve the relevant upstream from Antirez, Entrpi/ds4,
 llama.cpp and Marco Palaferri notices together with the MIT license.

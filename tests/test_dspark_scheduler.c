@@ -232,6 +232,86 @@ static ds4_dspark_schedule_item schedule_item(
     return item;
 }
 
+typedef struct {
+    uint32_t calls;
+    uint32_t historical_cliff_calls;
+} shape_curve_probe;
+
+static double test_shape_curve(
+        const uint32_t *prefix,
+        uint32_t request_count,
+        uint32_t batch_size,
+        void *opaque) {
+    shape_curve_probe *probe = opaque;
+    probe->calls++;
+    uint32_t admitted = 0u;
+    for (uint32_t r = 0; r < request_count; r++) {
+        admitted += prefix[r];
+    }
+    require_true(batch_size == request_count + admitted,
+                 "shape callback batch must match the prefix vector");
+    if (request_count == 2u && admitted >= 2u) {
+        probe->historical_cliff_calls++;
+        return 2.0;
+    }
+    return 10.0;
+}
+
+static double test_shape_curve_fallback(
+        const uint32_t *prefix,
+        uint32_t request_count,
+        uint32_t batch_size,
+        void *opaque) {
+    (void)prefix;
+    (void)request_count;
+    (void)batch_size;
+    (void)opaque;
+    return 0.0;
+}
+
+static void test_shape_aware_step_and_fallback(void) {
+    const double sps[] = {0.0, 0.0, 10.0, 10.0, 10.0, 10.0, 10.0};
+    ds4_dspark_schedule_item items[2] = {
+        schedule_item(11, 0.95, 0.90),
+        schedule_item(22, 0.90, 0.85),
+    };
+    ds4_dspark_scheduler_state shaped;
+    ds4_dspark_scheduler_state fallback;
+    ds4_dspark_scheduler_state_reset(&shaped);
+    ds4_dspark_scheduler_state_reset(&fallback);
+    ds4_dspark_schedule_step_result shaped_result;
+    ds4_dspark_schedule_step_result fallback_result;
+    shape_curve_probe probe = {0};
+
+    require_true(ds4_dspark_hardware_schedule_step_shape(
+                     &shaped, items, 2u, sps, 7u,
+                     test_shape_curve, &probe, &shaped_result) == 0,
+                 "shape-aware causal step failed");
+    require_true(shaped_result.selected.admitted_candidates == 1u &&
+                 shaped_result.selected.batch_size == 3u,
+                 "exact shape cliff must stop the causal prefix at one row");
+    require_true(probe.calls >= 3u && probe.historical_cliff_calls != 0u,
+                 "shape callback must evaluate candidate shapes");
+
+    require_true(ds4_dspark_hardware_schedule_step_shape(
+                     &fallback, items, 2u, sps, 7u,
+                     test_shape_curve_fallback, NULL,
+                     &fallback_result) == 0,
+                 "shape fallback step failed");
+    ds4_dspark_scheduler_state reference;
+    ds4_dspark_scheduler_state_reset(&reference);
+    ds4_dspark_schedule_step_result reference_result;
+    require_true(ds4_dspark_hardware_schedule_step(
+                     &reference, items, 2u, sps, 7u,
+                     &reference_result) == 0,
+                 "row-only reference step failed");
+    require_true(fallback_result.selected.batch_size ==
+                     reference_result.selected.batch_size &&
+                 fallback_result.selected.admitted_candidates ==
+                     reference_result.selected.admitted_candidates,
+                 "non-positive exact cost must preserve the row curve");
+}
+
 static void test_stateful_two_step_barrier(void) {
     ds4_dspark_scheduler_state state;
     ds4_dspark_scheduler_state_reset(&state);
@@ -636,6 +716,7 @@ int main(void) {
     test_async_crosses_jagged_hardware_cliff();
     test_async_capacity_is_historical();
     test_async_current_confidence_cannot_expand_capacity();
+    test_shape_aware_step_and_fallback();
     test_stateful_two_step_barrier();
     test_history_reset_preserves_runtime_step();
     test_physical_confirmation_probe();

@@ -77,6 +77,16 @@ typedef struct {
     uint32_t history_ready_requests;
 } ds4_dspark_schedule_step_result;
 
+/* Optional exact-shape hardware curve. Returning a non-positive or non-finite
+ * value falls back to sps[batch_size]. The callback may inspect the complete
+ * prefix vector, but the asynchronous scheduler invokes it on historical
+ * confidence while selecting capacity, preserving the t-2 causal barrier. */
+typedef double (*ds4_dspark_shape_sps_fn)(
+        const uint32_t *prefix,
+        uint32_t request_count,
+        uint32_t batch_size,
+        void *opaque);
+
 /* Request-major physical layout consumed by a variable-prefix verifier.
  * Prefix row zero is the mandatory pending target token; rows 1..K are the
  * selected DSpark draft prefix. row_request is the marker tensor payload. */
@@ -157,6 +167,18 @@ int ds4_dspark_hardware_schedule_step(
         uint32_t request_count,
         const double *sps,
         uint32_t sps_count,
+        ds4_dspark_schedule_step_result *result);
+
+/* Shape-aware production variant. The ordinary API remains the deterministic
+ * row-only reference used by existing callers and tests. */
+int ds4_dspark_hardware_schedule_step_shape(
+        ds4_dspark_scheduler_state *state,
+        const ds4_dspark_schedule_item *items,
+        uint32_t request_count,
+        const double *sps,
+        uint32_t sps_count,
+        ds4_dspark_shape_sps_fn shape_sps,
+        void *shape_sps_opaque,
         ds4_dspark_schedule_step_result *result);
 
 /* A single exact-shape timing is not mature enough for normal exploitation,

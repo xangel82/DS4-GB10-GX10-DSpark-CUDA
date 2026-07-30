@@ -92,6 +92,21 @@ function text_value(prefix,    i,a) {
 /dspark scheduler bypass/ { bypass++ }
 /dspark pre-draft bypass/ { predraft_bypass++ }
 /dspark scheduler K0 cooldown=/ { k0_cooldowns++ }
+/dspark admission R=/ {
+  shape_curve = text_value("shape_curve")
+  if (shape_curve != "") {
+    split(shape_curve, shape_parts, "/")
+    if (shape_parts[1] ~ /^[0-9]+$/ &&
+        shape_parts[2] ~ /^[0-9]+$/) {
+      shape_curve_records++
+      shape_curve_hits += shape_parts[1] + 0
+      shape_curve_queries += shape_parts[2] + 0
+      if ((shape_parts[1] + 0) == (shape_parts[2] + 0)) {
+        shape_curve_full_records++
+      }
+    }
+  }
+}
 /dspark coordinator mode=/ {
   coordinator_mode = text_value("mode")
   coordinator_reason = text_value("reason")
@@ -572,6 +587,13 @@ END {
           }
         }
       }
+    }
+    if (shape_curve_records > 0) {
+      shape_hit_rate = shape_curve_queries > 0 ? 100.0 * shape_curve_hits / shape_curve_queries : 0.0
+      printf "Hardware shape curve:      %d / %d hits (%.2f%%), full=%d/%d cohorts\n",
+             shape_curve_hits, shape_curve_queries,
+             shape_hit_rate,
+             shape_curve_full_records, shape_curve_records
     }
   } else if (timing_hardware_cycles > 0) {
     printf "Hardware scheduler mean R/batch: %.3f / %.3f (from timing)\n",

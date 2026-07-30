@@ -98,11 +98,28 @@ static int ds4_dspark_validate_sps(
     return 0;
 }
 
-int ds4_dspark_hardware_schedule(
+static double ds4_dspark_schedule_sps(
+        const double *sps,
+        uint32_t batch_size,
+        const uint32_t *prefix,
+        uint32_t request_count,
+        ds4_dspark_shape_sps_fn shape_sps,
+        void *shape_sps_opaque) {
+    if (shape_sps) {
+        const double exact = shape_sps(
+                prefix, request_count, batch_size, shape_sps_opaque);
+        if (exact > 0.0 && isfinite(exact)) return exact;
+    }
+    return sps[batch_size];
+}
+
+static int ds4_dspark_hardware_schedule_impl(
         const ds4_dspark_schedule_request *requests,
         uint32_t request_count,
         const double *sps,
         uint32_t sps_count,
+        ds4_dspark_shape_sps_fn shape_sps,
+        void *shape_sps_opaque,
         ds4_dspark_schedule_result *result) {
     if (!requests || !sps || !result || request_count == 0 ||
         request_count > DS4_DSPARK_SCHEDULER_MAX_REQUESTS) {
@@ -129,7 +146,9 @@ int ds4_dspark_hardware_schedule(
     }
     uint32_t batch_size = baseline_batch;
     double expected_tokens = baseline_expected;
-    double best_throughput = expected_tokens * sps[batch_size];
+    double best_throughput = expected_tokens * ds4_dspark_schedule_sps(
+            sps, batch_size, current_prefix, request_count,
+            shape_sps, shape_sps_opaque);
 
     result->request_count = request_count;
     result->batch_size = batch_size;
@@ -149,7 +168,9 @@ int ds4_dspark_hardware_schedule(
         current_prefix[candidate->request] = candidate->prefix;
         batch_size++;
         expected_tokens += candidate->survival;
-        const double throughput = expected_tokens * sps[batch_size];
+        const double throughput = expected_tokens * ds4_dspark_schedule_sps(
+                sps, batch_size, current_prefix, request_count,
+                shape_sps, shape_sps_opaque);
         result->evaluated_candidates++;
 
         if (throughput > best_throughput) {
@@ -174,12 +195,25 @@ int ds4_dspark_hardware_schedule(
     return 0;
 }
 
-int ds4_dspark_hardware_schedule_async(
+int ds4_dspark_hardware_schedule(
+        const ds4_dspark_schedule_request *requests,
+        uint32_t request_count,
+        const double *sps,
+        uint32_t sps_count,
+        ds4_dspark_schedule_result *result) {
+    return ds4_dspark_hardware_schedule_impl(
+            requests, request_count, sps, sps_count,
+            NULL, NULL, result);
+}
+
+static int ds4_dspark_hardware_schedule_async_impl(
         const ds4_dspark_schedule_request *capacity_requests,
         const ds4_dspark_schedule_request *current_requests,
         uint32_t request_count,
         const double *sps,
         uint32_t sps_count,
+        ds4_dspark_shape_sps_fn shape_sps,
+        void *shape_sps_opaque,
         ds4_dspark_schedule_result *result) {
     if (!capacity_requests || !current_requests || !sps || !result ||
         request_count == 0 ||
@@ -219,13 +253,27 @@ int ds4_dspark_hardware_schedule_async(
     uint32_t capacity_admitted = 0;
     uint32_t capacity_batch = capacity_baseline_batch;
     double capacity_expected = capacity_baseline_expected;
-    double capacity_throughput =
-        capacity_expected * sps[capacity_batch];
+    uint32_t capacity_prefix[DS4_DSPARK_SCHEDULER_MAX_REQUESTS] = {0};
+    for (uint32_t r = 0; r < request_count; r++) {
+        capacity_prefix[r] = capacity_requests[r].minimum_prefix;
+    }
+    double capacity_throughput = capacity_expected *
+        ds4_dspark_schedule_sps(
+                sps, capacity_batch, capacity_prefix, request_count,
+                shape_sps, shape_sps_opaque);
     for (uint32_t i = 0; i < capacity_count; i++) {
+        const ds4_dspark_candidate *candidate = &capacity_candidates[i];
+        if (candidate->prefix !=
+            capacity_prefix[candidate->request] + 1u) {
+            return 1;
+        }
+        capacity_prefix[candidate->request] = candidate->prefix;
         capacity_batch++;
-        capacity_expected += capacity_candidates[i].survival;
-        const double throughput =
-            capacity_expected * sps[capacity_batch];
+        capacity_expected += candidate->survival;
+        const double throughput = capacity_expected *
+            ds4_dspark_schedule_sps(
+                    sps, capacity_batch, capacity_prefix, request_count,
+                    shape_sps, shape_sps_opaque);
         if (throughput > capacity_throughput) {
             capacity_throughput = throughput;
             capacity_admitted = i + 1u;
@@ -240,9 +288,19 @@ int ds4_dspark_hardware_schedule_async(
     for (uint32_t i = 0; i < capacity_admitted; i++) {
         capacity_expected += capacity_candidates[i].survival;
     }
-    capacity_throughput =
-        capacity_expected *
-        sps[capacity_baseline_batch + capacity_admitted];
+    memset(capacity_prefix, 0, sizeof(capacity_prefix));
+    for (uint32_t r = 0; r < request_count; r++) {
+        capacity_prefix[r] = capacity_requests[r].minimum_prefix;
+    }
+    for (uint32_t i = 0; i < capacity_admitted; i++) {
+        const ds4_dspark_candidate *candidate = &capacity_candidates[i];
+        capacity_prefix[candidate->request] = candidate->prefix;
+    }
+    capacity_throughput = capacity_expected *
+        ds4_dspark_schedule_sps(
+                sps, capacity_baseline_batch + capacity_admitted,
+                capacity_prefix, request_count,
+                shape_sps, shape_sps_opaque);
 
     uint32_t current_prefix[DS4_DSPARK_SCHEDULER_MAX_REQUESTS] = {0};
     for (uint32_t r = 0; r < request_count; r++) {
@@ -267,13 +325,35 @@ int ds4_dspark_hardware_schedule_async(
     result->evaluated_candidates = capacity_count;
     result->stop_request = UINT32_MAX;
     result->expected_tokens = current_expected;
-    result->throughput = current_expected * sps[result->batch_size];
-    result->baseline_throughput =
-        current_baseline_expected * sps[current_baseline_batch];
+    result->throughput = current_expected * ds4_dspark_schedule_sps(
+            sps, result->batch_size, current_prefix, request_count,
+            shape_sps, shape_sps_opaque);
+    uint32_t current_baseline_prefix[
+        DS4_DSPARK_SCHEDULER_MAX_REQUESTS] = {0};
+    for (uint32_t r = 0; r < request_count; r++) {
+        current_baseline_prefix[r] =
+            current_requests[r].minimum_prefix;
+    }
+    result->baseline_throughput = current_baseline_expected *
+        ds4_dspark_schedule_sps(
+                sps, current_baseline_batch, current_baseline_prefix,
+                request_count, shape_sps, shape_sps_opaque);
     result->capacity_throughput = capacity_throughput;
     memcpy(result->prefix, current_prefix,
            (size_t)request_count * sizeof(result->prefix[0]));
     return 0;
+}
+
+int ds4_dspark_hardware_schedule_async(
+        const ds4_dspark_schedule_request *capacity_requests,
+        const ds4_dspark_schedule_request *current_requests,
+        uint32_t request_count,
+        const double *sps,
+        uint32_t sps_count,
+        ds4_dspark_schedule_result *result) {
+    return ds4_dspark_hardware_schedule_async_impl(
+            capacity_requests, current_requests, request_count,
+            sps, sps_count, NULL, NULL, result);
 }
 
 void ds4_dspark_scheduler_state_reset(
@@ -391,12 +471,14 @@ int ds4_dspark_scheduler_state_forget(
     return 1;
 }
 
-int ds4_dspark_hardware_schedule_step(
+int ds4_dspark_hardware_schedule_step_shape(
         ds4_dspark_scheduler_state *state,
         const ds4_dspark_schedule_item *items,
         uint32_t request_count,
         const double *sps,
         uint32_t sps_count,
+        ds4_dspark_shape_sps_fn shape_sps,
+        void *shape_sps_opaque,
         ds4_dspark_schedule_step_result *result) {
     if (!state || !items || !sps || !result ||
         request_count == 0 ||
@@ -446,15 +528,17 @@ int ds4_dspark_hardware_schedule_step(
         }
     }
 
-    if (ds4_dspark_hardware_schedule(
+    if (ds4_dspark_hardware_schedule_impl(
             current, request_count, sps, sps_count,
+            shape_sps, shape_sps_opaque,
             &result->causal) != 0) {
         return 1;
     }
     result->selected = result->causal;
     if (result->history_ready_requests == request_count) {
-        if (ds4_dspark_hardware_schedule_async(
+        if (ds4_dspark_hardware_schedule_async_impl(
                 capacity, current, request_count, sps, sps_count,
+                shape_sps, shape_sps_opaque,
                 &result->selected) != 0) {
             return 1;
         }
@@ -475,6 +559,18 @@ int ds4_dspark_hardware_schedule_step(
     }
     state->step = current_step;
     return 0;
+}
+
+int ds4_dspark_hardware_schedule_step(
+        ds4_dspark_scheduler_state *state,
+        const ds4_dspark_schedule_item *items,
+        uint32_t request_count,
+        const double *sps,
+        uint32_t sps_count,
+        ds4_dspark_schedule_step_result *result) {
+    return ds4_dspark_hardware_schedule_step_shape(
+            state, items, request_count, sps, sps_count,
+            NULL, NULL, result);
 }
 
 int ds4_dspark_schedule_flatten(

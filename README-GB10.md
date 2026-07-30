@@ -906,6 +906,79 @@ e ha eseguito il prefill soltanto fino a 19.760, invece di ripartire da zero.
 Regressione CUDA `sm_121a`, test scheduler, test server e `git diff --check`
 sono passati.
 
+### Curva hardware persistente per forma - 30 luglio 2026
+
+La curva `SPS(B)` per sole righe non descrive completamente il verifier
+multi-sessione: a parita' di `B`, forme come `[1,3]`, `[2,2]` e `[0,4]`
+possono avere costi diversi per padding, riga ombra `K=0`, attention privata e
+distribuzione del lavoro fra lane. Il planner production consulta ora anche un
+profilo esatto indicizzato da:
+
+```text
+executor, neural/HybridLC, bucket contesto, R, righe fisiche, forma K ordinata
+```
+
+La chiave conserva l'associazione fra bucket di contesto e `K` della singola
+lane, ordinando coppie `(bucket,K)` invece dei soli `K`: una lane lunga con
+`K=1` non viene quindi confusa con una lane corta con `K=1`, ne' con la forma
+ottenuta scambiando i due prefissi fra contesti diversi.
+
+Una forma guida la scelta del prefisso soltanto dopo otto campioni. Le normali
+decisioni physical/serial possono continuare a confermare una forma dopo due
+misure, ma il planner non modifica `K` sulla base di un EWMA ancora rumoroso.
+Prima della maturita', oppure quando la forma non e' mai stata osservata, il
+callback restituisce zero e lo scheduler ricade sulla curva rows-only
+esistente. La ricerca asincrona continua a
+scegliere la capacita' usando esclusivamente confidence dello step `t-2`;
+l'hardware profile sostituisce solo il costo `SPS` della forma candidata.
+Confidence corrente, token target, acceptance e risultato della verifica non
+entrano quindi nella scelta retrospettiva.
+
+Le misure neurali e HybridLC sono separate. Il profilo registra la forma
+realmente verificata dopo l'eventuale estensione retrieval, non quella
+originariamente pianificata; in questo modo un verifier `N=8/12/16` non
+contamina il costo del prefisso neurale `K=0..5`.
+
+Il launcher salva il profilo in:
+
+```text
+$DS4_MODEL_DIR/dspark-hardware-q2.profile
+$DS4_MODEL_DIR/dspark-hardware-q4.profile
+```
+
+Il percorso si puo' personalizzare con `DS4_DSPARK_HW_PROFILE`. Il file non
+contiene prompt, token, KV, probabilita' o output: soltanto EWMA, numero di
+campioni e chiavi hardware. Un fingerprint versionato include binario, modello
+target, sidecar, backend e power target; se uno cambia, il vecchio profilo
+viene ignorato automaticamente. Il salvataggio avviene atomicamente durante
+lo shutdown pulito.
+
+La prima validazione GB10 del formato V1 aveva raccolto 51 forme. Prima del riavvio la curva
+esatta ha coperto 7.593 valutazioni su 10.372 (`73,21%`); al primo run dopo il
+riavvio il profilo e' stato caricato con lo stesso fingerprint e ha coperto
+1.484 valutazioni su 1.571 (`94,46%`). Questi numeri verificano persistenza e
+warm-start, non costituiscono ancora un claim di incremento end-to-end:
+l'effetto va misurato sullo stesso carico operativo e contro il fallback
+rows-only.
+
+Il successivo test operativo ha mostrato una regressione da 28,557 a
+26,619 t/s aggregati. L'audit ha individuato due cause nella chiave V1:
+associazione lane-contesto persa dall'ordinamento dei soli `K` e forme abilitate
+dopo appena due campioni. Il formato V2 corregge entrambe; il fingerprint
+versionato invalida automaticamente il file V1. I numeri V1 restano qui come
+traccia diagnostica e non rappresentano uno stato promosso.
+
+Con `DS4_TELEMETRY=1`, ogni riga `dspark admission` espone
+`shape_curve=hit/query`. Il report aggregato mostra direttamente:
+
+```text
+Hardware shape curve: ... hits (...%), full=... cohorts
+```
+
+Questa e' intenzionalmente la sola base hardware. Una futura curva adattiva
+di acceptance dovra' essere gerarchica, regolarizzata verso il profilo STS e
+aggiornata piu' lentamente; non viene mescolata a questi costi fisici.
+
 ### STS offline autentico
 
 Il paper richiede temperature immutabili calibrate su un held-out set, da

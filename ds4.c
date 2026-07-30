@@ -28151,6 +28151,11 @@ static void ds4_acquire_instance_lock(void) {
 #define DS4_DSPARK_COST_WINDOW 9u
 #define DS4_DSPARK_RN_COST_SLOTS 512u
 #define DS4_DSPARK_RN_CONFIRM_GAIN 1.10
+#define DS4_DSPARK_HW_PROFILE_VERSION 2u
+#define DS4_DSPARK_RN_SHAPE_MIN_SAMPLES 8u
+#define DS4_DSPARK_RN_PROFILE_MAX_ROWS \
+    (DS4_DSPARK_SCHEDULER_MAX_REQUESTS * \
+     (DS4_HYBRID_LC_MAX_DRAFT + 1u))
 
 typedef struct {
     double value[DS4_DSPARK_COST_WINDOW];
@@ -28299,6 +28304,9 @@ struct ds4_session {
     ds4_dspark_rn_cost_profile
         dspark_rn_cost_profile[DS4_DSPARK_RN_COST_SLOTS];
     uint64_t dspark_rn_cost_clock;
+    uint64_t dspark_rn_cost_dirty;
+    uint64_t dspark_rn_hw_fingerprint;
+    char *dspark_rn_hw_profile_path;
     uint32_t dspark_last_early_stop;
     uint32_t dspark_last_champion;
     double dspark_anchor_ewma;
@@ -28399,6 +28407,8 @@ static int ds4_session_materialize_logits_internal(
 static uint32_t dspark_context_bucket(const ds4_session *s);
 static double dspark_stable_cycle_rate(
         const ds4_session *s, uint32_t k);
+static void dspark_rn_hardware_profile_load(ds4_session *s);
+static void dspark_rn_hardware_profile_save(ds4_session *s);
 
 static bool dspark_hybrid_lc_store_requested(void) {
     return ds4_env_enabled("DS4_DSPARK_HYBRID_LC") ||
@@ -32640,6 +32650,11 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
     }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (e->dspark_ready) {
+        dspark_rn_hardware_profile_load(s);
+    }
+#endif
     *out = s;
     return 0;
 #endif
@@ -33430,6 +33445,11 @@ int ds4_sessions_verify_suffix_rn(
 
 void ds4_session_free(ds4_session *s) {
     if (!s) return;
+#if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (!s->shared_scratch_lane) {
+        dspark_rn_hardware_profile_save(s);
+    }
+#endif
     ds4_dist_session_free(s->distributed);
     if (ds4_session_is_cpu(s)) {
         kv_cache_free(&s->cpu_cache);
@@ -33456,6 +33476,7 @@ void ds4_session_free(ds4_session *s) {
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     dspark_hybrid_lc_store_free(s->hybrid_lc_store);
 #endif
+    free(s->dspark_rn_hw_profile_path);
     free(s);
 }
 
@@ -37112,15 +37133,18 @@ enum {
 
 static uint64_t dspark_rn_shape_hash(
         const uint32_t *prefix,
+        const uint8_t *context_bucket,
         uint32_t request_count) {
-    uint8_t sorted[DS4_DSPARK_SCHEDULER_MAX_REQUESTS];
+    uint16_t sorted[DS4_DSPARK_SCHEDULER_MAX_REQUESTS];
     for (uint32_t r = 0; r < request_count; r++) {
         uint32_t value = prefix ? prefix[r] : 0u;
         if (value > UINT8_MAX) value = UINT8_MAX;
-        sorted[r] = (uint8_t)value;
+        sorted[r] =
+            ((uint16_t)(context_bucket ? context_bucket[r] : 0u) << 8u) |
+            (uint16_t)value;
     }
     for (uint32_t i = 1; i < request_count; i++) {
-        const uint8_t value = sorted[i];
+        const uint16_t value = sorted[i];
         uint32_t j = i;
         while (j != 0u && sorted[j - 1u] > value) {
             sorted[j] = sorted[j - 1u];
@@ -37130,12 +37154,240 @@ static uint64_t dspark_rn_shape_hash(
     }
     uint64_t hash = UINT64_C(1469598103934665603);
     for (uint32_t r = 0; r < request_count; r++) {
-        hash ^= sorted[r];
+        hash ^= sorted[r] & UINT16_C(0xff);
+        hash *= UINT64_C(1099511628211);
+        hash ^= sorted[r] >> 8u;
         hash *= UINT64_C(1099511628211);
     }
     hash ^= request_count;
     hash *= UINT64_C(1099511628211);
     return hash;
+}
+
+static uint64_t dspark_rn_fingerprint_mix(
+        uint64_t hash, uint64_t value) {
+    for (uint32_t byte = 0; byte < 8u; byte++) {
+        hash ^= (value >> (byte * 8u)) & UINT64_C(0xff);
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t dspark_rn_hardware_fingerprint(
+        const ds4_session *s) {
+    if (!s || !s->engine) return 0u;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = dspark_rn_fingerprint_mix(
+            hash, DS4_DSPARK_HW_PROFILE_VERSION);
+    hash = dspark_rn_fingerprint_mix(hash, DS4_MODEL_VARIANT);
+    hash = dspark_rn_fingerprint_mix(hash, DS4_DSPARK_BLOCK_SIZE);
+    hash = dspark_rn_fingerprint_mix(
+            hash, (uint64_t)s->engine->backend);
+    hash = dspark_rn_fingerprint_mix(
+            hash, (uint64_t)s->engine->power_percent);
+    hash = dspark_rn_fingerprint_mix(hash, s->engine->model.size);
+    hash = dspark_rn_fingerprint_mix(
+            hash, s->engine->dspark_model.size);
+
+    const int fds[] = {
+        s->engine->model.fd,
+        s->engine->dspark_model.fd,
+    };
+    for (uint32_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++) {
+        struct stat st;
+        if (fds[i] >= 0 && fstat(fds[i], &st) == 0) {
+            hash = dspark_rn_fingerprint_mix(
+                    hash, (uint64_t)st.st_size);
+            hash = dspark_rn_fingerprint_mix(
+                    hash, (uint64_t)st.st_mtim.tv_sec);
+            hash = dspark_rn_fingerprint_mix(
+                    hash, (uint64_t)st.st_mtim.tv_nsec);
+        }
+    }
+    struct stat executable;
+    if (stat("/proc/self/exe", &executable) == 0) {
+        hash = dspark_rn_fingerprint_mix(
+                hash, (uint64_t)executable.st_size);
+        hash = dspark_rn_fingerprint_mix(
+                hash, (uint64_t)executable.st_mtim.tv_sec);
+        hash = dspark_rn_fingerprint_mix(
+                hash, (uint64_t)executable.st_mtim.tv_nsec);
+    }
+    return hash ? hash : UINT64_C(1);
+}
+
+static void dspark_rn_hardware_profile_load(ds4_session *s) {
+    if (!s || s->shared_scratch_lane || !s->engine ||
+        !s->engine->dspark_ready) {
+        return;
+    }
+    const char *path = getenv("DS4_DSPARK_HW_PROFILE");
+    if (!path || !path[0]) return;
+    s->dspark_rn_hw_profile_path = ds4_strdup(path);
+    s->dspark_rn_hw_fingerprint =
+        dspark_rn_hardware_fingerprint(s);
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) {
+        if (errno != ENOENT) {
+            fprintf(stderr,
+                    "ds4: failed to read DSpark hardware profile %s: %s\n",
+                    path, strerror(errno));
+        }
+        return;
+    }
+    char line[512];
+    unsigned version = 0u;
+    unsigned long long file_fingerprint = 0u;
+    if (!fgets(line, sizeof(line), fp) ||
+        sscanf(line, "DS4_DSPARK_HW_PROFILE_V%u %llx",
+               &version, &file_fingerprint) != 2 ||
+        version != DS4_DSPARK_HW_PROFILE_VERSION ||
+        (uint64_t)file_fingerprint !=
+            s->dspark_rn_hw_fingerprint) {
+        fclose(fp);
+        fprintf(stderr,
+                "ds4: ignored stale or incompatible DSpark hardware "
+                "profile %s\n",
+                path);
+        return;
+    }
+
+    ds4_dspark_rn_cost_profile loaded[DS4_DSPARK_RN_COST_SLOTS];
+    memset(loaded, 0, sizeof(loaded));
+    uint32_t count = 0u;
+    uint64_t clock = 0u;
+    bool valid = true;
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '\0' || line[0] == '\n' || line[0] == '#') {
+            continue;
+        }
+        unsigned executor = 0u;
+        unsigned path_class = 0u;
+        unsigned context_bucket = 0u;
+        unsigned request_count = 0u;
+        unsigned rows = 0u;
+        unsigned long long shape = 0u;
+        unsigned long long samples = 0u;
+        unsigned long long last_seen = 0u;
+        double ewma = 0.0;
+        if (sscanf(line, "P %u %u %u %u %u %llx %lf %llu %llu",
+                   &executor, &path_class, &context_bucket,
+                   &request_count, &rows, &shape, &ewma,
+                   &samples, &last_seen) != 9 ||
+            count >= DS4_DSPARK_RN_COST_SLOTS ||
+            (executor != DS4_DSPARK_RN_EXEC_PHYSICAL &&
+             executor != DS4_DSPARK_RN_EXEC_SERIAL) ||
+            path_class > DS4_DSPARK_RN_PATH_HYBRID ||
+            context_bucket >= DS4_DSPARK_CONTEXT_BUCKETS ||
+            request_count == 0u ||
+            request_count > DS4_DSPARK_SCHEDULER_MAX_REQUESTS ||
+            rows == 0u ||
+            rows > DS4_DSPARK_RN_PROFILE_MAX_ROWS ||
+            shape == 0u || samples == 0u ||
+            !(ewma > 0.0) || !isfinite(ewma)) {
+            valid = false;
+            break;
+        }
+        loaded[count] = (ds4_dspark_rn_cost_profile) {
+            .shape = (uint64_t)shape,
+            .last_seen = (uint64_t)last_seen,
+            .ewma = ewma,
+            .samples = (uint64_t)samples,
+            .rows = rows,
+            .request_count = (uint16_t)request_count,
+            .context_bucket = (uint8_t)context_bucket,
+            .executor = (uint8_t)executor,
+            .path_class = (uint8_t)path_class,
+            .used = true,
+        };
+        if ((uint64_t)last_seen > clock) {
+            clock = (uint64_t)last_seen;
+        }
+        count++;
+    }
+    if (fclose(fp) != 0) valid = false;
+    if (!valid) {
+        fprintf(stderr,
+                "ds4: ignored malformed DSpark hardware profile %s\n",
+                path);
+        return;
+    }
+    memcpy(s->dspark_rn_cost_profile, loaded, sizeof(loaded));
+    s->dspark_rn_cost_clock = clock;
+    fprintf(stderr,
+            "ds4: persistent DSpark hardware profile loaded: %s "
+            "(shapes=%u fingerprint=%016llx)\n",
+            path, count,
+            (unsigned long long)s->dspark_rn_hw_fingerprint);
+}
+
+static void dspark_rn_hardware_profile_save(ds4_session *s) {
+    if (!s || s->shared_scratch_lane ||
+        !s->dspark_rn_hw_profile_path ||
+        s->dspark_rn_cost_dirty == 0u) {
+        return;
+    }
+    const size_t path_len = strlen(s->dspark_rn_hw_profile_path);
+    if (path_len > SIZE_MAX - 48u) return;
+    char *tmp = xmalloc(path_len + 48u);
+    snprintf(tmp, path_len + 48u, "%s.tmp.%ld",
+             s->dspark_rn_hw_profile_path, (long)getpid());
+    FILE *fp = fopen(tmp, "wb");
+    if (!fp) {
+        fprintf(stderr,
+                "ds4: failed to write DSpark hardware profile %s: %s\n",
+                tmp, strerror(errno));
+        free(tmp);
+        return;
+    }
+    bool ok = fprintf(
+            fp, "DS4_DSPARK_HW_PROFILE_V%u %016llx\n",
+            DS4_DSPARK_HW_PROFILE_VERSION,
+            (unsigned long long)s->dspark_rn_hw_fingerprint) > 0;
+    uint32_t count = 0u;
+    for (uint32_t i = 0;
+         ok && i < DS4_DSPARK_RN_COST_SLOTS; i++) {
+        const ds4_dspark_rn_cost_profile *profile =
+            &s->dspark_rn_cost_profile[i];
+        if (!profile->used || profile->samples == 0u ||
+            !(profile->ewma > 0.0)) {
+            continue;
+        }
+        ok = fprintf(
+                fp, "P %u %u %u %u %u %016llx %.17g %llu %llu\n",
+                profile->executor,
+                profile->path_class,
+                profile->context_bucket,
+                profile->request_count,
+                profile->rows,
+                (unsigned long long)profile->shape,
+                profile->ewma,
+                (unsigned long long)profile->samples,
+                (unsigned long long)profile->last_seen) > 0;
+        count++;
+    }
+    if (ok) ok = fflush(fp) == 0;
+    if (ok) ok = fsync(fileno(fp)) == 0;
+    if (fclose(fp) != 0) ok = false;
+    if (ok) {
+        ok = rename(tmp, s->dspark_rn_hw_profile_path) == 0;
+    }
+    if (!ok) {
+        const int saved = errno;
+        unlink(tmp);
+        fprintf(stderr,
+                "ds4: failed to persist DSpark hardware profile %s: %s\n",
+                s->dspark_rn_hw_profile_path,
+                saved ? strerror(saved) : "write error");
+    } else {
+        s->dspark_rn_cost_dirty = 0u;
+        fprintf(stderr,
+                "ds4: persistent DSpark hardware profile saved: %s "
+                "(shapes=%u)\n",
+                s->dspark_rn_hw_profile_path, count);
+    }
+    free(tmp);
 }
 
 static uint8_t dspark_rn_context_bucket(
@@ -37191,7 +37443,13 @@ static void dspark_rn_cost_profile_note(
         uint32_t rows,
         uint64_t shape,
         double seconds) {
-    if (!owner || !(seconds > 0.0)) return;
+    if (!owner || !(seconds > 0.0) ||
+        request_count == 0u ||
+        request_count > DS4_DSPARK_SCHEDULER_MAX_REQUESTS ||
+        rows == 0u || rows > DS4_DSPARK_RN_PROFILE_MAX_ROWS ||
+        shape == 0u) {
+        return;
+    }
     ds4_dspark_rn_cost_profile *selected = NULL;
     ds4_dspark_rn_cost_profile *oldest =
         &owner->dspark_rn_cost_profile[0];
@@ -37237,6 +37495,57 @@ static void dspark_rn_cost_profile_note(
         : selected->ewma * (1.0 - alpha) + seconds * alpha;
     selected->samples++;
     selected->last_seen = ++owner->dspark_rn_cost_clock;
+    owner->dspark_rn_cost_dirty++;
+}
+
+typedef struct {
+    ds4_session *owner;
+    double draft_seconds;
+    uint8_t context_bucket;
+    uint8_t lane_context_bucket[DS4_DSPARK_SCHEDULER_MAX_REQUESTS];
+    uint32_t queries;
+    uint32_t hits;
+} dspark_rn_shape_curve;
+
+static double dspark_rn_physical_shape_sps(
+        const uint32_t *prefix,
+        uint32_t request_count,
+        uint32_t batch_size,
+        void *opaque) {
+    dspark_rn_shape_curve *curve =
+        (dspark_rn_shape_curve *)opaque;
+    if (!curve || !curve->owner || !prefix ||
+        request_count == 0u) {
+        return 0.0;
+    }
+    curve->queries++;
+    uint32_t profile_rows = batch_size;
+    for (uint32_t r = 0; r < request_count; r++) {
+        if (prefix[r] == 0u) profile_rows++;
+    }
+    const uint64_t shape =
+        dspark_rn_shape_hash(
+                prefix, curve->lane_context_bucket, request_count);
+    double verify_seconds = 0.0;
+    uint64_t samples = 0u;
+    if (!dspark_rn_cost_profile_lookup(
+            curve->owner,
+            DS4_DSPARK_RN_EXEC_PHYSICAL,
+            DS4_DSPARK_RN_PATH_NEURAL,
+            curve->context_bucket,
+            request_count,
+            profile_rows,
+            shape,
+            &verify_seconds,
+            &samples) ||
+        samples < DS4_DSPARK_RN_SHAPE_MIN_SAMPLES) {
+        return 0.0;
+    }
+    const double seconds =
+        curve->draft_seconds + verify_seconds;
+    if (!(seconds > 0.0)) return 0.0;
+    curve->hits++;
+    return 1.0 / seconds;
 }
 
 static void dspark_rn_finalize_lane(
@@ -37621,7 +37930,6 @@ int ds4_sessions_eval_speculative_sample_rn(
     bool hybrid_lc[request_count];
     bool hybrid_shadow[request_count];
     bool lane_finalized[request_count];
-    bool planned_hybrid_path = false;
     memset(draft, 0, sizeof(draft));
     memset(items, 0, sizeof(items));
     memset(verify, 0, sizeof(verify));
@@ -37655,8 +37963,6 @@ int ds4_sessions_eval_speculative_sample_rn(
         session->dspark_pending_valid = false;
         hybrid_lc[r] = dspark_hybrid_lc_enabled(session);
         hybrid_shadow[r] = dspark_hybrid_lc_shadow_enabled(session);
-        planned_hybrid_path =
-            planned_hybrid_path || hybrid_lc[r];
         hybrid_rng_before[r] = session->hybrid_lc_rng;
         hybrid_shadow_rng_before[r] = session->hybrid_lc_shadow_rng;
         if (hybrid_lc[r] &&
@@ -37771,14 +38077,27 @@ int ds4_sessions_eval_speculative_sample_rn(
         sps[rows] = seconds > 0.0 ? 1.0 / seconds : 0.0;
     }
 
+    const uint8_t cost_context_bucket =
+        dspark_rn_context_bucket(requests, request_count);
+    dspark_rn_shape_curve shape_curve = {
+        .owner = owner,
+        .draft_seconds = cohort_draft_seconds,
+        .context_bucket = cost_context_bucket,
+    };
+    for (uint32_t r = 0; r < request_count; r++) {
+        shape_curve.lane_context_bucket[r] =
+            (uint8_t)dspark_context_bucket(requests[r].session);
+    }
     ds4_dspark_schedule_step_result schedule_step;
     memset(&schedule_step, 0, sizeof(schedule_step));
-    rc = ds4_dspark_hardware_schedule_step(
+    rc = ds4_dspark_hardware_schedule_step_shape(
             &owner->dspark_rn_hw_scheduler,
             items,
             request_count,
             sps,
             max_rows + 1u,
+            dspark_rn_physical_shape_sps,
+            &shape_curve,
             &schedule_step);
     if (rc != 0) {
         schedule_step.selected.request_count = request_count;
@@ -37837,19 +38156,16 @@ int ds4_sessions_eval_speculative_sample_rn(
         serial_verify_seconds += dspark_verify_cost_estimate(
                 requests[r].session, selected);
     }
-    const uint8_t cost_context_bucket =
-        dspark_rn_context_bucket(requests, request_count);
-    const uint8_t cost_path_class = planned_hybrid_path
-        ? DS4_DSPARK_RN_PATH_HYBRID
-        : DS4_DSPARK_RN_PATH_NEURAL;
     const uint64_t serial_shape =
-        dspark_rn_shape_hash(serial_prefix, request_count);
+        dspark_rn_shape_hash(
+                serial_prefix, shape_curve.lane_context_bucket,
+                request_count);
     uint64_t serial_profile_samples = 0u;
     double serial_profile_seconds = 0.0;
     if (dspark_rn_cost_profile_lookup(
             owner,
             DS4_DSPARK_RN_EXEC_SERIAL,
-            cost_path_class,
+            DS4_DSPARK_RN_PATH_NEURAL,
             cost_context_bucket,
             request_count,
             serial_profile_rows,
@@ -37875,7 +38191,9 @@ int ds4_sessions_eval_speculative_sample_rn(
         }
     }
     const uint64_t physical_shape = dspark_rn_shape_hash(
-            schedule_step.selected.prefix, request_count);
+            schedule_step.selected.prefix,
+            shape_curve.lane_context_bucket,
+            request_count);
     uint64_t physical_profile_samples = 0u;
     double physical_profile_seconds = 0.0;
     double physical_rate = schedule_step.selected.throughput;
@@ -37883,7 +38201,7 @@ int ds4_sessions_eval_speculative_sample_rn(
         dspark_rn_cost_profile_lookup(
             owner,
             DS4_DSPARK_RN_EXEC_PHYSICAL,
-            cost_path_class,
+            DS4_DSPARK_RN_PATH_NEURAL,
             cost_context_bucket,
             request_count,
             physical_profile_rows,
@@ -37989,7 +38307,8 @@ int ds4_sessions_eval_speculative_sample_rn(
             fprintf(stderr, "%s%u", r == 0u ? "" : ",",
                     schedule_step.selected.prefix[r]);
         }
-        fprintf(stderr, " serial_prefix=");
+        fprintf(stderr, " shape_curve=%u/%u serial_prefix=",
+                shape_curve.hits, shape_curve.queries);
         for (uint32_t r = 0; r < request_count; r++) {
             fprintf(stderr, "%s%u", r == 0u ? "" : ",",
                     serial_prefix[r]);
@@ -38355,12 +38674,21 @@ int ds4_sessions_eval_speculative_sample_rn(
     const double verify_seconds = done - verify_t0;
     const double cycle_seconds = done - cycle_t0;
     bool pure_neural_cohort = true;
+    uint32_t observed_prefix[request_count];
     for (uint32_t r = 0; r < request_count; r++) {
+        observed_prefix[r] = total_drafted[r];
         if (total_drafted[r] != neural_drafted[r]) {
             pure_neural_cohort = false;
-            break;
         }
     }
+    const uint8_t observed_path_class = pure_neural_cohort
+        ? DS4_DSPARK_RN_PATH_NEURAL
+        : DS4_DSPARK_RN_PATH_HYBRID;
+    const uint64_t observed_shape =
+        dspark_rn_shape_hash(
+                observed_prefix, shape_curve.lane_context_bucket,
+                request_count);
+    const uint32_t observed_profile_rows = physical_rows;
 
     if (use_physical && rc == 0 && active_count != 0u) {
         if (pure_neural_cohort) {
@@ -38378,11 +38706,11 @@ int ds4_sessions_eval_speculative_sample_rn(
         dspark_rn_cost_profile_note(
                 owner,
                 DS4_DSPARK_RN_EXEC_PHYSICAL,
-                cost_path_class,
+                observed_path_class,
                 cost_context_bucket,
                 request_count,
-                physical_profile_rows,
-                physical_shape,
+                observed_profile_rows,
+                observed_shape,
                 verify_seconds);
     }
     if (!use_physical && rc == 0) {
@@ -38402,11 +38730,11 @@ int ds4_sessions_eval_speculative_sample_rn(
         dspark_rn_cost_profile_note(
                 owner,
                 DS4_DSPARK_RN_EXEC_SERIAL,
-                cost_path_class,
+                observed_path_class,
                 cost_context_bucket,
                 request_count,
-                serial_profile_rows,
-                serial_shape,
+                observed_profile_rows,
+                observed_shape,
                 verify_seconds);
     }
 

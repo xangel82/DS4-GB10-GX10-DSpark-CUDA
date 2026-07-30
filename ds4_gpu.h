@@ -955,6 +955,26 @@ int ds4_gpu_dspark_attention_heads_tensor(
         uint32_t              n_head,
         uint32_t              head_dim);
 
+/* Request-major DSpark attention for a physical R=n draft batch.  Main KV
+ * rings stay request-owned; draft Q/KV and output heads are contiguous in the
+ * shared transient arena. */
+int ds4_gpu_dspark_attention_rn_heads_tensor(
+        ds4_gpu_tensor              *heads,
+        ds4_gpu_tensor              *kv_context,
+        const void                  *model_map,
+        uint64_t                     model_size,
+        uint64_t                     sinks_offset,
+        const ds4_gpu_tensor        *q,
+        const ds4_gpu_tensor *const *main_kv,
+        const ds4_gpu_tensor        *draft_kv,
+        const uint32_t              *n_main,
+        const uint32_t              *main_start,
+        uint32_t                     request_count,
+        uint32_t                     main_cap,
+        uint32_t                     block_tokens,
+        uint32_t                     n_head,
+        uint32_t                     head_dim);
+
 int ds4_gpu_dspark_confidence_tensor(
         ds4_gpu_tensor       *out,
         const ds4_gpu_tensor *hidden,

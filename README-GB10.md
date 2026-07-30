@@ -561,6 +561,40 @@ atteso quando tre richieste condividono la banda della stessa GB10. Un controllo
 R=2 sulla build N=8 ha misurato `16,73` e `17,52 t/s`, confermando l'assenza di
 regressioni sul profilo predefinito.
 
+#### Drafter DSpark fisico R=n
+
+Il drafter non viene piu' eseguito lane per lane quando una coorte fisica
+contiene due o tre richieste. I cinque token non causali vengono appiattiti
+request-major e condividono embedding, Q/KV, i tre blocchi Transformer, FFN e
+vocabulary head. L'attention usa un solo gather e un solo lancio CUDA, ma legge
+ring KV privati; la coda Markov viene proiettata depth-major con W1/W2
+batchate, mantenendo sampling, confidence e cronologia separati per lane.
+
+Non e' stata aggiunta memoria permanente: logits e hidden Markov temporanei
+riusano l'arena routed-MoE quando quella fase e' terminata. Il percorso `R=1`
+resta quello consolidato e non entra nelle nuove funzioni. La regressione
+CUDA confronta l'attention fisica `R=3` con tre esecuzioni indipendenti,
+includendo ring di lunghezza e wrap diversi; la tolleranza massima e'
+`1e-6`.
+
+Su un carico ripetitivo lossless, con tre lane e HybridLC largo 16, il tratto
+omogeneo `R=3` ha prodotto:
+
+| Metrica per coorte R=3 | Prima | Drafter fisico | Delta |
+| --- | ---: | ---: | ---: |
+| DSpark draft | 29,762 ms | 25,628 ms | -13,9% |
+| Target verifier | 427,774 ms | 431,203 ms | +0,8% |
+| Ciclo completo | 457,536 ms | 456,831 ms | -0,2% |
+
+Gli hash greedy `R=1` e `R=3` coincidono con il baseline. Il throughput
+end-to-end resta piu' variabile del tempo per coorte: quando una lane termina
+prima, il batch passa a `R=2` e poi `R=1`, quindi il wall time non misura
+soltanto il nuovo kernel. Nei tre run ripetuti comparabili la mediana aggregata
+e' passata da 59,26 a 60,45 t/s (`+2,0%`), ma ulteriori run hanno mostrato
+oscillazioni maggiori quando le lane si disallineano. Il risultato robusto e'
+quindi la riduzione del 13,9% del drafter; il verifier target rimane il costo
+dominante e limita il beneficio strutturale sull'intero ciclo a circa l'1%.
+
 Questi numeri sono throughput aggregato: una singola GB10 non raddoppia la
 banda disponibile, quindi due client non mantengono ciascuno il rate R=1.
 Il risultato corretto da osservare e' la somma dei token completati divisa per
@@ -604,17 +638,17 @@ path fisico.
 Il default e':
 
 ```bash
-DS4_SERVER_DSPARK_LANES=2
+DS4_SERVER_DSPARK_LANES=3
+DS4_SERVER_DSPARK_HOT_LANES=2
 DS4_SERVER_DSPARK_COALESCE_US=500
 DS4_DSPARK_RN_MIN_PHYSICAL_ROWS=10
 ```
 
 `DS4_SERVER_DSPARK_LANES=1` ripristina il worker seriale consolidato. La seconda
 lane alloca il proprio contesto ma non duplica i pesi; nel canary a 262K ha
-richiesto circa 2,25 GiB di stato privato. Il coordinatore accetta anche
-`DS4_SERVER_DSPARK_LANES=3`: la terza lane viene allocata soltanto in questo
-profilo, mentre `R=4` resta escluso perche' non lascia un margine UMA sicuro sul
-GB10 da 128 GiB.
+richiesto circa 2,25-2,37 GiB di stato privato. Il terzo slot e' configurato per
+default ma resta elastico; `R=4` resta escluso perche' non lascia un margine UMA
+sicuro sul GB10 da 128 GiB.
 
 #### Stato operativo e limiti della release
 
@@ -632,6 +666,22 @@ DS4_SERVER_DSPARK_LANES=3
 DS4_SERVER_DSPARK_HOT_LANES=2
 DS4_SERVER_DSPARK_LANE_RESERVE_MB=1536
 ```
+
+La prima prova operativa a tre agenti non era in realta' un test `R=3`: con
+l'arena prefill precedente rimanevano circa 3,25 GiB disponibili, contro
+3,90 GiB necessari per una lane da 2368,66 MiB piu' la riserva. Il coordinatore
+ha quindi mantenuto correttamente `resident=2/3` e servito la terza
+conversazione attraverso il tier KV su disco.
+
+La correzione non riduce contesto o cache Q8->F16. Gli score indexer, gli
+ausili attention e i buffer routed-MoE hanno lifetime disgiunti e ora occupano
+una sola arena CUDA: a 262K/chunk 8192 l'arena misura 2850,06 MiB e sostituisce
+3968,06 MiB di allocazioni separate, recuperando 1118 MiB. I buffer di contesto
+riportati all'avvio scendono da 4214,65 a 3096,65 MiB. Con cache Q8->F16 ancora
+a 12 GiB, la terza frontier full-context e' stata attivata come
+`resident=3/3`; dopo l'allocazione restavano 2,70 GiB disponibili e swap zero.
+Un canary simultaneo da tre richieste e 256 token ha completato 768 token in
+19,455 secondi, pari a `39,48 t/s` aggregati.
 
 Nel test operativo finale con tre agenti la lane elastica e' stata attivata una
 sola volta e il server ha completato 7.123 cicli DSpark senza fallback

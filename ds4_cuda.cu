@@ -7379,6 +7379,136 @@ __global__ static void dspark_attention_kernel(
     }
 }
 
+enum {
+    DS4_CUDA_DSPARK_RN_MAX_REQUESTS = 4,
+};
+
+struct dspark_attention_rn_desc {
+    const float *main_kv[DS4_CUDA_DSPARK_RN_MAX_REQUESTS];
+    uint32_t n_main[DS4_CUDA_DSPARK_RN_MAX_REQUESTS];
+    uint32_t main_start[DS4_CUDA_DSPARK_RN_MAX_REQUESTS];
+};
+
+__global__ static void dspark_gather_kv_rn_kernel(
+        float *dst,
+        const float *draft_kv,
+        dspark_attention_rn_desc desc,
+        uint32_t request_count,
+        uint32_t main_cap,
+        uint32_t context_stride,
+        uint32_t block_tokens,
+        uint32_t head_dim) {
+    const uint64_t gid =
+        (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t request_stride =
+        (uint64_t)context_stride * head_dim;
+    const uint64_t n =
+        (uint64_t)request_count * request_stride;
+    if (gid >= n) return;
+    const uint32_t request = (uint32_t)(gid / request_stride);
+    const uint64_t within = gid % request_stride;
+    const uint32_t row = (uint32_t)(within / head_dim);
+    const uint32_t d = (uint32_t)(within % head_dim);
+    const uint32_t main_rows = desc.n_main[request];
+    if (row < main_rows) {
+        const uint32_t src_row =
+            (desc.main_start[request] + row) % main_cap;
+        dst[gid] =
+            desc.main_kv[request][(uint64_t)src_row * head_dim + d];
+    } else if (row < main_rows + block_tokens) {
+        const uint32_t draft_row =
+            request * block_tokens + row - main_rows;
+        dst[gid] =
+            draft_kv[(uint64_t)draft_row * head_dim + d];
+    }
+}
+
+__global__ static void dspark_attention_rn_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *kv_context,
+        dspark_attention_rn_desc desc,
+        uint32_t request_count,
+        uint32_t context_stride,
+        uint32_t block_tokens,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const uint32_t physical_row = blockIdx.x;
+    const uint32_t h = blockIdx.y;
+    const uint32_t total_rows = request_count * block_tokens;
+    if (physical_row >= total_rows || h >= n_head) return;
+    const uint32_t request = physical_row / block_tokens;
+    const uint32_t n_keys =
+        desc.n_main[request] + block_tokens;
+    if (n_keys > 256u) return;
+    const float *qh =
+        q + ((uint64_t)physical_row * n_head + h) * head_dim;
+    const float *kv =
+        kv_context +
+        (uint64_t)request * context_stride * head_dim;
+    __shared__ float scores[256];
+    __shared__ float partial[256];
+    __shared__ float max_s;
+    __shared__ float denom;
+    const float scale = rsqrtf((float)head_dim);
+    float local_max = sinks[h];
+    for (uint32_t r = threadIdx.x; r < n_keys; r += blockDim.x) {
+        const float *kr = kv + (uint64_t)r * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) {
+            dot += qh[d] * kr[d];
+        }
+        const float s = dot * scale;
+        scores[r] = s;
+        local_max = fmaxf(local_max, s);
+    }
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1;
+         stride > 0;
+         stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] = fmaxf(
+                    partial[threadIdx.x],
+                    partial[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) max_s = partial[0];
+    __syncthreads();
+    float den_local = 0.0f;
+    for (uint32_t r = threadIdx.x; r < n_keys; r += blockDim.x) {
+        const float p = expf(scores[r] - max_s);
+        scores[r] = p;
+        den_local += p;
+    }
+    partial[threadIdx.x] = den_local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1;
+         stride > 0;
+         stride >>= 1) {
+        if (threadIdx.x < stride) {
+            partial[threadIdx.x] += partial[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        denom = partial[0] + expf(sinks[h] - max_s);
+    }
+    __syncthreads();
+    float *oh =
+        heads + ((uint64_t)physical_row * n_head + h) * head_dim;
+    for (uint32_t d = threadIdx.x; d < head_dim;
+         d += blockDim.x) {
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < n_keys; r++) {
+            acc += kv[(uint64_t)r * head_dim + d] * scores[r];
+        }
+        oh[d] = acc / denom;
+    }
+}
+
 __global__ static void dspark_confidence_kernel(
         float        *out,
         const float  *hidden,
@@ -16706,6 +16836,111 @@ extern "C" int ds4_gpu_dspark_attention_heads_tensor(
             n_head,
             head_dim);
     return cuda_ok(cudaGetLastError(), "dspark attention launch");
+}
+
+extern "C" int ds4_gpu_dspark_attention_rn_heads_tensor(
+        ds4_gpu_tensor              *heads,
+        ds4_gpu_tensor              *kv_context,
+        const void                  *model_map,
+        uint64_t                     model_size,
+        uint64_t                     sinks_offset,
+        const ds4_gpu_tensor        *q,
+        const ds4_gpu_tensor *const *main_kv,
+        const ds4_gpu_tensor        *draft_kv,
+        const uint32_t              *n_main,
+        const uint32_t              *main_start,
+        uint32_t                     request_count,
+        uint32_t                     main_cap,
+        uint32_t                     block_tokens,
+        uint32_t                     n_head,
+        uint32_t                     head_dim) {
+    if (!heads || !kv_context || !model_map || !q || !main_kv ||
+        !draft_kv || !n_main || !main_start ||
+        request_count < 2u ||
+        request_count > DS4_CUDA_DSPARK_RN_MAX_REQUESTS ||
+        main_cap == 0u || block_tokens == 0u ||
+        main_cap + block_tokens > 256u ||
+        sinks_offset > model_size ||
+        (uint64_t)n_head * sizeof(float) >
+            model_size - sinks_offset) {
+        return 0;
+    }
+    const uint32_t total_rows = request_count * block_tokens;
+    const uint32_t context_stride = main_cap + block_tokens;
+    const uint64_t head_bytes =
+        (uint64_t)total_rows * n_head * head_dim * sizeof(float);
+    const uint64_t draft_bytes =
+        (uint64_t)total_rows * head_dim * sizeof(float);
+    const uint64_t context_bytes =
+        (uint64_t)request_count * context_stride * head_dim *
+        sizeof(float);
+    if (heads->bytes < head_bytes || q->bytes < head_bytes ||
+        draft_kv->bytes < draft_bytes ||
+        kv_context->bytes < context_bytes) {
+        return 0;
+    }
+
+    dspark_attention_rn_desc desc = {};
+    for (uint32_t r = 0; r < request_count; r++) {
+        if (!main_kv[r] || n_main[r] == 0u ||
+            n_main[r] > main_cap || main_start[r] >= main_cap ||
+            main_kv[r]->bytes <
+                (uint64_t)main_cap * head_dim * sizeof(float)) {
+            return 0;
+        }
+        desc.main_kv[r] = (const float *)main_kv[r]->ptr;
+        desc.n_main[r] = n_main[r];
+        desc.main_start[r] = main_start[r];
+    }
+    const float *sinks = (const float *)cuda_model_range_ptr(
+            model_map,
+            sinks_offset,
+            (uint64_t)n_head * sizeof(float),
+            "dspark_rn_attn_sinks");
+    if (!sinks) return 0;
+
+    const uint64_t gather_count =
+        (uint64_t)request_count * context_stride * head_dim;
+    dspark_gather_kv_rn_kernel<<<
+            (gather_count + 255u) / 256u, 256>>>(
+            (float *)kv_context->ptr,
+            (const float *)draft_kv->ptr,
+            desc,
+            request_count,
+            main_cap,
+            context_stride,
+            block_tokens,
+            head_dim);
+    if (!cuda_ok(
+                cudaGetLastError(),
+                "dspark R=n gather kv launch")) {
+        return 0;
+    }
+    dim3 grid(total_rows, n_head, 1);
+    dspark_attention_rn_kernel<<<grid, 256>>>(
+            (float *)heads->ptr,
+            sinks,
+            (const float *)q->ptr,
+            (const float *)kv_context->ptr,
+            desc,
+            request_count,
+            context_stride,
+            block_tokens,
+            n_head,
+            head_dim);
+    if (!cuda_ok(
+                cudaGetLastError(),
+                "dspark R=n attention launch")) {
+        return 0;
+    }
+    static bool reported = false;
+    if (!reported) {
+        reported = true;
+        fprintf(stderr,
+                "ds4: CUDA physical R=n DSpark attention enabled "
+                "(single gather + single attention launch, private KV)\n");
+    }
+    return 1;
 }
 
 extern "C" int ds4_gpu_dspark_confidence_tensor(

@@ -11146,13 +11146,37 @@ static uint64_t metal_graph_indexer_scratch_bytes(uint64_t comp_cap,
         getenv("DS4_PREFILL_DENSE_COMP_MASK") != NULL ? prefill_cap : 1u;
     const uint64_t score_bytes =
         comp_cap * prefill_cap * sizeof(float);
-    const uint64_t moe_gate_up_mid_bytes =
-        3u * prefill_cap * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float);
-    const bool score_alias =
-        getenv("DS4_PREFILL_NO_SCRATCH_ALIAS") == NULL &&
-        score_bytes <= moe_gate_up_mid_bytes;
+    if (getenv("DS4_PREFILL_NO_SCRATCH_ALIAS") != NULL) {
+        return comp_cap * comp_mask_rows * sizeof(float) + score_bytes;
+    }
+
+    const uint64_t routed_mid_bytes =
+        prefill_cap * DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float);
+    const uint64_t routed_arena_bytes =
+        3u * routed_mid_bytes +
+        prefill_cap * DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float);
+    const uint64_t q_half_bytes =
+        prefill_cap * DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(uint16_t);
+    const uint64_t indexer_query_bytes = DS4_GPU_INDEXER_PACKED
+        ? prefill_cap * DS4_N_INDEXER_HEAD *
+              DS4_N_INDEXER_HEAD_DIM * sizeof(float)
+        : 0u;
+    const uint64_t indexer_query_packed_bytes = DS4_GPU_INDEXER_PACKED
+        ? prefill_cap * DS4_N_INDEXER_HEAD *
+              DS4_GPU_INDEXER_FP4_ROW_BYTES
+        : 0u;
+    const uint64_t indexer_phase_bytes =
+        score_bytes + q_half_bytes +
+        indexer_query_bytes + indexer_query_packed_bytes;
+    const uint64_t unified_arena_bytes =
+        routed_arena_bytes > indexer_phase_bytes
+            ? routed_arena_bytes
+            : indexer_phase_bytes;
+    const uint64_t incremental_bytes =
+        unified_arena_bytes - routed_arena_bytes;
+
     return comp_cap * comp_mask_rows * sizeof(float) +
-           (score_alias ? 0u : score_bytes);
+           incremental_bytes;
 }
 
 static uint64_t metal_graph_context_bytes_for_kv_policy(
@@ -11696,11 +11720,23 @@ static bool metal_graph_alloc_raw_cap(
         3u * batch_routed_mid_bytes;
     const uint64_t batch_routed_arena_bytes =
         batch_routed_prefix_bytes + batch_routed_down_bytes;
-    const uint64_t batch_routed_owner_bytes = alias_batch_scratch
-        ? batch_routed_arena_bytes
-        : batch_routed_mid_bytes;
     const uint64_t indexer_scores_bytes =
         (uint64_t)g->comp_cap * pc * sizeof(float);
+    const uint64_t indexer_q_half_offset = indexer_scores_bytes;
+    const uint64_t indexer_query_offset =
+        indexer_q_half_offset + batch_q_half_bytes;
+    const uint64_t indexer_query_packed_offset =
+        indexer_query_offset + batch_indexer_q_bytes;
+    const uint64_t indexer_phase_bytes =
+        indexer_query_offset +
+        (DS4_GPU_INDEXER_PACKED
+             ? batch_indexer_q_bytes + batch_indexer_q_packed_bytes
+             : 0u);
+    const uint64_t batch_routed_owner_bytes = alias_batch_scratch
+        ? (batch_routed_arena_bytes > indexer_phase_bytes
+               ? batch_routed_arena_bytes
+               : indexer_phase_bytes)
+        : batch_routed_mid_bytes;
 
     g->prefill_tokens = ds4_gpu_tensor_alloc(pc * sizeof(int32_t));
     g->batch_cur_hc = ds4_gpu_tensor_alloc(pc * hc_dim * sizeof(float));
@@ -11716,9 +11752,9 @@ static bool metal_graph_alloc_raw_cap(
     g->batch_qr_norm = ds4_gpu_tensor_alloc(pc * q_rank * sizeof(float));
     /*
      * Attention/indexer and routed MoE are consecutive phases of a layer.
-     * Keep their large temporaries in one arena: scores occupy the gate/up/mid
-     * prefix while the indexer runs, then routed MoE overwrites that prefix.
-     * The packed/F32 indexer query remains in the disjoint down region.
+     * Reserve one arena for the larger phase. Indexer scores occupy its prefix;
+     * Q-half and the F32/packed indexer queries follow in a disjoint tail.
+     * Routed MoE then reuses the arena from offset zero for gate/up/mid/down.
      */
     g->batch_routed_gate = ds4_gpu_tensor_alloc(batch_routed_owner_bytes);
     g->batch_routed_up = metal_graph_tensor_alias_or_alloc(
@@ -11736,9 +11772,7 @@ static bool metal_graph_alloc_raw_cap(
             batch_routed_prefix_bytes,
             batch_routed_down_bytes,
             alias_batch_scratch);
-    const bool indexer_scores_can_alias =
-        alias_batch_scratch && indexer_scores_bytes <= batch_routed_prefix_bytes;
-    ds4_gpu_tensor *indexer_scores_view = indexer_scores_can_alias
+    ds4_gpu_tensor *indexer_scores_view = alias_batch_scratch
         ? ds4_gpu_tensor_view(g->batch_routed_gate, 0, indexer_scores_bytes)
         : NULL;
     g->indexer_scores = indexer_scores_view;
@@ -11747,28 +11781,38 @@ static bool metal_graph_alloc_raw_cap(
     }
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (indexer_scores_view) {
+        const uint64_t independent_bytes =
+            batch_routed_arena_bytes + indexer_scores_bytes;
+        const uint64_t saved_bytes =
+            independent_bytes > batch_routed_owner_bytes
+                ? independent_bytes - batch_routed_owner_bytes
+                : 0u;
         fprintf(stderr,
-                "ds4: CUDA shared indexer-score/MoE prefill arena active "
-                "(alias=%.2f MiB)\n",
-                (double)indexer_scores_bytes / 1048576.0);
+                "ds4: CUDA unified indexer/attention/MoE prefill arena active "
+                "(arena=%.2f MiB saved=%.2f MiB)\n",
+                (double)batch_routed_owner_bytes / 1048576.0,
+                (double)saved_bytes / 1048576.0);
     }
 #endif
     g->batch_q_half = metal_graph_tensor_alias_or_alloc(
-            g->batch_routed_down, 0, batch_q_half_bytes, alias_batch_scratch);
+            g->batch_routed_gate,
+            indexer_q_half_offset,
+            batch_q_half_bytes,
+            alias_batch_scratch);
     g->batch_kv_raw = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
     g->batch_kv = ds4_gpu_tensor_alloc(pc * DS4_N_HEAD_DIM * sizeof(float));
     g->batch_comp_kv = ds4_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
     g->batch_comp_sc = ds4_gpu_tensor_alloc(pc * comp_width_max * sizeof(float));
     g->batch_indexer_q = DS4_GPU_INDEXER_PACKED
-        ? metal_graph_tensor_alias_or_alloc(g->batch_routed_down,
-                                             0,
+        ? metal_graph_tensor_alias_or_alloc(g->batch_routed_gate,
+                                             indexer_query_offset,
                                              batch_indexer_q_bytes,
                                              alias_batch_scratch)
         : ds4_gpu_tensor_alloc(batch_indexer_q_bytes);
     if (DS4_GPU_INDEXER_PACKED) {
         g->batch_indexer_q_packed = metal_graph_tensor_alias_or_alloc(
-                g->batch_routed_down,
-                batch_indexer_q_bytes,
+                g->batch_routed_gate,
+                indexer_query_packed_offset,
                 batch_indexer_q_packed_bytes,
                 alias_batch_scratch);
     }
@@ -25011,12 +25055,218 @@ typedef struct {
     uint32_t physical_offset;
 } metal_physical_draft_request;
 
+enum {
+    DS4_PHYSICAL_DSPARK_MAX_REQUESTS = 4,
+};
+
+/* Markov correction is causal inside each request, but requests at the same
+ * depth are independent. Reuse the now-idle routed-MoE arena to project all
+ * active Markov rows through W2 once, then sample into each private lane. */
+static bool metal_graph_encode_dspark_markov_tail_rn(
+        ds4_gpu_graph                *scratch,
+        const ds4_model              *dspark_model,
+        const ds4_dspark_weights     *dspark,
+        metal_physical_draft_request *requests,
+        uint32_t                      request_count,
+        uint32_t                      block_tokens) {
+    if (!scratch || !dspark_model || !dspark || !requests ||
+        request_count < 2u ||
+        request_count > DS4_PHYSICAL_DSPARK_MAX_REQUESTS ||
+        block_tokens == 0u || block_tokens > DS4_DSPARK_BLOCK_SIZE) {
+        return false;
+    }
+
+    const uint64_t delta_row_bytes =
+        (uint64_t)DS4_N_VOCAB * sizeof(float);
+    const uint64_t delta_bytes =
+        (uint64_t)request_count * delta_row_bytes;
+    const uint64_t hidden_row_bytes =
+        (uint64_t)DS4_DSPARK_MARKOV_RANK * sizeof(float);
+    const uint64_t hidden_offset = (delta_bytes + 255u) & ~255ull;
+    const uint64_t hidden_bytes =
+        (uint64_t)request_count * hidden_row_bytes;
+    if (!scratch->batch_routed_gate ||
+        ds4_gpu_tensor_bytes(scratch->batch_routed_gate) <
+            hidden_offset + hidden_bytes) {
+        return false;
+    }
+
+    ds4_gpu_tensor *tokens = ds4_gpu_tensor_view(
+            scratch->prefill_tokens,
+            0,
+            (uint64_t)request_count * sizeof(int32_t));
+    ds4_gpu_tensor *hidden = ds4_gpu_tensor_view(
+            scratch->batch_routed_gate,
+            hidden_offset,
+            hidden_bytes);
+    ds4_gpu_tensor *delta = ds4_gpu_tensor_view(
+            scratch->batch_routed_gate,
+            0,
+            delta_bytes);
+    bool ok = tokens && hidden && delta;
+
+    for (uint32_t depth = 0; ok && depth < block_tokens; depth++) {
+        uint32_t active[DS4_PHYSICAL_DSPARK_MAX_REQUESTS];
+        uint32_t active_count = 0u;
+        for (uint32_t r = 0; r < request_count; r++) {
+            if (depth < requests[r].proposal_tokens) {
+                active[active_count++] = r;
+            }
+        }
+        if (active_count == 0u) continue;
+
+        for (uint32_t slot = 0; ok && slot < active_count; slot++) {
+            const metal_physical_draft_request *request =
+                &requests[active[slot]];
+            ok = ds4_gpu_tensor_copy_async(
+                    tokens,
+                    (uint64_t)slot * sizeof(int32_t),
+                    request->state->dspark_tokens,
+                    (uint64_t)depth * sizeof(int32_t),
+                    sizeof(int32_t)) != 0;
+        }
+        if (ok) {
+            ok = ds4_gpu_embed_tokens_hc_tensor(
+                    hidden,
+                    tokens,
+                    dspark_model->map,
+                    dspark_model->size,
+                    dspark->markov_w1->abs_offset,
+                    DS4_N_VOCAB,
+                    active_count,
+                    DS4_DSPARK_MARKOV_RANK,
+                    1) != 0;
+        }
+        if (ok) {
+            ok = ds4_gpu_matmul_f16_tensor(
+                    delta,
+                    dspark_model->map,
+                    dspark_model->size,
+                    dspark->markov_w2->abs_offset,
+                    DS4_DSPARK_MARKOV_RANK,
+                    DS4_N_VOCAB,
+                    hidden,
+                    active_count) != 0;
+        }
+
+        for (uint32_t slot = 0; ok && slot < active_count; slot++) {
+            metal_physical_draft_request *request =
+                &requests[active[slot]];
+            ds4_gpu_tensor *base_row = ds4_gpu_tensor_view(
+                    scratch->spec_logits,
+                    ((uint64_t)request->physical_offset + depth) *
+                        delta_row_bytes,
+                    delta_row_bytes);
+            ds4_gpu_tensor *delta_row = ds4_gpu_tensor_view(
+                    delta,
+                    (uint64_t)slot * delta_row_bytes,
+                    delta_row_bytes);
+            ds4_gpu_tensor *token_out = ds4_gpu_tensor_view(
+                    request->state->dspark_tokens,
+                    (uint64_t)(depth + 1u) * sizeof(int32_t),
+                    sizeof(int32_t));
+            ds4_gpu_tensor *prob_row =
+                request->stochastic_rejection
+                ? ds4_gpu_tensor_view(
+                      request->state->dspark_draft_probs,
+                      (uint64_t)depth * delta_row_bytes,
+                      delta_row_bytes)
+                : NULL;
+            ds4_gpu_tensor *uniform_row =
+                request->stochastic_rejection
+                ? ds4_gpu_tensor_view(
+                      request->state->dspark_sample_uniforms,
+                      (uint64_t)depth * sizeof(float),
+                      sizeof(float))
+                : NULL;
+            ok = base_row && delta_row && token_out &&
+                 (!request->stochastic_rejection ||
+                  (prob_row && uniform_row));
+            if (ok) {
+                ok = ds4_gpu_tensor_copy_async(
+                        request->state->dspark_markov_hidden,
+                        (uint64_t)depth * hidden_row_bytes,
+                        hidden,
+                        (uint64_t)slot * hidden_row_bytes,
+                        hidden_row_bytes) != 0;
+            }
+            if (ok) {
+                ok = ds4_gpu_add_tensor(
+                        delta_row,
+                        base_row,
+                        delta_row,
+                        DS4_N_VOCAB) != 0;
+            }
+            if (ok && request->stochastic_rejection) {
+                ok = ds4_gpu_sample_min_p_tensor(
+                        token_out,
+                        prob_row,
+                        delta_row,
+                        uniform_row,
+                        DS4_N_VOCAB,
+                        request->temperature,
+                        request->min_p) != 0;
+            } else if (ok) {
+                ok = ds4_gpu_argmax_tensor(
+                        token_out,
+                        delta_row,
+                        DS4_N_VOCAB) != 0;
+            }
+            ds4_gpu_tensor_free(uniform_row);
+            ds4_gpu_tensor_free(prob_row);
+            ds4_gpu_tensor_free(token_out);
+            ds4_gpu_tensor_free(delta_row);
+            ds4_gpu_tensor_free(base_row);
+        }
+    }
+
+    for (uint32_t r = 0; ok && r < request_count; r++) {
+        metal_physical_draft_request *request = &requests[r];
+        ds4_gpu_tensor *state_rows = ds4_gpu_tensor_view(
+                getenv("DS4_DSPARK_CONFIDENCE_POST_NORM") != NULL
+                    ? scratch->batch_ffn_norm
+                    : scratch->batch_ffn_cur,
+                (uint64_t)request->physical_offset *
+                    DS4_N_EMBD * sizeof(float),
+                (uint64_t)request->proposal_tokens *
+                    DS4_N_EMBD * sizeof(float));
+        ok = state_rows != NULL;
+        if (ok) {
+            ok = ds4_gpu_dspark_confidence_tensor(
+                    request->state->dspark_confidence,
+                    state_rows,
+                    request->state->dspark_markov_hidden,
+                    dspark_model->map,
+                    dspark_model->size,
+                    dspark->confidence_proj->abs_offset,
+                    request->proposal_tokens,
+                    DS4_N_EMBD,
+                    DS4_DSPARK_MARKOV_RANK) != 0;
+        }
+        ds4_gpu_tensor_free(state_rows);
+    }
+
+    ds4_gpu_tensor_free(delta);
+    ds4_gpu_tensor_free(hidden);
+    ds4_gpu_tensor_free(tokens);
+    if (ok) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            fprintf(stderr,
+                    "ds4: CUDA physical R=n Markov tail enabled "
+                    "(depth-major W2 batching, private sampling/confidence)\n");
+        }
+    }
+    return ok;
+}
+
 /* The three DSpark Transformer blocks use request-private 128-row KV rings,
  * but all dense/FFN weights and transient activations are shared. Flatten the
  * five-row blocks request-major, preserve independent attention views, and run
  * each FFN plus the target vocabulary head once for the whole physical batch.
- * The causal Markov tails remain independent and are queued on the same stream
- * using lane-private sub-MiB buffers. */
+ * Markov state and sampling remain private, while W1/W2 are projected
+ * depth-major across the active requests in the shared transient arena. */
 static bool metal_graph_eval_dspark_draft_rn(
         ds4_gpu_graph                *scratch,
         const ds4_model              *base_model,
@@ -25028,7 +25278,7 @@ static bool metal_graph_eval_dspark_draft_rn(
         uint32_t                      block_tokens) {
     if (!scratch || !base_model || !base_weights || !dspark_model ||
         !dspark || !requests || request_count < 2u ||
-        request_count > DS4_DSPARK_SCHEDULER_MAX_REQUESTS ||
+        request_count > DS4_PHYSICAL_DSPARK_MAX_REQUESTS ||
         block_tokens == 0u || block_tokens > DS4_DSPARK_BLOCK_SIZE ||
         request_count > UINT32_MAX / block_tokens) {
         return false;
@@ -25040,6 +25290,9 @@ static bool metal_graph_eval_dspark_draft_rn(
     }
 
     int32_t row_tokens[DS4_DSPARK_SCHEDULER_MAX_ROWS];
+    uint32_t row_positions[DS4_DSPARK_SCHEDULER_MAX_ROWS];
+    const char *failure_stage = "validate";
+    int32_t failure_block = -1;
     bool ok = true;
     for (uint32_t r = 0; ok && r < request_count; r++) {
         metal_physical_draft_request *request = &requests[r];
@@ -25083,6 +25336,8 @@ static bool metal_graph_eval_dspark_draft_rn(
         }
         for (uint32_t i = 0; i < block_tokens; i++) {
             row_tokens[request->physical_offset + i] = token_ids[i];
+            row_positions[request->physical_offset + i] =
+                request->position + i;
         }
         ok = ds4_gpu_tensor_write(
                 state->dspark_tokens, 0, token_ids,
@@ -25106,15 +25361,35 @@ static bool metal_graph_eval_dspark_draft_rn(
                 scratch, total_rows);
         if (ok) scratch->spec_logits = scratch->physical_spec_logits;
     }
+    ds4_gpu_tensor *positions = ok
+        ? ds4_gpu_tensor_view(
+              scratch->spec_logits,
+              0,
+              (uint64_t)total_rows * sizeof(row_positions[0]))
+        : NULL;
     if (ok) {
+        failure_stage = "positions";
+        ok = positions &&
+             ds4_gpu_tensor_write(
+                 positions,
+                 0,
+                 row_positions,
+                 (uint64_t)total_rows * sizeof(row_positions[0])) != 0;
+    }
+    if (ok) {
+        failure_stage = "tokens";
         ok = ds4_gpu_tensor_write(
                 scratch->prefill_tokens,
                 0,
                 row_tokens,
                 (uint64_t)total_rows * sizeof(row_tokens[0])) != 0;
     }
-    if (ok) ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
+        failure_stage = "begin-commands";
+        ok = ds4_gpu_begin_commands() != 0;
+    }
+    if (ok) {
+        failure_stage = "embedding";
         ok = ds4_gpu_embed_tokens_hc_tensor(
                 scratch->batch_cur_hc,
                 scratch->prefill_tokens,
@@ -25127,47 +25402,85 @@ static bool metal_graph_eval_dspark_draft_rn(
                 DS4_N_HC) != 0;
     }
 
+    const bool saved_dspark_attention_mode =
+        scratch->dspark_attention_mode;
+    const uint32_t saved_dspark_block = scratch->dspark_block;
     for (uint32_t block = 0;
          ok && block < DS4_DSPARK_N_BLOCK;
          block++) {
-        bool ffn_hc_norm_f16_ready = true;
+        failure_block = (int32_t)block;
+        scratch->dspark_attention_mode = true;
+        scratch->dspark_block = block;
+        failure_stage = "attention-qkv";
+        ok = metal_graph_encode_layer_attention_batch_impl(
+                scratch,
+                dspark_model,
+                &dspark->block[block],
+                0,
+                requests[0].position,
+                total_rows,
+                false,
+                false,
+                true,
+                positions,
+                false,
+                true,
+                NULL,
+                NULL);
+
+        const ds4_gpu_tensor
+            *main_kv[DS4_PHYSICAL_DSPARK_MAX_REQUESTS] = {0};
+        uint32_t n_main[DS4_PHYSICAL_DSPARK_MAX_REQUESTS] = {0};
+        uint32_t main_start[DS4_PHYSICAL_DSPARK_MAX_REQUESTS] = {0};
         for (uint32_t r = 0; ok && r < request_count; r++) {
+            failure_stage = "attention-descriptor";
             metal_physical_draft_request *request = &requests[r];
-            metal_graph_attention_row_view view;
-            ok = metal_graph_attention_row_view_init(
-                    &view,
-                    request->state,
-                    scratch,
-                    &dspark->block[block],
-                    request->physical_offset,
-                    block_tokens);
-            bool request_ffn_f16_ready = false;
+            n_main[r] = request->state->dspark_n_raw;
+            main_kv[r] =
+                request->state->dspark_raw_cache[block];
+            ok = n_main[r] != 0u &&
+                 n_main[r] <= DS4_DSPARK_WINDOW &&
+                 request->position >= n_main[r] &&
+                 main_kv[r] != NULL;
             if (ok) {
-                view.graph.dspark_attention_mode = true;
-                view.graph.dspark_suspend_capture = true;
-                view.graph.dspark_block = block;
-                ok = metal_graph_encode_layer_attention_batch(
-                        &view.graph,
-                        dspark_model,
-                        &dspark->block[block],
-                        0,
-                        request->position,
-                        block_tokens,
-                        false,
-                        &request_ffn_f16_ready);
-                if (ok) {
-                    metal_graph_attention_row_view_commit(
-                            request->state, &view);
-                }
-                ffn_hc_norm_f16_ready =
-                    ffn_hc_norm_f16_ready &&
-                    request_ffn_f16_ready;
-                metal_graph_attention_row_view_free(&view);
+                main_start[r] =
+                    (request->position - n_main[r]) %
+                    DS4_DSPARK_WINDOW;
             }
+        }
+        if (ok) {
+            failure_stage = "attention-core";
+            ok = ds4_gpu_dspark_attention_rn_heads_tensor(
+                    scratch->batch_heads,
+                    scratch->batch_ffn_cur,
+                    dspark_model->map,
+                    dspark_model->size,
+                    dspark->block[block].attn_sinks->abs_offset,
+                    scratch->batch_q,
+                    main_kv,
+                    scratch->batch_kv,
+                    n_main,
+                    main_start,
+                    request_count,
+                    DS4_DSPARK_WINDOW,
+                    block_tokens,
+                    DS4_N_HEAD,
+                    DS4_N_HEAD_DIM) != 0;
+        }
+        if (ok) {
+            failure_stage = "attention-output";
+            ok = metal_graph_encode_layer_attention_output_rn(
+                    scratch,
+                    dspark_model,
+                    &dspark->block[block],
+                    0,
+                    total_rows,
+                    positions);
         }
 
         bool next_hc_norm_f16_ready = false;
         if (ok) {
+            failure_stage = "ffn";
             ok = metal_graph_encode_layer_ffn_batch(
                     scratch,
                     dspark_model,
@@ -25175,7 +25488,7 @@ static bool metal_graph_eval_dspark_draft_rn(
                     0,
                     requests[0].position,
                     total_rows,
-                    ffn_hc_norm_f16_ready,
+                    false,
                     &next_hc_norm_f16_ready);
         }
         if (ok) {
@@ -25184,8 +25497,12 @@ static bool metal_graph_eval_dspark_draft_rn(
             scratch->batch_next_hc = tmp;
         }
     }
+    scratch->dspark_attention_mode =
+        saved_dspark_attention_mode;
+    scratch->dspark_block = saved_dspark_block;
 
     if (ok) {
+        failure_stage = "output-head";
         ok = metal_graph_encode_dspark_output_head(
                 scratch,
                 base_model,
@@ -25194,47 +25511,23 @@ static bool metal_graph_eval_dspark_draft_rn(
                 dspark,
                 total_rows);
     }
-    for (uint32_t r = 0; ok && r < request_count; r++) {
-        metal_physical_draft_request *request = &requests[r];
-        ds4_gpu_graph tail = *request->state;
-        tail.prefill_cap = block_tokens;
-        tail.spec_logits = ds4_gpu_tensor_view(
-                scratch->spec_logits,
-                (uint64_t)request->physical_offset *
-                    DS4_N_VOCAB * sizeof(float),
-                (uint64_t)block_tokens *
-                    DS4_N_VOCAB * sizeof(float));
-        tail.batch_ffn_cur = ds4_gpu_tensor_view(
-                scratch->batch_ffn_cur,
-                (uint64_t)request->physical_offset *
-                    DS4_N_EMBD * sizeof(float),
-                (uint64_t)block_tokens *
-                    DS4_N_EMBD * sizeof(float));
-        tail.batch_ffn_norm = ds4_gpu_tensor_view(
-                scratch->batch_ffn_norm,
-                (uint64_t)request->physical_offset *
-                    DS4_N_EMBD * sizeof(float),
-                (uint64_t)block_tokens *
-                    DS4_N_EMBD * sizeof(float));
-        ok = tail.spec_logits && tail.batch_ffn_cur &&
-             tail.batch_ffn_norm;
-        if (ok) {
-            ok = metal_graph_encode_dspark_markov_tail(
-                    &tail,
-                    dspark_model,
-                    dspark,
-                    request->proposal_tokens,
-                    request->stochastic_rejection,
-                    request->temperature,
-                    request->min_p);
-        }
-        ds4_gpu_tensor_free(tail.batch_ffn_norm);
-        ds4_gpu_tensor_free(tail.batch_ffn_cur);
-        ds4_gpu_tensor_free(tail.spec_logits);
+    if (ok) {
+        failure_stage = "markov-tail";
+        ok = metal_graph_encode_dspark_markov_tail_rn(
+                scratch,
+                dspark_model,
+                dspark,
+                requests,
+                request_count,
+                block_tokens);
     }
 
-    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (ok) {
+        failure_stage = "end-commands";
+        ok = ds4_gpu_end_commands() != 0;
+    }
     for (uint32_t r = 0; ok && r < request_count; r++) {
+        failure_stage = "read-draft";
         metal_physical_draft_request *request = &requests[r];
         ok = ds4_gpu_tensor_read(
                 request->state->dspark_tokens,
@@ -25243,6 +25536,7 @@ static bool metal_graph_eval_dspark_draft_rn(
                 (uint64_t)request->proposal_tokens *
                     sizeof(request->drafts[0])) != 0;
         if (ok) {
+            failure_stage = "read-confidence";
             ok = ds4_gpu_tensor_read(
                     request->state->dspark_confidence,
                     0,
@@ -25251,7 +25545,17 @@ static bool metal_graph_eval_dspark_draft_rn(
                         sizeof(request->confidence[0])) != 0;
         }
     }
-    if (!ok) (void)ds4_gpu_synchronize();
+    if (!ok) {
+        fprintf(stderr,
+                "ds4: CUDA physical R=n DSpark drafter stage failed "
+                "stage=%s block=%d requests=%u rows=%u\n",
+                failure_stage,
+                failure_block,
+                request_count,
+                total_rows);
+        (void)ds4_gpu_synchronize();
+    }
+    ds4_gpu_tensor_free(positions);
     scratch->spec_logits = saved_spec_logits;
     if (ok) {
         static bool reported = false;

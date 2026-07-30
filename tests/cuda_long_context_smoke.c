@@ -622,6 +622,184 @@ static int check_decode_attention_overflow_path(void) {
     return rc;
 }
 
+static int check_physical_rn_dspark_attention(void) {
+    enum {
+        REQUESTS = 3,
+        BLOCK_TOKENS = 5,
+        N_HEAD = 2,
+        HEAD_DIM = 8,
+        MAIN_CAP = 8,
+        CONTEXT_STRIDE = MAIN_CAP + BLOCK_TOKENS,
+    };
+    const uint32_t n_main[REQUESTS] = {6, 7, 8};
+    const uint32_t main_start[REQUESTS] = {2, 5, 1};
+    const uint32_t total_rows = REQUESTS * BLOCK_TOKENS;
+    const uint64_t head_count =
+        (uint64_t)total_rows * N_HEAD * HEAD_DIM;
+    const uint64_t draft_count =
+        (uint64_t)total_rows * HEAD_DIM;
+    const uint64_t main_count =
+        (uint64_t)MAIN_CAP * HEAD_DIM;
+    static float sinks_page[1024] __attribute__((aligned(4096)));
+    float *sinks = sinks_page;
+    sinks[0] = -0.25f;
+    sinks[1] = 0.125f;
+
+    float q_host[head_count];
+    float draft_host[draft_count];
+    float main_host[REQUESTS][main_count];
+    float rn_host[head_count];
+    float ref_host[head_count];
+    for (uint64_t i = 0; i < head_count; i++) {
+        q_host[i] =
+            ((float)((i * 17u) % 43u) - 21.0f) / 29.0f;
+    }
+    for (uint64_t i = 0; i < draft_count; i++) {
+        draft_host[i] =
+            ((float)((i * 13u) % 37u) - 18.0f) / 23.0f;
+    }
+    for (uint32_t r = 0; r < REQUESTS; r++) {
+        for (uint64_t i = 0; i < main_count; i++) {
+            main_host[r][i] =
+                ((float)(((i + 11u * r) * 19u) % 47u) - 23.0f) /
+                31.0f;
+        }
+    }
+    memset(rn_host, 0, sizeof(rn_host));
+    memset(ref_host, 0, sizeof(ref_host));
+
+    ds4_gpu_tensor *heads_rn =
+        ds4_gpu_tensor_alloc(sizeof(rn_host));
+    ds4_gpu_tensor *heads_ref =
+        ds4_gpu_tensor_alloc(sizeof(ref_host));
+    ds4_gpu_tensor *q =
+        ds4_gpu_tensor_alloc(sizeof(q_host));
+    ds4_gpu_tensor *draft =
+        ds4_gpu_tensor_alloc(sizeof(draft_host));
+    ds4_gpu_tensor *context_rn = ds4_gpu_tensor_alloc(
+        (uint64_t)REQUESTS * CONTEXT_STRIDE * HEAD_DIM *
+        sizeof(float));
+    ds4_gpu_tensor *main_kv[REQUESTS] = {0};
+    ds4_gpu_tensor *heads_slice[REQUESTS] = {0};
+    ds4_gpu_tensor *q_slice[REQUESTS] = {0};
+    ds4_gpu_tensor *draft_slice[REQUESTS] = {0};
+    ds4_gpu_tensor *context_slice[REQUESTS] = {0};
+    int rc = 1;
+    const uint64_t head_slice_bytes =
+        (uint64_t)BLOCK_TOKENS * N_HEAD * HEAD_DIM * sizeof(float);
+    const uint64_t draft_slice_bytes =
+        (uint64_t)BLOCK_TOKENS * HEAD_DIM * sizeof(float);
+    bool ok = heads_rn && heads_ref && q && draft && context_rn &&
+              ds4_gpu_tensor_write(
+                  q, 0, q_host, sizeof(q_host)) != 0 &&
+              ds4_gpu_tensor_write(
+                  draft, 0, draft_host, sizeof(draft_host)) != 0;
+    for (uint32_t r = 0; ok && r < REQUESTS; r++) {
+        main_kv[r] = ds4_gpu_tensor_alloc(
+                main_count * sizeof(float));
+        heads_slice[r] = ds4_gpu_tensor_view(
+                heads_ref,
+                (uint64_t)r * head_slice_bytes,
+                head_slice_bytes);
+        q_slice[r] = ds4_gpu_tensor_view(
+                q,
+                (uint64_t)r * head_slice_bytes,
+                head_slice_bytes);
+        draft_slice[r] = ds4_gpu_tensor_view(
+                draft,
+                (uint64_t)r * draft_slice_bytes,
+                draft_slice_bytes);
+        context_slice[r] = ds4_gpu_tensor_alloc(
+                (uint64_t)(n_main[r] + BLOCK_TOKENS) *
+                HEAD_DIM * sizeof(float));
+        ok = main_kv[r] && heads_slice[r] && q_slice[r] &&
+             draft_slice[r] && context_slice[r] &&
+             ds4_gpu_tensor_write(
+                 main_kv[r],
+                 0,
+                 main_host[r],
+                 main_count * sizeof(float)) != 0;
+    }
+    for (uint32_t r = 0; ok && r < REQUESTS; r++) {
+        ok = ds4_gpu_dspark_attention_heads_tensor(
+                heads_slice[r],
+                context_slice[r],
+                sinks,
+                N_HEAD * sizeof(float),
+                0,
+                q_slice[r],
+                main_kv[r],
+                draft_slice[r],
+                n_main[r],
+                MAIN_CAP,
+                main_start[r],
+                BLOCK_TOKENS,
+                N_HEAD,
+                HEAD_DIM) != 0;
+    }
+    if (ok) {
+        const ds4_gpu_tensor *main_const[REQUESTS] = {
+            main_kv[0], main_kv[1], main_kv[2]
+        };
+        ok = ds4_gpu_dspark_attention_rn_heads_tensor(
+                heads_rn,
+                context_rn,
+                sinks,
+                N_HEAD * sizeof(float),
+                0,
+                q,
+                main_const,
+                draft,
+                n_main,
+                main_start,
+                REQUESTS,
+                MAIN_CAP,
+                BLOCK_TOKENS,
+                N_HEAD,
+                HEAD_DIM) != 0;
+    }
+    if (ok) {
+        ok = ds4_gpu_synchronize() != 0 &&
+             ds4_gpu_tensor_read(
+                 heads_ref, 0, ref_host, sizeof(ref_host)) != 0 &&
+             ds4_gpu_tensor_read(
+                 heads_rn, 0, rn_host, sizeof(rn_host)) != 0;
+    }
+    if (ok) {
+        rc = 0;
+        for (uint64_t i = 0; i < head_count; i++) {
+            if (fabsf(ref_host[i] - rn_host[i]) > 1.0e-6f) {
+                fprintf(stderr,
+                        "physical R=n DSpark attention mismatch "
+                        "at=%llu got=%g ref=%g\n",
+                        (unsigned long long)i,
+                        (double)rn_host[i],
+                        (double)ref_host[i]);
+                rc = 1;
+                break;
+            }
+        }
+    }
+    if (rc == 0) {
+        fprintf(stderr,
+                "cuda-regression: physical R=3 DSpark attention "
+                "matches independent R=1 KV rings\n");
+    }
+    for (uint32_t r = 0; r < REQUESTS; r++) {
+        ds4_gpu_tensor_free(context_slice[r]);
+        ds4_gpu_tensor_free(draft_slice[r]);
+        ds4_gpu_tensor_free(q_slice[r]);
+        ds4_gpu_tensor_free(heads_slice[r]);
+        ds4_gpu_tensor_free(main_kv[r]);
+    }
+    ds4_gpu_tensor_free(context_rn);
+    ds4_gpu_tensor_free(draft);
+    ds4_gpu_tensor_free(q);
+    ds4_gpu_tensor_free(heads_ref);
+    ds4_gpu_tensor_free(heads_rn);
+    return rc;
+}
+
 static int check_physical_rn_indexed_attention(void) {
     enum {
         REQUESTS = 2,
@@ -2036,6 +2214,11 @@ int main(void) {
     }
     if (check_decode_attention_overflow_path() != 0) {
         fprintf(stderr, "cuda-regression: FAILED decode attention overflow\n");
+        rc = 1;
+    }
+    if (check_physical_rn_dspark_attention() != 0) {
+        fprintf(stderr,
+                "cuda-regression: FAILED physical R=n DSpark attention\n");
         rc = 1;
     }
     if (check_physical_rn_indexed_attention() != 0) {

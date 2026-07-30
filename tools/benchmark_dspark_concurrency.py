@@ -20,21 +20,40 @@ def parse_args():
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--seed", type=int, default=4242)
+    parser.add_argument(
+        "--prompt-mode",
+        choices=("technical", "repetitive"),
+        default="technical",
+    )
+    parser.add_argument("--temperature", type=float, default=0.7)
     return parser.parse_args()
 
 
 def run_request(args, lane, barrier):
-    prompt = (
-        f"Lane {lane}: write a continuous technical analysis of CUDA "
-        f"scheduling and speculative decoding. Produce exactly "
-        f"{args.max_tokens} output tokens. Do not conclude early, do not "
-        "summarize, and keep writing until the token limit."
-    )
+    if args.prompt_mode == "repetitive":
+        cycle = (
+            "alpha beta gamma delta epsilon zeta eta theta "
+            "iota kappa lambda mu "
+        )
+        prompt = (
+            f"Lane {lane}: continue the exact cyclic sequence below. "
+            "Output only sequence words separated by spaces and keep "
+            f"repeating until {args.max_tokens} output tokens.\n"
+            + cycle * 96
+            + "alpha beta gamma delta"
+        )
+    else:
+        prompt = (
+            f"Lane {lane}: write a continuous technical analysis of CUDA "
+            f"scheduling and speculative decoding. Produce exactly "
+            f"{args.max_tokens} output tokens. Do not conclude early, do not "
+            "summarize, and keep writing until the token limit."
+        )
     payload = {
         "model": args.model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": args.max_tokens,
-        "temperature": 0.7,
+        "temperature": args.temperature,
         "top_k": 0,
         "top_p": 1.0,
         "min_p": 0.0,

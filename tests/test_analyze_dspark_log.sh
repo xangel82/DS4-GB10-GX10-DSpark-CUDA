@@ -34,7 +34,9 @@ grep -Fq 'Hardware mean capacity/rate: 4.667 / 21.000 t/s' "$OUT"
 grep -Fq 'Verifier-cycle throughput: 18.750 t/s' "$OUT"
 
 printf '%s\n' \
+  'ds4: dspark coordinator mode=physical R=2 scheduled_batch=8 physical_rate=25.00 serial_batch=8 serial_rate=18.18 physical_samples=2 serial_samples=2 physical_shape_samples=2 serial_shape_samples=2 bucket=0 shape_mature=1 step=7 reason=predicted' \
   'ds4: dspark cohort timing cohort=7 requested_r=2 executor=physical fallback=none drafted=6 committed=4 emitted=7 rows=8 wait_us=1000 draft=40.000 ms verify=240.000 ms total=280.000 ms' \
+  'ds4: dspark coordinator mode=serial R=2 scheduled_batch=8 physical_rate=17.00 serial_batch=8 serial_rate=18.18 physical_samples=2 serial_samples=2 physical_shape_samples=2 serial_shape_samples=2 bucket=0 shape_mature=1 step=8 reason=predicted' \
   'ds4: dspark cohort timing cohort=8 requested_r=2 executor=serial fallback=none drafted=6 committed=3 emitted=6 rows=8 wait_us=2000 draft=40.000 ms verify=290.000 ms total=330.000 ms' \
   'ds4-server: decode summary req=chatcmpl-1 kind=chat prompt=128 gen=100 seconds=10.000000 tps=10.000 finish=stop' \
   >"$LOG"
@@ -42,10 +44,14 @@ printf '%s\n' \
 "$ROOT/analyze-dspark-log.sh" "$LOG" 0 >"$OUT"
 
 grep -Fq 'Coordinator cohorts:       2 (physical=1 serial=1 target-only=0 fallback=0)' "$OUT"
-grep -Fq 'Mean coordinator wait:     1.500 ms' "$OUT"
+grep -Fq 'Coordinator wait mean/max: 1.500 / 2.000 ms (>=10ms=0 >=19ms=0)' "$OUT"
+grep -Fq 'rendezvous R=2 n=2 mean=1.500ms max=2.000ms' "$OUT"
 grep -Fq 'Cohort aggregate throughput: 21.311 t/s' "$OUT"
 grep -Fq 'physical R=2 n=1 aggregate=25.000t/s accept=66.67% rows=8.000' "$OUT"
 grep -Fq 'serial R=2 n=1 aggregate=18.182t/s accept=50.00% rows=8.000' "$OUT"
+grep -Fq 'Coordinator dispatch reasons: predicted=2' "$OUT"
+grep -Fq 'dispatch physical R=2 reason=predicted n=1' "$OUT"
+grep -Fq 'dispatch serial R=2 reason=predicted n=1' "$OUT"
 grep -Fq 'Per-request decode (overlap): 10.000 t/s (1 summaries; not aggregate)' "$OUT"
 
 printf 'dspark analyzer shadow regression: OK\n'

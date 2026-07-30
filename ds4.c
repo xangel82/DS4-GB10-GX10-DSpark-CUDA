@@ -37921,7 +37921,10 @@ int ds4_sessions_eval_speculative_sample_rn(
         coordinator_step % probe_interval == 0u;
     const bool physical_shape_mature =
         physical_profile_samples >= 2u;
-    uint32_t min_physical_rows = 10u;
+    /* The completed physical executor is profitable for the common GB10 R=2
+     * and R=3 shapes below ten scheduled rows. Keep an explicit diagnostic
+     * override, but let measured physical/serial profiles decide by default. */
+    uint32_t min_physical_rows = 0u;
     const char *min_rows_env =
         getenv("DS4_DSPARK_RN_MIN_PHYSICAL_ROWS");
     if (min_rows_env && min_rows_env[0]) {
@@ -37953,7 +37956,8 @@ int ds4_sessions_eval_speculative_sample_rn(
     } else if (force_serial) {
         use_physical = false;
         decision_reason = "forced-serial";
-    } else if (use_physical &&
+    } else if (min_physical_rows != 0u &&
+               use_physical &&
                request_count > 1u &&
                !periodic_probe &&
                !physical_confirmation_probe &&

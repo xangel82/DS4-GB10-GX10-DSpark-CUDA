@@ -92,6 +92,22 @@ function text_value(prefix,    i,a) {
 /dspark scheduler bypass/ { bypass++ }
 /dspark pre-draft bypass/ { predraft_bypass++ }
 /dspark scheduler K0 cooldown=/ { k0_cooldowns++ }
+/dspark coordinator mode=/ {
+  coordinator_mode = text_value("mode")
+  coordinator_reason = text_value("reason")
+  coordinator_r = value("R")
+  if (coordinator_mode == "") coordinator_mode = "unknown"
+  if (coordinator_reason == "") coordinator_reason = "unknown"
+  coordinator_decisions++
+  coordinator_reason_n[coordinator_reason]++
+  if (coordinator_r > 0) {
+    coordinator_decision_key = coordinator_mode SUBSEP coordinator_r SUBSEP coordinator_reason
+    coordinator_decision_n[coordinator_decision_key]++
+    if (coordinator_r > coordinator_decision_max_r) {
+      coordinator_decision_max_r = coordinator_r
+    }
+  }
+}
 /dspark cohort timing/ {
   cohort_n++
   cohort_executor = text_value("executor")
@@ -113,6 +129,18 @@ function text_value(prefix,    i,a) {
   if (cohort_wait_value >= 0) {
     cohort_wait_us += cohort_wait_value
     cohort_wait_n++
+    if (cohort_wait_value > cohort_wait_max_us) {
+      cohort_wait_max_us = cohort_wait_value
+    }
+    if (cohort_wait_value >= 10000) cohort_wait_10ms++
+    if (cohort_wait_value >= 19000) cohort_wait_19ms++
+    if (cohort_r > 0) {
+      cohort_wait_by_r_us[cohort_r] += cohort_wait_value
+      cohort_wait_by_r_n[cohort_r]++
+      if (cohort_wait_value > cohort_wait_by_r_max_us[cohort_r]) {
+        cohort_wait_by_r_max_us[cohort_r] = cohort_wait_value
+      }
+    }
   }
   if (cohort_drafted_value >= 0) {
     cohort_drafted += cohort_drafted_value
@@ -456,8 +484,17 @@ END {
            cohort_executor_n["target-only"],
            cohort_executor_n["fallback"]
     if (cohort_wait_n > 0) {
-      printf "Mean coordinator wait:     %.3f ms\n",
-             cohort_wait_us / cohort_wait_n / 1000.0
+      printf "Coordinator wait mean/max: %.3f / %.3f ms (>=10ms=%d >=19ms=%d)\n",
+             cohort_wait_us / cohort_wait_n / 1000.0,
+             cohort_wait_max_us / 1000.0,
+             cohort_wait_10ms, cohort_wait_19ms
+      for (rr = 1; rr <= cohort_max_r; rr++) {
+        if (cohort_wait_by_r_n[rr] == 0) continue
+        printf "  rendezvous R=%d n=%d mean=%.3fms max=%.3fms\n",
+               rr, cohort_wait_by_r_n[rr],
+               cohort_wait_by_r_us[rr] / cohort_wait_by_r_n[rr] / 1000.0,
+               cohort_wait_by_r_max_us[rr] / 1000.0
+      }
     }
     if (cohort_drafted > 0) {
       printf "Cohort acceptance:         %.2f%% (%d / %d)\n",
@@ -497,6 +534,28 @@ END {
       }
     }
     printf "\n"
+    if (coordinator_decisions > 0) {
+      printf "Coordinator dispatch reasons:"
+      for (reason in coordinator_reason_n) {
+        printf " %s=%d", reason, coordinator_reason_n[reason]
+      }
+      printf "\n"
+      for (rr = 1; rr <= coordinator_decision_max_r; rr++) {
+        for (executor_index = 1; executor_index <= 2; executor_index++) {
+          if (executor_index == 1) executor = "physical"
+          else executor = "serial"
+          for (reason in coordinator_reason_n) {
+            coordinator_decision_key = executor SUBSEP rr SUBSEP reason
+            if (coordinator_decision_n[coordinator_decision_key] == 0) {
+              continue
+            }
+            printf "  dispatch %s R=%d reason=%s n=%d\n",
+                   executor, rr, reason,
+                   coordinator_decision_n[coordinator_decision_key]
+          }
+        }
+      }
+    }
   } else if (timing_hardware_cycles > 0) {
     printf "Hardware scheduler mean R/batch: %.3f / %.3f (from timing)\n",
            timing_hardware_r_sum / timing_hardware_cycles,

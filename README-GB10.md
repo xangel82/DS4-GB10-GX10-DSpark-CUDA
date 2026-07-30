@@ -604,13 +604,14 @@ Q8 weight-reuse e MoE aligned; non sono stati aggiunti buffer permanenti oltre
 allo stato privato delle lane configurate.
 
 Un test operativo lungo con agenti reali ha chiarito perche' lo scaling non e'
-lineare. R=2 era realmente attivo, ma e' un batching fisico parziale: QKV,
-FFN, output e vocab vengono appiattiti, mentre KV, compressor, frontier,
-rejection e commit restano request-local per preservare la distribuzione
-target. Nel run osservato R=1 ha misurato circa `19,23 t/s`; R=2 e' sceso a
-`11,40 t/s` per lane ma `22,80 t/s` aggregati, cioe' circa +18,6% invece di
-2x. I batch HybridLC larghi possono superare i 40 t/s aggregati, ma sono rari
-nei testi liberi.
+lineare. R=2 era realmente attivo, ma la banda dei pesi resta condivisa:
+QKV, FFN, output e vocab vengono appiattiti, mentre KV, RNG e frontier restano
+private per preservare la distribuzione target. Rejection e commit sono
+racchiusi nella stessa transazione R=n, ma applicano ancora per-sessione le
+decisioni p/q e il rollback della frontier. Nel run osservato R=1 ha misurato
+circa `19,23 t/s`; R=2 e' sceso a `11,40 t/s` per lane ma `22,80 t/s`
+aggregati, cioe' circa +18,6% invece di 2x. I batch HybridLC larghi possono
+superare i 40 t/s aggregati, ma sono rari nei testi liberi.
 
 Da questa modifica la telemetria distingue `verify_begin`, `verify_reject`
 e `verify_finish` nelle righe `dspark timing`. Registra inoltre
@@ -621,19 +622,51 @@ dalle righe timing, non solo dalle righe scheduler, e stampa rate lane e rate
 aggregato della coorte. Il server, con `DS4_TELEMETRY=1`, registra anche la
 dimensione del rendezvous (`cohort selected`, lane attive e wait_us).
 
-Per evitare che microbatch troppo piccoli peggiorino la latenza, il
-coordinatore applica una soglia minima di righe fisiche prima di preferire
-R=n fuori da warmup/probe:
+Il coordinatore lascia decidere ai profili misurati fisico/seriale anche per i
+microbatch:
 
 ```bash
-DS4_DSPARK_RN_MIN_PHYSICAL_ROWS=10
+DS4_DSPARK_RN_MIN_PHYSICAL_ROWS=0
 ```
 
-Il valore `10` e' il default conservativo scelto dai log: i batch fisici sotto
-10 righe erano spesso equivalenti o peggiori del seriale; sopra 12-14 righe il
-rate aggregato iniziava a essere visibilmente utile. `0` disabilita il gate per
-profilazione, mentre `DS4_DSPARK_COORDINATOR_MODE=physical` forza comunque il
-path fisico.
+Il valore `0` e' il default di produzione. I test GB10 mostrano che le forme
+R=2/R=3 piu' comuni occupano appena 5-9 righe ma restano piu' veloci nel
+percorso fisico; la precedente soglia conservativa `10` le serializzava quasi
+tutte. Un valore maggiore di zero resta disponibile come guardia diagnostica,
+mentre `DS4_DSPARK_COORDINATOR_MODE=physical` forza il percorso fisico.
+
+La rimozione del gate statico e il rendezvous phase-aware sono stati validati
+con lo stesso carico sintetico controllato. Il timeout raccoglie ora tutte le
+lane gia' pronte, anziche' rilasciare soltanto quella che lo ha raggiunto; una
+lane attiva ma uscita dalla coorte da oltre 5 ms usa il rendezvous breve.
+
+| Concorrenza | Prima | Coordinator aggiornato | Delta |
+| --- | ---: | ---: | ---: |
+| R=2 aggregato | 14,94 t/s | 16,54 t/s | +10,7% |
+| R=3 aggregato | 16,40 t/s | 18,92 t/s | +15,4% |
+
+In un secondo run phase-aware, 705 delle 765 coorti sono state fisiche. Il
+rendezvous medio e' stato 0,379 ms, senza attese da 10 ms o piu'. R=2 fisico
+ha misurato 16,80 t/s contro 14,52 t/s seriali; R=3 fisico 19,59 t/s. Il
+profilo del verifier attribuisce in media 167,20 ms a `verify_begin`, 0,44 ms a
+rejection e 1,19 ms a commit. Sono gia' fisici 40,61 layer attention per ciclo,
+contro 2,39 request-local: fondere ulteriormente rejection/commit avrebbe un
+tetto inferiore all'1% e aumenterebbe il rischio sulla semantica lossless.
+
+Il successivo test operativo con tre agenti e telemetria completa ha formato
+3.717 coorti, 2.727 delle quali fisiche: la copertura sale quindi dal precedente
+40,5% al 73,4%. Il throughput aggregato delle coorti e' passato da 24,383 a
+28,294 t/s (`+16,0%`). R=3 fisico ha misurato 33,351 t/s contro 23,595 t/s
+seriali (`+41,3%`), mentre R=2 fisico ha misurato 24,150 t/s contro 21,904 t/s.
+In media 29,20 dei 43 layer attention per ciclo sono stati eseguiti dal percorso
+fisico. Il prefill non e' regredito: un prompt da 23.335 token ha mantenuto
+1.001,38 t/s.
+
+La stessa misura identifica il prossimo limite: l'acceptance complessiva e'
+stata 60,59% e 2.310 dei 7.675 cicli neurali, circa il 30%, hanno verificato
+soltanto K=1, ottenendo 4,821 t/s. Il batching multi-sessione non e' piu' il
+primo collo di bottiglia; lo sono ora le decisioni conservative K=1 e il target
+verifier, che occupa in media 251,54 ms dei 277,54 ms del ciclo.
 
 Il default e':
 
@@ -641,7 +674,7 @@ Il default e':
 DS4_SERVER_DSPARK_LANES=3
 DS4_SERVER_DSPARK_HOT_LANES=2
 DS4_SERVER_DSPARK_COALESCE_US=500
-DS4_DSPARK_RN_MIN_PHYSICAL_ROWS=10
+DS4_DSPARK_RN_MIN_PHYSICAL_ROWS=0
 ```
 
 `DS4_SERVER_DSPARK_LANES=1` ripristina il worker seriale consolidato. La seconda
@@ -697,13 +730,12 @@ attention per ciclo sono passati dal percorso fisico e 29,30 sono rimasti
 locali: e' il principale margine ancora aperto per aumentare lo scaling
 aggregato senza modificare la distribuzione target.
 
-Il batching fisico e' ancora parziale. QKV, FFN, output, vocabulary head e le
-forme CSA/HCA compatibili possono lavorare sul batch appiattito; ogni lane
-mantiene pero' KV e frontier proprie, mentre parte della preparazione
-compressor/indexer, rejection sampling e commit rimane per-sessione. Questa
-separazione e' necessaria per mantenere esatte posizione, RNG e distribuzione
-target, ma spiega perche' `R=2` aumenta il throughput aggregato senza
-raddoppiarlo.
+Il batching fisico copre QKV, FFN, output, vocabulary head, compressor/indexer
+e quasi tutte le forme CSA/HCA. Ogni lane mantiene KV, RNG e frontier proprie;
+rejection sampling e commit consumano viste del batch fisico ma applicano
+per-sessione decisioni e rollback. Questa separazione e' necessaria per
+mantenere esatte posizione, RNG e distribuzione target, ma spiega perche' R=2
+aumenta il throughput aggregato senza raddoppiarlo.
 
 Le coorti si formano soltanto quando due richieste raggiungono insieme un
 confine speculativo. Se una lane esegue una tool call o un prefill, oppure una
@@ -2894,9 +2926,26 @@ di pesi.
 ### Persistenza KV `canonical-only` e retry
 
 Il percorso scelto per Athena è `canonical-only`: il prefill viene completato,
-poi la frontiera completa del prompt viene salvata una sola volta con la chiave
-testuale canonica della richiesta, e infine inizia il decode. Non vengono
-serializzate frontiere intermedie `continued` durante il prefill.
+poi la frontiera completa del prompt viene congelata una sola volta con la
+chiave testuale canonica della richiesta. La cattura della sessione resta
+sincrona per garantire che token, KV, compressor, logits e RNG appartengano
+alla stessa frontier. Anche il trailer della memoria tool viene serializzato in
+questa fase, per evitare che pruning o nuove tool call ne cambino il contenuto
+mentre il writer lavora. Il payload immutabile viene poi accodato a un writer
+bounded che completa eviction, header e rename mentre il decode puo' proseguire.
+La coda contiene al massimo un payload pending oltre a quello in scrittura e
+usa file temporanei, non snapshot RAM.
+
+Prima di caricare o eliminare un checkpoint il server drena il writer. Un retry
+non puo' quindi osservare un file parziale, perdere un checkpoint gia'
+accettato o ripristinare una frontier piu' vecchia. Anche lo shutdown attende
+il commit durevole prima di liberare sessioni e tool memory.
+
+Nel test Athena con 15.839 token il checkpoint canonico da 196,32 MiB e' stato
+accodato al termine del prefill e consolidato in 92,1 ms mentre iniziava la
+generazione; `VmSwap` del server e' rimasto zero e nessun payload temporaneo e'
+rimasto dopo il drain. Il vantaggio cresce con i checkpoint lunghi: i log
+precedenti mostravano fino a circa 1,5 s per la sola seconda copia da 690 MiB.
 
 Se una scrittura SSE fallisce, i token già prodotti ma non consegnati al client
 non vengono salvati come nuova risposta e il server non tenta un rewind CUDA nel
@@ -2908,7 +2957,9 @@ viene consumato anche da una richiesta non corrispondente.
 Log attesi:
 
 ```text
-kv canonical prefill checkpoint tokens=... persisted=1
+kv checkpoint queued tokens=... reason=continued stage=... ms
+kv canonical prefill checkpoint tokens=... accepted=1 async=1
+kv cache stored tokens=... reason=continued ... save=... ms
 stream-failure deferred restore ... abandoned_tail=...
 stream retry guard consumed matched=1 ...
 stream retry selecting canonical disk restore ...

@@ -109,6 +109,14 @@ typedef struct {
     char *path;
 } ds4_kvstore_load_result;
 
+typedef struct ds4_kvstore_prepared_write ds4_kvstore_prepared_write;
+
+typedef enum {
+    DS4_KVSTORE_PREPARE_FAILED = 0,
+    DS4_KVSTORE_PREPARE_COMPLETE = 1,
+    DS4_KVSTORE_PREPARE_STAGED = 2,
+} ds4_kvstore_prepare_result;
+
 ds4_kvstore_options ds4_kvstore_default_options(void);
 uint8_t ds4_kvstore_reason_code(const char *reason);
 const char *ds4_kvstore_key_kind(uint8_t ext_flags);
@@ -162,6 +170,27 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        const ds4_kvstore_eviction_context *incoming);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size);
+
+ds4_kvstore_prepare_result ds4_kvstore_prepare_live_prefix_text(
+                                        ds4_kvstore *kc,
+                                        ds4_engine *engine,
+                                        ds4_session *session,
+                                        const ds4_tokens *tokens,
+                                        int store_len,
+                                        const char *reason,
+                                        const char *cache_text_override,
+                                        uint8_t cache_text_ext,
+                                        const char *cache_text_key,
+                                        const char *protect_prompt_text,
+                                        const ds4_kvstore_trailer_hooks *hooks,
+                                        ds4_kvstore_prepared_write **out,
+                                        char *err,
+                                        size_t err_len);
+bool ds4_kvstore_commit_prepared(ds4_kvstore *kc,
+                                 ds4_kvstore_prepared_write *prepared,
+                                 char *err,
+                                 size_t err_len);
+void ds4_kvstore_prepared_free(ds4_kvstore_prepared_write *prepared);
 
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,

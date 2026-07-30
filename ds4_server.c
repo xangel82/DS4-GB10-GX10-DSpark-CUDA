@@ -8057,6 +8057,14 @@ struct server {
     FILE *trace;
     pthread_mutex_t trace_mu;
     uint64_t trace_seq;
+    pthread_mutex_t kv_io_mu;
+    pthread_mutex_t kv_queue_mu;
+    pthread_cond_t kv_queue_cv;
+    pthread_t kv_writer_thread;
+    ds4_kvstore_prepared_write *kv_pending_write;
+    bool kv_writer_started;
+    bool kv_writer_stopping;
+    bool kv_writer_busy;
     pthread_mutex_t gpu_mu;
     pthread_cond_t gpu_cv;
     bool gpu_busy;
@@ -8079,6 +8087,7 @@ struct server {
         bool done;
         int rc;
         double enqueued_sec;
+        double last_done_sec;
         ds4_speculative_request request;
         char err[160];
     } cycle[DS4_SERVER_DSPARK_MAX_LANES];
@@ -9391,22 +9400,135 @@ static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
     };
 }
 
+static void *kv_cache_writer_main(void *ud) {
+    server *root = server_root((server *)ud);
+    for (;;) {
+        pthread_mutex_lock(&root->kv_queue_mu);
+        while (!root->kv_pending_write && !root->kv_writer_stopping) {
+            pthread_cond_wait(&root->kv_queue_cv, &root->kv_queue_mu);
+        }
+        if (!root->kv_pending_write && root->kv_writer_stopping) {
+            pthread_mutex_unlock(&root->kv_queue_mu);
+            return NULL;
+        }
+        ds4_kvstore_prepared_write *prepared = root->kv_pending_write;
+        root->kv_pending_write = NULL;
+        root->kv_writer_busy = true;
+        pthread_cond_broadcast(&root->kv_queue_cv);
+        pthread_mutex_unlock(&root->kv_queue_mu);
+
+        char err[160] = {0};
+        pthread_mutex_lock(&root->kv_io_mu);
+        bool ok = ds4_kvstore_commit_prepared(
+            &root->kv, prepared, err, sizeof(err));
+        pthread_mutex_unlock(&root->kv_io_mu);
+        if (!ok) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: async KV checkpoint commit failed: %s",
+                       err[0] ? err : "unknown error");
+        }
+        ds4_kvstore_prepared_free(prepared);
+
+        pthread_mutex_lock(&root->kv_queue_mu);
+        root->kv_writer_busy = false;
+        pthread_cond_broadcast(&root->kv_queue_cv);
+        pthread_mutex_unlock(&root->kv_queue_mu);
+    }
+}
+
+static bool kv_cache_writer_start(server *s) {
+    server *root = server_root(s);
+    if (!root || !root->kv.enabled || root->kv_writer_started) return true;
+    int rc = pthread_create(&root->kv_writer_thread, NULL,
+                            kv_cache_writer_main, root);
+    if (rc != 0) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: async KV checkpoint writer unavailable: %s",
+                   strerror(rc));
+        return false;
+    }
+    root->kv_writer_started = true;
+    server_log(DS4_LOG_DEFAULT,
+               "ds4-server: bounded async KV checkpoint writer active "
+               "(one immutable staged payload, ordered durable commit)");
+    return true;
+}
+
+static void kv_cache_writer_flush(server *s) {
+    server *root = server_root(s);
+    if (!root || !root->kv_writer_started) return;
+    pthread_mutex_lock(&root->kv_queue_mu);
+    while (root->kv_pending_write || root->kv_writer_busy) {
+        pthread_cond_wait(&root->kv_queue_cv, &root->kv_queue_mu);
+    }
+    pthread_mutex_unlock(&root->kv_queue_mu);
+}
+
+static void kv_cache_writer_stop(server *s) {
+    server *root = server_root(s);
+    if (!root || !root->kv_writer_started) return;
+    kv_cache_writer_flush(root);
+    pthread_mutex_lock(&root->kv_queue_mu);
+    root->kv_writer_stopping = true;
+    pthread_cond_broadcast(&root->kv_queue_cv);
+    pthread_mutex_unlock(&root->kv_queue_mu);
+    pthread_join(root->kv_writer_thread, NULL);
+    root->kv_writer_started = false;
+}
+
 static bool kv_cache_store_live_prefix_text(server *s, const ds4_tokens *tokens,
                                             int store_len, const char *reason,
                                             const char *cache_text_override,
                                             uint8_t cache_text_ext,
                                             const char *cache_text_key,
                                             const char *protect_prompt_text) {
+    server *root = server_root(s);
     char err[160] = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
-    return ds4_kvstore_store_live_prefix_text(server_kv(s),
-                                               s->engine, s->session,
-                                              tokens, store_len, reason,
-                                              cache_text_override,
-                                              cache_text_ext,
-                                              cache_text_key,
-                                              protect_prompt_text,
-                                              &hooks, err, sizeof(err));
+    if (!root->kv_writer_started) {
+        pthread_mutex_lock(&root->kv_io_mu);
+        bool ok = ds4_kvstore_store_live_prefix_text(
+            server_kv(s), s->engine, s->session,
+            tokens, store_len, reason, cache_text_override,
+            cache_text_ext, cache_text_key, protect_prompt_text,
+            &hooks, err, sizeof(err));
+        pthread_mutex_unlock(&root->kv_io_mu);
+        return ok;
+    }
+
+    /* Holding the queue mutex through preparation bounds disk staging to one
+     * active writer plus one pending immutable payload. A previous active
+     * commit may briefly hold kv_io_mu, but model execution remains free while
+     * its final disk copy runs. */
+    pthread_mutex_lock(&root->kv_queue_mu);
+    while (root->kv_pending_write && !root->kv_writer_stopping) {
+        pthread_cond_wait(&root->kv_queue_cv, &root->kv_queue_mu);
+    }
+    if (root->kv_writer_stopping) {
+        pthread_mutex_unlock(&root->kv_queue_mu);
+        return false;
+    }
+    const double stage_t0 = now_sec();
+    ds4_kvstore_prepared_write *prepared = NULL;
+    pthread_mutex_lock(&root->kv_io_mu);
+    ds4_kvstore_prepare_result result =
+        ds4_kvstore_prepare_live_prefix_text(
+            server_kv(s), s->engine, s->session,
+            tokens, store_len, reason, cache_text_override,
+            cache_text_ext, cache_text_key, protect_prompt_text,
+            &hooks, &prepared, err, sizeof(err));
+    pthread_mutex_unlock(&root->kv_io_mu);
+    if (result == DS4_KVSTORE_PREPARE_STAGED) {
+        root->kv_pending_write = prepared;
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: kv checkpoint queued tokens=%d reason=%s "
+                   "stage=%.1f ms",
+                   store_len, reason ? reason : "unknown",
+                   (now_sec() - stage_t0) * 1000.0);
+        pthread_cond_broadcast(&root->kv_queue_cv);
+    }
+    pthread_mutex_unlock(&root->kv_queue_mu);
+    return result != DS4_KVSTORE_PREPARE_FAILED;
 }
 
 static bool kv_cache_store_live_prefix(server *s, const ds4_tokens *tokens,
@@ -9496,6 +9618,9 @@ static void kv_cache_restore_suppressed_continued(kv_disk_cache *kc,
 
 static void kv_cache_discard_failed_disk_entry(server *s, const char *path) {
     if (!s || !path) return;
+    server *root = server_root(s);
+    kv_cache_writer_flush(root);
+    pthread_mutex_lock(&root->kv_io_mu);
     if (unlink(path) == 0) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: kv cache discarded reason=prefill-failed file=%s",
@@ -9506,6 +9631,7 @@ static void kv_cache_discard_failed_disk_entry(server *s, const char *path) {
                    path, strerror(errno));
     }
     server_kv(s)->continued_last_store_tokens = 0;
+    pthread_mutex_unlock(&root->kv_io_mu);
     ds4_session_invalidate(s->session);
 }
 
@@ -9534,12 +9660,18 @@ static int kv_cache_try_load_text(server *s, const char *prompt_text,
                                   bool responses_protocol) {
     if (loaded_path_out) *loaded_path_out = NULL;
     if (loaded_ext_flags_out) *loaded_ext_flags_out = 0;
+    server *root = server_root(s);
+    /* A load replaces the live session. Drain older staged writes first so the
+     * lookup sees every checkpoint that was acknowledged as queued. */
+    kv_cache_writer_flush(root);
     ds4_kvstore_load_result lr = {0};
     ds4_kvstore_trailer_hooks hooks = kv_cache_tool_map_hooks(s, NULL);
+    pthread_mutex_lock(&root->kv_io_mu);
     int loaded = ds4_kvstore_try_load_text(server_kv(s),
                                            s->engine, s->session,
                                            prompt_text, effective_prompt, &lr,
                                            &hooks, responses_protocol);
+    pthread_mutex_unlock(&root->kv_io_mu);
     if (loaded > 0) {
         if (loaded_path_out && lr.path) *loaded_path_out = xstrdup(lr.path);
         if (loaded_ext_flags_out) *loaded_ext_flags_out = lr.ext_flags;
@@ -10998,15 +11130,44 @@ static long server_active_coalesce_us(void) {
     return parsed;
 }
 
-/* cycle_mu protects this state. A longer rendezvous is useful only while a
- * peer is already decoding; cold prefill or a single active request must not
- * inherit multi-session latency. */
-static bool server_peer_decode_active_locked(
-        const server *root, uint32_t own) {
+/* A peer that has just completed the same cohort is expected to enqueue its
+ * next cycle almost immediately. A peer whose last completion is older is
+ * usually streaming, entering a tool call, or otherwise out of phase; making
+ * an independent request wait the full active rendezvous adds latency without
+ * increasing physical coverage. cycle_mu protects every field read here. */
+static long server_rendezvous_wait_us_locked(
+        const server *root, uint32_t own, double now) {
+    const double recent_done_sec = 0.005;
+    bool peer_active = false;
+    bool peer_imminent = false;
     for (uint32_t i = 0; i < root->lane_count; i++) {
-        if (i != own && root->lanes[i]->decode_active) return true;
+        if (i == own || !root->lanes[i]->decode_active) continue;
+        peer_active = true;
+        if (root->cycle[i].pending ||
+            root->cycle[i].last_done_sec <= 0.0 ||
+            now - root->cycle[i].last_done_sec <= recent_done_sec) {
+            peer_imminent = true;
+            break;
+        }
     }
-    return false;
+    return peer_active && peer_imminent
+        ? server_active_coalesce_us()
+        : server_coalesce_us();
+}
+
+/* Select every request that is ready at a cohort boundary. This helper is
+ * shared by goal, zero-wait, and deadline releases so a timed-out R=3
+ * rendezvous still launches the ready R=2 cohort instead of one R=1 lane. */
+static uint32_t server_collect_pending_locked(
+        const server *root,
+        uint32_t *selected,
+        uint32_t selected_cap) {
+    uint32_t count = 0u;
+    for (uint32_t i = 0; i < root->lane_count &&
+                         count < selected_cap; i++) {
+        if (root->cycle[i].pending) selected[count++] = i;
+    }
+    return count;
 }
 
 /* The coordinator used to launch as soon as any two lanes were pending. That
@@ -11101,11 +11262,8 @@ static int server_eval_speculative(
     uint32_t selected_count = 0u;
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);
-    const bool peer_decode_active =
-        server_peer_decode_active_locked(root, own);
-    const long wait_us = peer_decode_active
-        ? server_active_coalesce_us()
-        : server_coalesce_us();
+    const long wait_us = server_rendezvous_wait_us_locked(
+            root, own, root->cycle[own].enqueued_sec);
     deadline.tv_nsec += wait_us * 1000L;
     deadline.tv_sec += deadline.tv_nsec / 1000000000L;
     deadline.tv_nsec %= 1000000000L;
@@ -11123,16 +11281,16 @@ static int server_eval_speculative(
         const uint32_t cohort_goal =
             server_cohort_goal_locked(root);
         if (!root->cycle_running && pending >= cohort_goal) {
-            for (uint32_t i = 0; i < root->lane_count; i++) {
-                if (root->cycle[i].pending) {
-                    selected[selected_count++] = i;
-                }
-            }
+            selected_count = server_collect_pending_locked(
+                    root, selected,
+                    DS4_SERVER_DSPARK_MAX_LANES);
             leader = true;
             break;
         }
         if (wait_us == 0) {
-            selected[selected_count++] = own;
+            selected_count = server_collect_pending_locked(
+                    root, selected,
+                    DS4_SERVER_DSPARK_MAX_LANES);
             leader = true;
             break;
         }
@@ -11140,7 +11298,9 @@ static int server_eval_speculative(
                 &root->cycle_cv, &root->cycle_mu, &deadline);
         if (wait_rc == ETIMEDOUT && root->cycle[own].pending &&
             !root->cycle_running) {
-            selected[selected_count++] = own;
+            selected_count = server_collect_pending_locked(
+                    root, selected,
+                    DS4_SERVER_DSPARK_MAX_LANES);
             leader = true;
             break;
         }
@@ -11201,6 +11361,7 @@ static int server_eval_speculative(
         for (uint32_t i = 0; i < selected_count; i++) {
             const uint32_t slot = selected[i];
             root->cycle[slot].request.result = cohort[i].result;
+            root->cycle[slot].last_done_sec = now_sec();
             const bool lane_ok = cohort[i].result >= 0;
             root->cycle[slot].rc = lane_ok
                 ? 0 : (cohort_rc != 0 ? cohort_rc : 1);
@@ -11532,7 +11693,8 @@ static void generate_job(server *s, job *j) {
     ds4_session_set_display_progress(s->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
-    if (cached == 0 &&
+    if (!progress.kv_canonical_only &&
+        cached == 0 &&
         shared_kv->enabled &&
         prompt_for_sync->len >= shared_kv->opt.min_tokens &&
         shared_kv->opt.cold_max_tokens > 0 &&
@@ -11652,8 +11814,11 @@ static void generate_job(server *s, job *j) {
             kv_cache_note_store(shared_kv, prompt_tokens);
         }
         server_log(canonical_prefill_saved ? DS4_LOG_KVCACHE : DS4_LOG_WARNING,
-                   "ds4-server: kv canonical prefill checkpoint tokens=%d elapsed=%.3fs persisted=%d",
-                   prompt_tokens, prefill_elapsed, canonical_prefill_saved ? 1 : 0);
+                   "ds4-server: kv canonical prefill checkpoint tokens=%d "
+                   "elapsed=%.3fs accepted=%d async=%d",
+                   prompt_tokens, prefill_elapsed,
+                   canonical_prefill_saved ? 1 : 0,
+                   server_root(s)->kv_writer_started ? 1 : 0);
     }
     if (!progress.kv_canonical_only) kv_cache_maybe_store_continued(s);
     server_log(DS4_LOG_PREFILL,
@@ -13416,6 +13581,7 @@ static void log_context_memory(ds4_backend backend,
 static void server_close_resources(server *s) {
     server *root = server_root(s);
     if (s != root) return;
+    kv_cache_writer_stop(s);
     if (s->trace) {
         fclose(s->trace);
         s->trace = NULL;
@@ -13450,6 +13616,9 @@ static void server_close_resources(server *s) {
     }
     pthread_mutex_destroy(&s->tool_mu);
     pthread_mutex_destroy(&s->trace_mu);
+    pthread_cond_destroy(&s->kv_queue_cv);
+    pthread_mutex_destroy(&s->kv_queue_mu);
+    pthread_mutex_destroy(&s->kv_io_mu);
     pthread_cond_destroy(&s->cycle_cv);
     pthread_mutex_destroy(&s->cycle_mu);
     pthread_cond_destroy(&s->gpu_cv);
@@ -13766,6 +13935,9 @@ int main(int argc, char **argv) {
     pthread_cond_init(&s.clients_cv, NULL);
     pthread_mutex_init(&s.tool_mu, NULL);
     pthread_mutex_init(&s.trace_mu, NULL);
+    pthread_mutex_init(&s.kv_io_mu, NULL);
+    pthread_mutex_init(&s.kv_queue_mu, NULL);
+    pthread_cond_init(&s.kv_queue_cv, NULL);
     pthread_mutex_init(&s.gpu_mu, NULL);
     pthread_cond_init(&s.gpu_cv, NULL);
     pthread_mutex_init(&s.cycle_mu, NULL);
@@ -13781,6 +13953,7 @@ int main(int argc, char **argv) {
         setvbuf(s.trace, NULL, _IONBF, 0);
         server_log(DS4_LOG_DEFAULT, "ds4-server: tracing session to %s", cfg.trace_path);
     }
+    (void)kv_cache_writer_start(&s);
 
     const char *lane_env = getenv("DS4_SERVER_DSPARK_LANES");
     uint32_t requested_lanes = DS4_SERVER_DSPARK_DEFAULT_LANES;
@@ -17601,6 +17774,73 @@ static void test_kv_tool_map_filters_by_dsml_text(void) {
     pthread_mutex_destroy(&dst.tool_mu);
 }
 
+static void test_kv_tool_map_staging_freezes_snapshot(void) {
+    const char *dsml_before =
+        "\n\n<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">echo before</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+    const char *dsml_after =
+        "\n\n<｜DSML｜tool_calls>\n"
+        "<｜DSML｜invoke name=\"bash\">\n"
+        "<｜DSML｜parameter name=\"command\" string=\"true\">echo after</｜DSML｜parameter>\n"
+        "</｜DSML｜invoke>\n"
+        "</｜DSML｜tool_calls>";
+
+    server src = {0}, dst = {0};
+    pthread_mutex_init(&src.tool_mu, NULL);
+    pthread_mutex_init(&dst.tool_mu, NULL);
+    tool_memory_put(&src, "call_frozen", dsml_before);
+
+    char tmpl[] = "/tmp/ds4-kv-tool-stage.XXXXXX";
+    int fd = mkstemp(tmpl);
+    TEST_ASSERT(fd >= 0);
+    FILE *staged = fd >= 0 ? fdopen(fd, "wb") : NULL;
+    TEST_ASSERT(staged != NULL);
+    uint64_t staged_bytes = 0;
+    if (staged) {
+        TEST_ASSERT(kv_tool_map_write(
+            &src, staged, dsml_before, &staged_bytes));
+        TEST_ASSERT(staged_bytes > 0);
+        TEST_ASSERT(fclose(staged) == 0);
+    } else if (fd >= 0) {
+        close(fd);
+    }
+
+    /* A later tool-memory update must not alter the already staged trailer. */
+    tool_memory_put(&src, "call_frozen", dsml_after);
+    FILE *committed = fopen(tmpl, "rb");
+    TEST_ASSERT(committed != NULL);
+    if (committed && staged_bytes > 0) {
+        TEST_ASSERT(kv_tool_map_load_from_pos(&dst, committed, NULL) == 1);
+    }
+
+    chat_msgs msgs = {0};
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    tool_call tc = {
+        .id = xstrdup("call_frozen"),
+        .name = xstrdup("bash"),
+        .arguments = xstrdup("{}"),
+    };
+    tool_calls_push(&assistant.calls, tc);
+    chat_msgs_push(&msgs, assistant);
+    tool_replay_stats stats = {0};
+    tool_memory_attach_to_messages(&dst, &msgs, &stats);
+    TEST_ASSERT(msgs.v[0].calls.raw_dsml != NULL);
+    TEST_ASSERT(strstr(msgs.v[0].calls.raw_dsml, "echo before") != NULL);
+    TEST_ASSERT(strstr(msgs.v[0].calls.raw_dsml, "echo after") == NULL);
+
+    chat_msgs_free(&msgs);
+    if (committed) fclose(committed);
+    unlink(tmpl);
+    tool_memory_free(&src.tool_mem);
+    tool_memory_free(&dst.tool_mem);
+    pthread_mutex_destroy(&src.tool_mu);
+    pthread_mutex_destroy(&dst.tool_mu);
+}
+
 static void test_kv_tool_map_restores_before_prompt_render(void) {
     char tmpl[] = "/tmp/ds4-kv-tool-map-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -18623,6 +18863,26 @@ static void test_coordinator_dispatches_by_prefix_and_tool_binding(void) {
     second.decode_active = true;
     third.decode_active = true;
     TEST_ASSERT(server_cohort_goal_locked(&root) == 3u);
+    const double rendezvous_now = now_sec();
+    root.cycle[1].last_done_sec = rendezvous_now;
+    root.cycle[2].last_done_sec = rendezvous_now;
+    TEST_ASSERT(server_rendezvous_wait_us_locked(
+                &root, 0u, rendezvous_now) ==
+                server_active_coalesce_us());
+    root.cycle[1].last_done_sec = rendezvous_now - 1.0;
+    root.cycle[2].last_done_sec = rendezvous_now - 1.0;
+    TEST_ASSERT(server_rendezvous_wait_us_locked(
+                &root, 0u, rendezvous_now) ==
+                server_coalesce_us());
+    root.cycle[0].pending = true;
+    root.cycle[2].pending = true;
+    uint32_t selected[DS4_SERVER_DSPARK_MAX_LANES] = {0};
+    TEST_ASSERT(server_collect_pending_locked(
+                &root, selected,
+                DS4_SERVER_DSPARK_MAX_LANES) == 2u);
+    TEST_ASSERT(selected[0] == 0u && selected[1] == 2u);
+    root.cycle[0].pending = false;
+    root.cycle[2].pending = false;
     third.decode_active = false;
     TEST_ASSERT(server_cohort_goal_locked(&root) == 2u);
     second.decode_active = false;
@@ -18732,6 +18992,7 @@ static void ds4_server_unit_tests_run(void) {
     test_dsml_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();
     test_kv_tool_map_filters_by_dsml_text();
+    test_kv_tool_map_staging_freezes_snapshot();
     test_kv_tool_map_restores_before_prompt_render();
     test_thinking_checkpoint_canonical_matches_future_prompt();
     test_thinking_canonical_empty_content();

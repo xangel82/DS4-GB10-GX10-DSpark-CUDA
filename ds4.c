@@ -37967,6 +37967,44 @@ int ds4_sessions_eval_speculative_sample_rn(
         use_physical = false;
         decision_reason = "small-batch-serial";
     }
+    if (getenv("DS4_DSPARK_LOG") != NULL) {
+        /* Keep one atomic, replayable admission record per cohort.  The
+         * conditional confidence vectors and both candidate prefix vectors
+         * let offline analysis compare Algorithm 1 with alternative policies
+         * without changing target sampling or running another verifier. */
+        flockfile(stderr);
+        fprintf(stderr,
+                "ds4: dspark admission R=%u executor=%s batch=%u "
+                "capacity_batch=%u capacity_age=%u expected=%.6f "
+                "rate=%.6f capacity_rate=%.6f hw_prefix=",
+                request_count,
+                use_physical ? "physical" : "serial",
+                schedule_step.selected.batch_size,
+                schedule_step.selected.capacity_batch_size,
+                schedule_step.used_async ? 2u : 0u,
+                schedule_step.selected.expected_tokens,
+                schedule_step.selected.throughput,
+                schedule_step.selected.capacity_throughput);
+        for (uint32_t r = 0; r < request_count; r++) {
+            fprintf(stderr, "%s%u", r == 0u ? "" : ",",
+                    schedule_step.selected.prefix[r]);
+        }
+        fprintf(stderr, " serial_prefix=");
+        for (uint32_t r = 0; r < request_count; r++) {
+            fprintf(stderr, "%s%u", r == 0u ? "" : ",",
+                    serial_prefix[r]);
+        }
+        fprintf(stderr, " conditional=");
+        for (uint32_t r = 0; r < request_count; r++) {
+            if (r != 0u) fputc('/', stderr);
+            for (uint32_t k = 0; k < verify_cap[r]; k++) {
+                fprintf(stderr, "%s%.6f", k == 0u ? "" : ",",
+                        items[r].request.conditional[k]);
+            }
+        }
+        fprintf(stderr, "\n");
+        funlockfile(stderr);
+    }
     if (!use_physical) {
         for (uint32_t r = 0; r < request_count; r++) {
             schedule_step.selected.prefix[r] = serial_prefix[r];

@@ -8,9 +8,9 @@ trap 'rm -f "$LOG" "$OUT"' EXIT
 
 printf '%s\n' \
   'ds4: dspark scheduler selected=3 legacy=3 deterministic=1 block=5 proposed=5 configured=5 pos=65536 bucket=2 shadow_k=4 shadow_ready=0 shadow_rate=20.00 shadow_stop=0 hw_r=1 hw_batch=5 hw_base=15.00 hw_sync_k=4 hw_sync_rate=20.00 hw_async=0 hw_capacity=5 hw_capacity_rate=20.00 hw_age=0 hw_stop_batch=0 hw_admitted=4 early_stop=0 champion=3 history=1' \
-  'ds4: dspark timing drafted=3 target_rows=4 committed=2 emitted=3 draft=20.000 ms verify=140.000 ms total=160.000 ms fused=1' \
+  'ds4: dspark timing drafted=3 target_rows=4 committed=2 emitted=3 draft=20.000 ms verify=140.000 ms total=160.000 ms fused=1 neural=3 hybrid=0 requested_r=1' \
   'ds4: dspark scheduler selected=3 legacy=4 deterministic=1 block=5 proposed=5 configured=5 pos=65539 bucket=2 shadow_k=4 shadow_ready=1 shadow_rate=22.00 shadow_local_ready=0 probe_k=3 shadow_stop=5 hw_r=1 hw_batch=5 hw_base=15.00 hw_sync_k=3 hw_sync_rate=21.00 hw_async=1 hw_capacity=5 hw_capacity_rate=22.00 hw_age=2 hw_stop_batch=6 hw_admitted=4 early_stop=0 champion=4 history=1' \
-  'ds4: dspark timing drafted=3 target_rows=4 committed=3 emitted=3 draft=20.000 ms verify=140.000 ms total=160.000 ms fused=1' \
+  'ds4: dspark timing drafted=3 target_rows=4 committed=3 emitted=3 draft=20.000 ms verify=140.000 ms total=160.000 ms fused=1 neural=3 hybrid=0 requested_r=1' \
   'ds4: dspark scheduler selected=4 legacy=4 deterministic=1 block=5 proposed=5 configured=5 pos=65542 bucket=2 shadow_k=3 shadow_ready=1 shadow_rate=21.00 shadow_stop=4 hw_r=1 hw_batch=4 hw_base=15.00 hw_sync_k=4 hw_sync_rate=22.00 hw_async=1 hw_capacity=4 hw_capacity_rate=21.00 hw_age=2 hw_stop_batch=5 hw_admitted=3 early_stop=0 champion=4 history=1' \
   >"$LOG"
 
@@ -32,6 +32,10 @@ grep -Fq 'Hardware causal K=0..5:    0 0 0 1 2 0' "$OUT"
 grep -Fq 'Hardware async cycles/changes: 2 / 2' "$OUT"
 grep -Fq 'Hardware mean capacity/rate: 4.667 / 21.000 t/s' "$OUT"
 grep -Fq 'Verifier-cycle throughput: 18.750 t/s' "$OUT"
+grep -Fq 'Neural scheduler K=0..5:   0 0 0 2 0 0' "$OUT"
+grep -Fq 'neural R=1 K=0..5: 0 0 0 2 0 0' "$OUT"
+grep -Fq 'R=1 K=3 n=2 neural_accept=83.33%' "$OUT"
+grep -Fq 'verifier-width=3 n=2 accept=83.33%' "$OUT"
 
 printf '%s\n' \
   'ds4: dspark coordinator mode=physical R=2 scheduled_batch=8 physical_rate=25.00 serial_batch=8 serial_rate=18.18 physical_samples=2 serial_samples=2 physical_shape_samples=2 serial_shape_samples=2 bucket=0 shape_mature=1 step=7 reason=predicted' \

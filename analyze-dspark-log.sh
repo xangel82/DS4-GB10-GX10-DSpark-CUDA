@@ -202,6 +202,8 @@ function text_value(prefix,    i,a) {
   rejection = value("rejection")
   residual = value("residual")
   hybrid = value("hybrid")
+  neural = value("neural")
+  requested_r = value("requested_r")
   hybrid_enabled = value("hybrid_enabled")
   blockv = value("blockv")
   retrieval = value("retrieval")
@@ -233,6 +235,21 @@ function text_value(prefix,    i,a) {
   if (rejection == 1) rejection_cycles++
   if (residual == 1) residual_cycles++
   if (hybrid == 1) hybrid_cycles++
+  if (neural >= 0 && neural <= 5) {
+    neural_cycles++
+    neural_k_n[neural]++
+    neural_k_drafted[neural] += neural
+    neural_committed = c
+    if (neural_committed < 0) neural_committed = 0
+    if (neural_committed > neural) neural_committed = neural
+    neural_k_committed[neural] += neural_committed
+    if (requested_r > 0) {
+      neural_r_k_n[requested_r, neural]++
+      neural_r_k_drafted[requested_r, neural] += neural
+      neural_r_k_committed[requested_r, neural] += neural_committed
+      if (requested_r > neural_max_r) neural_max_r = requested_r
+    }
+  }
   if (hybrid_enabled == 1) hybrid_production_cycles++
   if (blockv == 1) blockv_cycles++
   if (retrieval > 0) {
@@ -605,6 +622,25 @@ END {
   printf "Circuit-breaker bypasses:  %d\n", bypass
   if (graph_launches > 0) printf "DSpark graph launch/update: %d / %d (draft=%d verify=%d rebuilds=%d topology-reuses=%d)\n", graph_launches, graph_updates, graph_draft, graph_verify, graph_rebuilds, graph_topology_reuses
   if (verifier_cycles > 0) {
+    if (neural_cycles > 0) {
+      printf "Neural scheduler K=0..5:   %d %d %d %d %d %d\n",
+             neural_k_n[0], neural_k_n[1], neural_k_n[2],
+             neural_k_n[3], neural_k_n[4], neural_k_n[5]
+      for (rr = 1; rr <= neural_max_r; rr++) {
+        printf "  neural R=%d K=0..5:", rr
+        for (k = 0; k <= 5; k++) {
+          printf " %d", neural_r_k_n[rr, k]
+        }
+        printf "\n"
+        for (k = 1; k <= 5; k++) {
+          if (neural_r_k_drafted[rr, k] == 0) continue
+          neural_accept_rate = 100.0 * neural_r_k_committed[rr, k] / neural_r_k_drafted[rr, k]
+          printf "    R=%d K=%d n=%d neural_accept=%.2f%%\n",
+                 rr, k, neural_r_k_n[rr, k],
+                 neural_accept_rate
+        }
+      }
+    }
     printf "Mean verifier target rows: %.3f\n", verifier_rows / verifier_cycles
     printf "Mean verifier draft time:  %.3f ms\n", verifier_draft_ms / verifier_cycles
     printf "Mean verifier target time: %.3f ms\n", verifier_verify_ms / verifier_cycles
@@ -626,7 +662,7 @@ END {
     printf "Mean fused cycle:          %.3f ms\n", verifier_total_ms / verifier_cycles
     if (verifier_total_ms > 0) printf "Verifier-cycle throughput: %.3f t/s\n", 1000.0 * verifier_emitted / verifier_total_ms
     for (k = 1; k <= 5; k++) if (kn[k] > 0) {
-      printf "  K=%d n=%d accept=%.2f%% emitted=%.3f draft=%.3fms target=%.3fms total=%.3fms rate=%.3ft/s\n",
+      printf "  verifier-width=%d n=%d accept=%.2f%% emitted=%.3f draft=%.3fms target=%.3fms total=%.3fms rate=%.3ft/s\n",
              k, kn[k], (kd[k] > 0 ? 100.0 * kc[k] / kd[k] : 0.0),
              ke[k] / kn[k], kdr[k] / kn[k], kvr[k] / kn[k],
              kt[k] / kn[k], (kt[k] > 0 ? 1000.0 * ke[k] / kt[k] : 0.0)

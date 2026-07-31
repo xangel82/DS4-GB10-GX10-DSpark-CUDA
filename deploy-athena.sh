@@ -42,6 +42,7 @@ rsync -az --progress \
   --exclude='*.dSYM' \
   --exclude='tests/test_q4k_dot' \
   --exclude='tests/test_dspark_scheduler' \
+  --exclude='tests/test_dspark_sps' \
   --exclude='tests/test_dspark_sts' \
   --exclude='tests/cuda_long_context_smoke' \
   --exclude='gguf-tools/deepseek4-quantize' \

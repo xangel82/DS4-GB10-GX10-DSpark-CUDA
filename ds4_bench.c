@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_dspark_sps.h"
 #include "ds4_help.h"
 
 /* Purpose-built throughput benchmark.
@@ -600,23 +601,74 @@ static void maybe_warn_distributed_step_shape(const bench_config *cfg, ds4_sessi
     }
 }
 
+static void build_sps_shapes_recursive(
+        uint32_t request_count,
+        uint32_t remaining,
+        uint32_t minimum_rows,
+        uint32_t depth,
+        uint32_t current[4],
+        uint32_t shapes[64][4],
+        uint32_t *shape_count) {
+    if (depth == request_count) {
+        if (remaining == 0u && *shape_count < 64u) {
+            memcpy(shapes[*shape_count], current,
+                   request_count * sizeof(current[0]));
+            (*shape_count)++;
+        }
+        return;
+    }
+    const uint32_t lanes_left = request_count - depth - 1u;
+    for (uint32_t rows = minimum_rows; rows <= 6u; rows++) {
+        if (rows > remaining) break;
+        const uint32_t tail = remaining - rows;
+        if (tail < lanes_left * rows || tail > lanes_left * 6u) {
+            continue;
+        }
+        current[depth] = rows;
+        build_sps_shapes_recursive(
+                request_count, tail, rows, depth + 1u,
+                current, shapes, shape_count);
+    }
+}
+
+static uint32_t build_sps_shapes(
+        uint32_t request_count,
+        uint32_t batch,
+        uint32_t shapes[64][4]) {
+    uint32_t current[4] = {0};
+    uint32_t shape_count = 0u;
+    build_sps_shapes_recursive(
+            request_count, batch, 1u, 0u,
+            current, shapes, &shape_count);
+    return shape_count;
+}
+
 static int run_physical_rn_smoke(
         ds4_session *owner,
-        const ds4_tokens *prompt) {
+        const ds4_tokens *prompt,
+        uint32_t request_count_override,
+        int prefix_override,
+        bool preserve_owner_frontier) {
     if (!owner || !prompt || prompt->len < 515) return 1;
-    uint32_t request_count = 2;
+    uint32_t request_count =
+        request_count_override >= 1u && request_count_override <= 4u
+            ? request_count_override
+            : 2u;
     const char *count_env = getenv("DS4_BENCH_PHYSICAL_RN_SMOKE");
-    if (count_env && count_env[0]) {
+    if (request_count_override == 0u && count_env && count_env[0]) {
         char *end = NULL;
         const unsigned long parsed = strtoul(count_env, &end, 10);
         if (end != count_env && *end == '\0' &&
-            parsed >= 2u && parsed <= 4u) {
+            parsed >= 1u && parsed <= 4u) {
             request_count = (uint32_t)parsed;
         }
     }
-    int prefix_len = prompt->len > 4099 ? 4096 : prompt->len - 3;
+    int prefix_len =
+        prefix_override >= 512
+            ? prefix_override
+            : (prompt->len > 4099 ? 4096 : prompt->len - 3);
     const char *prefix_env = getenv("DS4_BENCH_PHYSICAL_RN_PREFIX");
-    if (prefix_env && prefix_env[0]) {
+    if (prefix_override < 512 && prefix_env && prefix_env[0]) {
         char *end = NULL;
         const unsigned long parsed = strtoul(prefix_env, &end, 10);
         if (end == prefix_env || *end != '\0' ||
@@ -630,6 +682,13 @@ static int run_physical_rn_smoke(
             return 1;
         }
         prefix_len = (int)parsed;
+    }
+    if (prefix_len < 512 || prefix_len > prompt->len - 3) {
+        fprintf(stderr,
+                "ds4-bench: invalid physical R=%u prefix=%d "
+                "(expected 512..%d)\n",
+                request_count, prefix_len, prompt->len - 3);
+        return 1;
     }
     ds4_tokens prefix = {
         .v = prompt->v,
@@ -667,8 +726,8 @@ static int run_physical_rn_smoke(
         }
     }
 
-    int tops[4][2] = {{0}};
-    int sequential_tops[4][2] = {{0}};
+    int tops[4][5] = {{0}};
+    int sequential_tops[4][5] = {{0}};
     float *logits[4] = {0};
     float *sequential_logits[4] = {0};
     float *row_logits[4] = {0};
@@ -729,7 +788,7 @@ static int run_physical_rn_smoke(
         rc = 1;
     }
     for (uint32_t r = 0; rc == 0 && r < request_count; r++) {
-        physical_tokens[r].len = prefix_len + 3;
+        physical_tokens[r].len = prefix_len + 6;
         physical_tokens[r].cap = physical_tokens[r].len;
         physical_tokens[r].v = malloc(
                 (size_t)physical_tokens[r].len *
@@ -742,19 +801,33 @@ static int run_physical_rn_smoke(
                (size_t)prefix_len * sizeof(prompt->v[0]));
         physical_tokens[r].v[prefix_len] =
             draft_request[r].pending_token;
-        physical_tokens[r].v[prefix_len + 1] =
-            draft_request[r].draft_tokens[0];
-        physical_tokens[r].v[prefix_len + 2] =
-            draft_request[r].draft_tokens[1];
+        for (uint32_t row = 0; row < 2u; row++) {
+            physical_tokens[r].v[prefix_len + 1 + (int)row] =
+                draft_request[r].draft_tokens[row];
+        }
+        /*
+         * The established physical-drafter parity guard covers two proposals.
+         * SPS profiling needs verifier shapes through K=5, so fill only the
+         * additional verifier rows with deterministic corpus tokens. Verifier
+         * cost depends on the target path and remains representative without
+         * expanding the drafter test's behavioral surface.
+         */
+        for (uint32_t row = 2u; row < 5u; row++) {
+            const int source =
+                (prefix_len + 3 + (int)r + (int)(row - 2u)) %
+                prompt->len;
+            physical_tokens[r].v[prefix_len + 1 + (int)row] =
+                prompt->v[source];
+        }
     }
     for (uint32_t r = 0; rc == 0 && r < request_count; r++) {
         logits[r] = malloc((size_t)129280 * sizeof(float));
         sequential_logits[r] =
             malloc((size_t)129280 * sizeof(float));
         row_logits[r] =
-            malloc((size_t)3 * 129280 * sizeof(float));
+            malloc((size_t)6 * 129280 * sizeof(float));
         sequential_row_logits[r] =
-            malloc((size_t)3 * 129280 * sizeof(float));
+            malloc((size_t)6 * 129280 * sizeof(float));
         if (!logits[r] || !sequential_logits[r] ||
             !row_logits[r] || !sequential_row_logits[r]) {
             rc = 1;
@@ -951,6 +1024,211 @@ static int run_physical_rn_smoke(
         (void)ds4_sessions_verify_suffix_rn_abort(
                 txn, NULL, 0);
     }
+    if (parity && getenv("DS4_BENCH_SPS_PROFILE") != NULL) {
+        uint32_t profile_runs = 10u;
+        uint32_t only_r = 0u;
+        uint32_t only_batch = 0u;
+        const char *runs_env = getenv("DS4_BENCH_SPS_RUNS");
+        if (runs_env && runs_env[0]) {
+            char *end = NULL;
+            const unsigned long parsed = strtoul(runs_env, &end, 10);
+            if (end != runs_env && *end == '\0' &&
+                parsed >= 3u && parsed <= 100u) {
+                profile_runs = (uint32_t)parsed;
+            }
+        }
+        const char *only_r_env = getenv("DS4_BENCH_SPS_ONLY_R");
+        if (only_r_env && only_r_env[0]) {
+            char *end = NULL;
+            const unsigned long parsed = strtoul(only_r_env, &end, 10);
+            if (end != only_r_env && *end == '\0' &&
+                parsed >= 1u && parsed <= request_count) {
+                only_r = (uint32_t)parsed;
+            }
+        }
+        const char *only_batch_env = getenv("DS4_BENCH_SPS_ONLY_BATCH");
+        if (only_batch_env && only_batch_env[0]) {
+            char *end = NULL;
+            const unsigned long parsed =
+                strtoul(only_batch_env, &end, 10);
+            if (end != only_batch_env && *end == '\0' &&
+                parsed >= 1u &&
+                parsed <= (unsigned long)request_count * 6u) {
+                only_batch = (uint32_t)parsed;
+            }
+        }
+        for (uint32_t r = 0; r < request_count; r++) {
+            if (ds4_session_sync(
+                    sessions[r], &prefix, err, sizeof(err)) != 0) {
+                fprintf(stderr,
+                        "ds4-bench: SPS lane %u restore failed: %s\n",
+                        r, err);
+                rc = 1;
+                break;
+            }
+        }
+        const uint32_t raw_context_bucket =
+            (uint32_t)prefix_len >> 15u;
+        const uint32_t context_bucket =
+            raw_context_bucket < DS4_DSPARK_SPS_CONTEXT_BUCKETS
+                ? raw_context_bucket
+                : DS4_DSPARK_SPS_CONTEXT_BUCKETS - 1u;
+        for (uint32_t cohort_r = 1u;
+             rc == 0 && cohort_r <= request_count; cohort_r++) {
+            if (only_r != 0u && cohort_r != only_r) continue;
+            const uint32_t max_batch = cohort_r * 6u;
+            for (uint32_t batch = cohort_r;
+                 rc == 0 && batch <= max_batch; batch++) {
+                if (only_batch != 0u && batch != only_batch) continue;
+                uint32_t shapes[64][4];
+                const uint32_t shape_count =
+                    build_sps_shapes(cohort_r, batch, shapes);
+                if (shape_count == 0u) {
+                    rc = 1;
+                    snprintf(err, sizeof(err),
+                             "no SPS shape for R=%u B=%u",
+                             cohort_r, batch);
+                    break;
+                }
+                const uint32_t runs_per_shape = profile_runs;
+                for (uint32_t shape_index = 0u;
+                     rc == 0 && shape_index < shape_count;
+                     shape_index++) {
+                    uint32_t physical_rows = 0u;
+                    for (uint32_t r = 0; r < cohort_r; r++) {
+                        const uint32_t logical_rows =
+                            shapes[shape_index][r];
+                        const uint32_t shadow_tail =
+                            logical_rows == 1u ? 1u : 0u;
+                        const uint32_t rows =
+                            logical_rows + shadow_tail;
+                        physical_rows += rows;
+                        request[r].rows = rows;
+                        request[r].capture_prefixes = rows - 1u;
+                        request[r].shadow_tail_rows = shadow_tail;
+                        sequential_request[r] = request[r];
+                        sequential_request[r].row_tops =
+                            sequential_tops[r];
+                        sequential_request[r].row_logits =
+                            sequential_row_logits[r];
+                        sequential_request[r].continuation_logits =
+                            sequential_logits[r];
+                    }
+                    /*
+                     * Each partition can select a different graph topology.
+                     * Warm both executors before recording the partition so
+                     * graph creation never contaminates the SPS curve.
+                     */
+                    for (uint32_t r = 0;
+                         rc == 0 && r < cohort_r; r++) {
+                        rc = ds4_sessions_verify_suffix_rn(
+                                &sequential_request[r], 1u,
+                                err, sizeof(err));
+                    }
+                    if (rc == 0) {
+                        rc = ds4_sessions_verify_suffix_rn(
+                                request, cohort_r, err, sizeof(err));
+                    }
+                    double shape_squared = 0.0;
+                    double shape_reference = 0.0;
+                    for (uint32_t r = 0;
+                         rc == 0 && r < cohort_r; r++) {
+                        const uint64_t values =
+                            (uint64_t)request[r].rows * 129280u;
+                        for (uint64_t i = 0; i < values; i++) {
+                            const double delta =
+                                (double)row_logits[r][i] -
+                                (double)sequential_row_logits[r][i];
+                            shape_squared += delta * delta;
+                            shape_reference +=
+                                (double)sequential_row_logits[r][i] *
+                                (double)sequential_row_logits[r][i];
+                        }
+                    }
+                    const double shape_rel_rmse =
+                        shape_reference > 0.0
+                            ? sqrt(shape_squared / shape_reference)
+                            : sqrt(shape_squared);
+                    if (rc == 0 &&
+                        (!isfinite(shape_rel_rmse) ||
+                         shape_rel_rmse > 1.0e-5)) {
+                        flockfile(stderr);
+                        fprintf(stderr,
+                                "ds4-bench: SPS parity failed R=%u "
+                                "batch=%u rows=%u shape=",
+                                cohort_r, batch, physical_rows);
+                        for (uint32_t r = 0; r < cohort_r; r++) {
+                            fprintf(stderr, "%s%u",
+                                    r == 0u ? "" : ",",
+                                    shapes[shape_index][r]);
+                        }
+                        fprintf(stderr, " rel-rmse=%.8f\n",
+                                shape_rel_rmse);
+                        funlockfile(stderr);
+                        snprintf(err, sizeof(err),
+                                 "SPS shape parity failed");
+                        rc = 1;
+                    }
+                    for (uint32_t run = 0;
+                         rc == 0 && run < runs_per_shape; run++) {
+                        const double serial_t0 = bench_now_sec();
+                        for (uint32_t r = 0;
+                             rc == 0 && r < cohort_r; r++) {
+                            rc = ds4_sessions_verify_suffix_rn(
+                                    &sequential_request[r], 1u,
+                                    err, sizeof(err));
+                        }
+                        const double serial_seconds =
+                            bench_now_sec() - serial_t0;
+                        if (rc != 0) break;
+                        fprintf(stderr,
+                                "ds4-bench: SPS sample executor=serial "
+                                "path=neural bucket=%u R=%u batch=%u "
+                                "rows=%u verify=%.6f ms shape=",
+                                context_bucket, cohort_r, batch,
+                                physical_rows,
+                                serial_seconds * 1000.0);
+                        for (uint32_t r = 0; r < cohort_r; r++) {
+                            fprintf(stderr, "%s%u",
+                                    r == 0u ? "" : ",",
+                                    shapes[shape_index][r]);
+                        }
+                        fprintf(stderr, " run=%u\n", run);
+
+                        const double physical_t0 = bench_now_sec();
+                        rc = ds4_sessions_verify_suffix_rn(
+                                request, cohort_r, err, sizeof(err));
+                        const double physical_seconds =
+                            bench_now_sec() - physical_t0;
+                        if (rc != 0) break;
+                        fprintf(stderr,
+                                "ds4-bench: SPS sample executor=physical "
+                                "path=neural bucket=%u R=%u batch=%u "
+                                "rows=%u verify=%.6f ms shape=",
+                                context_bucket, cohort_r, batch,
+                                physical_rows,
+                                physical_seconds * 1000.0);
+                        for (uint32_t r = 0; r < cohort_r; r++) {
+                            fprintf(stderr, "%s%u",
+                                    r == 0u ? "" : ",",
+                                    shapes[shape_index][r]);
+                        }
+                        fprintf(stderr, " run=%u\n", run);
+                    }
+                }
+            }
+        }
+        if (rc != 0) {
+            fprintf(stderr,
+                    "ds4-bench: SPS profiling failed: %s\n",
+                    err[0] ? err : "verifier error");
+        } else {
+            fprintf(stderr,
+                    "ds4-bench: SPS profiling complete R=1..%u "
+                    "runs-per-shape=%u bucket=%u\n",
+                    request_count, profile_runs, context_bucket);
+        }
+    }
     if (!parity) {
         fprintf(stderr, "ds4-bench: physical R=%u lane rel-rmse",
                 request_count);
@@ -1012,7 +1290,16 @@ static int run_physical_rn_smoke(
     for (uint32_t r = 1; r < allocated_sessions; r++) {
         ds4_session_free(sessions[r]);
     }
-    ds4_session_rewind(owner, 0);
+    if (preserve_owner_frontier && rc == 0) {
+        if (ds4_session_sync(owner, &prefix, err, sizeof(err)) != 0) {
+            fprintf(stderr,
+                    "ds4-bench: failed to preserve SPS owner frontier %d: %s\n",
+                    prefix_len, err);
+            rc = 1;
+        }
+    } else {
+        ds4_session_rewind(owner, 0);
+    }
     return rc;
 }
 
@@ -1087,12 +1374,73 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         return 1;
     }
-    if (getenv("DS4_BENCH_PHYSICAL_RN_SMOKE") != NULL &&
-        run_physical_rn_smoke(session, &prompt) != 0) {
-        ds4_session_free(session);
-        ds4_tokens_free(&prompt);
-        ds4_engine_close(engine);
-        return 1;
+    if (getenv("DS4_BENCH_PHYSICAL_RN_SMOKE") != NULL) {
+        const bool sps_profile =
+            getenv("DS4_BENCH_SPS_PROFILE") != NULL;
+        if (sps_profile && cfg.n_frontiers > 0u) {
+            uint32_t max_r = 2u;
+            const char *max_r_env =
+                getenv("DS4_BENCH_PHYSICAL_RN_SMOKE");
+            if (max_r_env && max_r_env[0]) {
+                char *end = NULL;
+                const unsigned long parsed =
+                    strtoul(max_r_env, &end, 10);
+                if (end != max_r_env && *end == '\0' &&
+                    parsed >= 1u && parsed <= 4u) {
+                    max_r = (uint32_t)parsed;
+                }
+            }
+            unsigned long multi_r_max_prefix = ULONG_MAX;
+            const char *multi_r_env =
+                getenv("DS4_DSPARK_SPS_MULTI_R_MAX_PREFIX");
+            if (multi_r_env && multi_r_env[0]) {
+                char *end = NULL;
+                const unsigned long parsed =
+                    strtoul(multi_r_env, &end, 10);
+                if (end != multi_r_env && *end == '\0') {
+                    multi_r_max_prefix = parsed;
+                }
+            }
+            for (size_t i = 0; i < cfg.n_frontiers; i++) {
+                const int prefix = cfg.frontiers[i];
+                const uint32_t request_count =
+                    (unsigned long)prefix > multi_r_max_prefix
+                        ? 1u : max_r;
+                fprintf(stderr,
+                        "ds4-bench: incremental SPS frontier=%d "
+                        "bucket=%u max-r=%u\n",
+                        prefix,
+                        (uint32_t)prefix / 32768u,
+                        request_count);
+                if (run_physical_rn_smoke(
+                            session, &prompt, request_count,
+                            prefix, true) != 0) {
+                    ds4_session_free(session);
+                    ds4_tokens_free(&prompt);
+                    ds4_engine_close(engine);
+                    free(cfg.frontiers);
+                    return 1;
+                }
+            }
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            free(cfg.frontiers);
+            return 0;
+        }
+        if (run_physical_rn_smoke(
+                    session, &prompt, 0u, 0, false) != 0) {
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 1;
+        }
+        if (sps_profile) {
+            ds4_session_free(session);
+            ds4_tokens_free(&prompt);
+            ds4_engine_close(engine);
+            return 0;
+        }
     }
     maybe_warn_distributed_step_shape(&cfg, session);
     const bench_process_memory ready_memory = bench_process_memory_read();

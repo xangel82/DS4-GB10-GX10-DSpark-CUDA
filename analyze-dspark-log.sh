@@ -93,6 +93,34 @@ function text_value(prefix,    i,a) {
 /dspark pre-draft bypass/ { predraft_bypass++ }
 /dspark scheduler K0 cooldown=/ { k0_cooldowns++ }
 /dspark admission R=/ {
+  sps_curve = text_value("sps_curve")
+  if (sps_curve == "offline") {
+    offline_sps_cohorts++
+  } else if (sps_curve == "generic") {
+    generic_sps_cohorts++
+  } else if (sps_curve == "shape") {
+    shape_sps_cohorts++
+  } else if (sps_curve == "lane-model") {
+    lane_model_sps_cohorts++
+  }
+  physical_sps_curve = text_value("physical_curve")
+  if (physical_sps_curve == "offline") {
+    physical_offline_sps_cohorts++
+  } else if (physical_sps_curve == "generic") {
+    physical_generic_sps_cohorts++
+  } else if (physical_sps_curve == "shape") {
+    physical_shape_sps_cohorts++
+  }
+  serial_sps_curve = text_value("serial_curve")
+  if (serial_sps_curve == "offline") {
+    serial_offline_sps_cohorts++
+  } else if (serial_sps_curve == "generic") {
+    serial_generic_sps_cohorts++
+  } else if (serial_sps_curve == "shape") {
+    serial_shape_sps_cohorts++
+  } else if (serial_sps_curve == "lane-model") {
+    serial_lane_model_sps_cohorts++
+  }
   shape_curve = text_value("shape_curve")
   if (shape_curve != "") {
     split(shape_curve, shape_parts, "/")
@@ -594,6 +622,38 @@ END {
              shape_curve_hits, shape_curve_queries,
              shape_hit_rate,
              shape_curve_full_records, shape_curve_records
+    }
+    if (offline_sps_cohorts + generic_sps_cohorts > 0) {
+      offline_sps_rate = 100.0 * offline_sps_cohorts \
+        / (offline_sps_cohorts + generic_sps_cohorts)
+      printf "Offline SPS curves:       %d/%d cohorts (%.2f%%), generic=%d\n",
+             offline_sps_cohorts,
+             offline_sps_cohorts + generic_sps_cohorts,
+             offline_sps_rate,
+             generic_sps_cohorts
+    }
+    if (shape_sps_cohorts + lane_model_sps_cohorts > 0) {
+      printf "Shape-aware SPS selections: shape=%d lane-model=%d\n",
+             shape_sps_cohorts, lane_model_sps_cohorts
+    }
+    if (physical_offline_sps_cohorts + physical_generic_sps_cohorts > 0 ||
+        physical_shape_sps_cohorts > 0 ||
+        serial_offline_sps_cohorts + serial_generic_sps_cohorts > 0 ||
+        serial_shape_sps_cohorts + serial_lane_model_sps_cohorts > 0) {
+      printf "  physical candidate: offline=%d generic=%d\n",
+             physical_offline_sps_cohorts,
+             physical_generic_sps_cohorts
+      printf "  serial candidate:   offline=%d generic=%d\n",
+             serial_offline_sps_cohorts,
+             serial_generic_sps_cohorts
+      if (physical_shape_sps_cohorts + \
+          serial_shape_sps_cohorts + \
+          serial_lane_model_sps_cohorts > 0) {
+        printf "  exact/model curves:  physical-shape=%d serial-shape=%d serial-lane-model=%d\n",
+               physical_shape_sps_cohorts,
+               serial_shape_sps_cohorts,
+               serial_lane_model_sps_cohorts
+      }
     }
   } else if (timing_hardware_cycles > 0) {
     printf "Hardware scheduler mean R/batch: %.3f / %.3f (from timing)\n",

@@ -169,6 +169,35 @@ int ds4_dspark_hardware_schedule_step(
         uint32_t sps_count,
         ds4_dspark_schedule_step_result *result);
 
+/* Evaluate two executor curves and their independent exact-shape models
+ * against the same t-2 history, then advance the shared history exactly once.
+ * This keeps executor selection causal while allowing physical and serial
+ * implementations to choose different prefixes. */
+int ds4_dspark_hardware_schedule_step_pair_shape(
+        ds4_dspark_scheduler_state *state,
+        const ds4_dspark_schedule_item *items,
+        uint32_t request_count,
+        const double *first_sps,
+        ds4_dspark_shape_sps_fn first_shape_sps,
+        void *first_shape_sps_opaque,
+        const double *second_sps,
+        ds4_dspark_shape_sps_fn second_shape_sps,
+        void *second_shape_sps_opaque,
+        uint32_t sps_count,
+        ds4_dspark_schedule_step_result *first_result,
+        ds4_dspark_schedule_step_result *second_result);
+
+/* Row-only compatibility wrapper around the paired shape-aware API. */
+int ds4_dspark_hardware_schedule_step_pair(
+        ds4_dspark_scheduler_state *state,
+        const ds4_dspark_schedule_item *items,
+        uint32_t request_count,
+        const double *first_sps,
+        const double *second_sps,
+        uint32_t sps_count,
+        ds4_dspark_schedule_step_result *first_result,
+        ds4_dspark_schedule_step_result *second_result);
+
 /* Shape-aware production variant. The ordinary API remains the deterministic
  * row-only reference used by existing callers and tests. */
 int ds4_dspark_hardware_schedule_step_shape(

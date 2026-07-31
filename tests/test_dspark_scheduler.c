@@ -341,6 +341,101 @@ static void test_stateful_two_step_barrier(void) {
                  "historical capacity must be filled by current confidence");
 }
 
+static void test_executor_pair_advances_history_once(void) {
+    ds4_dspark_scheduler_state state;
+    ds4_dspark_scheduler_state_reset(&state);
+    ds4_dspark_schedule_item item = schedule_item(77, 0.95, 0.90);
+    const double physical_sps[] = {0.0, 5.0, 8.0, 10.0};
+    const double serial_sps[] = {0.0, 10.0, 5.0, 2.0};
+    ds4_dspark_schedule_step_result physical;
+    ds4_dspark_schedule_step_result serial;
+
+    require_true(ds4_dspark_hardware_schedule_step_pair(
+                     &state, &item, 1u,
+                     physical_sps, serial_sps, 4u,
+                     &physical, &serial) == 0,
+                 "paired executor scheduling failed");
+    require_true(physical.selected.prefix[0] == 2u &&
+                 serial.selected.prefix[0] == 0u,
+                 "executor curves must produce independent prefixes");
+    require_true(state.step == 1u && state.entry_count == 1u &&
+                 state.entries[0].history_count == 1u,
+                 "paired scheduling must advance shared history once");
+
+    require_true(ds4_dspark_hardware_schedule_step_pair(
+                     &state, &item, 1u,
+                     physical_sps, serial_sps, 4u,
+                     &physical, &serial) == 0,
+                 "second paired executor scheduling failed");
+    require_true(state.step == 2u &&
+                 state.entries[0].history_count == 2u,
+                 "second paired step must retain two observations");
+
+    item.request.conditional[0] = 0.40;
+    item.request.conditional[1] = 0.20;
+    require_true(ds4_dspark_hardware_schedule_step_pair(
+                     &state, &item, 1u,
+                     physical_sps, serial_sps, 4u,
+                     &physical, &serial) == 0,
+                 "asynchronous paired executor scheduling failed");
+    require_true(state.step == 3u &&
+                 physical.used_async == 1u &&
+                 serial.used_async == 1u,
+                 "both executor candidates must share exact t-2 readiness");
+}
+
+typedef struct {
+    uint32_t calls;
+    uint32_t prefer_long;
+} pair_shape_probe;
+
+static double test_pair_shape_curve(
+        const uint32_t *prefix,
+        uint32_t request_count,
+        uint32_t batch_size,
+        void *opaque) {
+    pair_shape_probe *probe = (pair_shape_probe *)opaque;
+    require_true(probe != NULL && prefix != NULL &&
+                 request_count == 1u &&
+                 batch_size == prefix[0] + 1u,
+                 "paired shape callback contract");
+    probe->calls++;
+    if (probe->prefer_long) {
+        return prefix[0] == 2u ? 20.0 :
+               prefix[0] == 1u ? 10.0 : 5.0;
+    }
+    return prefix[0] == 0u ? 20.0 : 1.0;
+}
+
+static void test_executor_pair_uses_independent_shapes(void) {
+    ds4_dspark_scheduler_state state;
+    ds4_dspark_scheduler_state_reset(&state);
+    ds4_dspark_schedule_item item = schedule_item(91, 0.95, 0.90);
+    const double same_sps[] = {0.0, 5.0, 5.0, 5.0};
+    pair_shape_probe physical_probe = {.prefer_long = 1u};
+    pair_shape_probe serial_probe = {.prefer_long = 0u};
+    ds4_dspark_schedule_step_result physical;
+    ds4_dspark_schedule_step_result serial;
+
+    require_true(ds4_dspark_hardware_schedule_step_pair_shape(
+                     &state, &item, 1u,
+                     same_sps,
+                     test_pair_shape_curve, &physical_probe,
+                     same_sps,
+                     test_pair_shape_curve, &serial_probe,
+                     4u, &physical, &serial) == 0,
+                 "paired shape-aware scheduling failed");
+    require_true(physical.selected.prefix[0] == 2u &&
+                 serial.selected.prefix[0] == 0u,
+                 "each executor must optimize its own exact shape");
+    require_true(physical_probe.calls >= 3u &&
+                 serial_probe.calls >= 2u,
+                 "both paired shape curves must be evaluated");
+    require_true(state.step == 1u &&
+                 state.entries[0].history_count == 1u,
+                 "paired shape scheduling must commit history once");
+}
+
 static void test_history_reset_preserves_runtime_step(void) {
     ds4_dspark_scheduler_state state;
     ds4_dspark_scheduler_state_reset(&state);
@@ -718,6 +813,8 @@ int main(void) {
     test_async_current_confidence_cannot_expand_capacity();
     test_shape_aware_step_and_fallback();
     test_stateful_two_step_barrier();
+    test_executor_pair_advances_history_once();
+    test_executor_pair_uses_independent_shapes();
     test_history_reset_preserves_runtime_step();
     test_physical_confirmation_probe();
     test_stateful_cohort_reordering();

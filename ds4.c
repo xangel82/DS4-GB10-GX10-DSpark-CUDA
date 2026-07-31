@@ -42,6 +42,7 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
 #include "ds4_dspark_scheduler.h"
+#include "ds4_dspark_sps.h"
 #include "ds4_dspark_sts.h"
 
 #ifndef DS4_NO_GPU
@@ -24216,7 +24217,6 @@ static bool metal_graph_physical_attention_plan_init(
         DS4_N_LAYER > DS4_MAX_LAYER) {
         return true;
     }
-
     ds4_gpu_graph *first = requests[0].state;
     if (!first || first->raw_cap == 0u) return true;
     plan->request_count = request_count;
@@ -24706,6 +24706,98 @@ static bool metal_graph_verify_suffix_rn(
         !scratch->spec_logits) {
         return false;
     }
+
+    /*
+     * The GB10 target path changes its batched reduction geometry at six
+     * verifier rows.  N<=5 is numerically identical to independent lanes,
+     * while N>=6 can perturb attention slightly and the quantized MoE then
+     * amplifies that perturbation.  Preserve the lossless target contract by
+     * executing complete request-shaped lanes and assembling their logits in
+     * one physical arena.  The offline SPS curve measures this hardware cliff,
+     * so the scheduler can still choose the fast physical frontier whenever
+     * its admitted rows remain below it.
+     */
+    if (request_count > 1u && total_rows >= 6u) {
+        uint32_t max_lane_rows = 0u;
+        for (uint32_t r = 0; r < request_count; r++) {
+            if (requests[r].rows > max_lane_rows) {
+                max_lane_rows = requests[r].rows;
+            }
+        }
+        if (!metal_graph_ensure_physical_spec_logits(
+                    scratch, total_rows)) {
+            return false;
+        }
+        ds4_gpu_tensor *assembled_logits =
+            scratch->physical_spec_logits;
+        ds4_gpu_tensor *saved_spec_logits = scratch->spec_logits;
+        ds4_gpu_tensor *lane_logits = saved_spec_logits;
+        bool lane_logits_owned = false;
+        const uint64_t lane_logits_bytes =
+            (uint64_t)max_lane_rows * DS4_N_VOCAB * sizeof(float);
+        if (lane_logits == assembled_logits ||
+            ds4_gpu_tensor_bytes(lane_logits) < lane_logits_bytes) {
+            lane_logits = ds4_gpu_tensor_alloc(lane_logits_bytes);
+            lane_logits_owned = lane_logits != NULL;
+        }
+        bool ok = lane_logits != NULL;
+        for (uint32_t r = 0; ok && r < request_count; r++) {
+            const uint32_t physical_offset =
+                requests[r].physical_offset;
+            ds4_gpu_tensor *lane_output = NULL;
+            metal_physical_verify_stats lane_stats;
+            memset(&lane_stats, 0, sizeof(lane_stats));
+            scratch->spec_logits = lane_logits;
+            ok = metal_graph_verify_suffix_rn(
+                    scratch,
+                    model,
+                    weights,
+                    &requests[r],
+                    1u,
+                    &lane_output,
+                    &lane_stats);
+            requests[r].physical_offset = physical_offset;
+            if (ok) {
+                ok = lane_output != NULL &&
+                     ds4_gpu_tensor_copy_async(
+                         assembled_logits,
+                         (uint64_t)physical_offset *
+                             DS4_N_VOCAB * sizeof(float),
+                         lane_output,
+                         0,
+                         (uint64_t)requests[r].rows *
+                             DS4_N_VOCAB * sizeof(float)) != 0;
+            }
+            if (ok && stats) {
+                stats->physical_attention_layers +=
+                    lane_stats.physical_attention_layers;
+                stats->request_local_attention_layers +=
+                    lane_stats.request_local_attention_layers;
+                stats->indexed_attention_layers +=
+                    lane_stats.indexed_attention_layers;
+                stats->dense_attention_layers +=
+                    lane_stats.dense_attention_layers;
+            }
+        }
+        scratch->spec_logits = saved_spec_logits;
+        if (lane_logits_owned) {
+            ds4_gpu_tensor_free(lane_logits);
+        }
+        if (ok && output_logits) {
+            *output_logits = assembled_logits;
+        }
+        if (ok) {
+            static bool reported = false;
+            if (!reported) {
+                reported = true;
+                fprintf(stderr,
+                        "ds4: CUDA exact lane-partitioned verifier "
+                        "enabled for physical batches >=6 rows\n");
+            }
+        }
+        return ok;
+    }
+
     ds4_gpu_tensor *saved_spec_logits = scratch->spec_logits;
     const uint64_t required_logits_bytes =
         (uint64_t)total_rows * DS4_N_VOCAB * sizeof(float);
@@ -28147,12 +28239,16 @@ static void ds4_acquire_instance_lock(void) {
     atexit(ds4_release_instance_lock);
 }
 
-#define DS4_DSPARK_CONTEXT_BUCKETS 8u
+#define DS4_DSPARK_CONTEXT_BUCKETS DS4_DSPARK_SPS_CONTEXT_BUCKETS
 #define DS4_DSPARK_COST_WINDOW 9u
 #define DS4_DSPARK_RN_COST_SLOTS 512u
 #define DS4_DSPARK_RN_CONFIRM_GAIN 1.10
-#define DS4_DSPARK_HW_PROFILE_VERSION 2u
 #define DS4_DSPARK_RN_SHAPE_MIN_SAMPLES 8u
+#define DS4_DSPARK_RN_PHYSICAL_GAIN_PAIRED 1.01
+#define DS4_DSPARK_RN_PHYSICAL_GAIN_MATURE 1.05
+#define DS4_DSPARK_RN_PHYSICAL_GAIN_COLD 1.15
+#define DS4_DSPARK_HW_PROFILE_VERSION 2u
+#define DS4_DSPARK_SPS_KERNEL_ABI 3u
 #define DS4_DSPARK_RN_PROFILE_MAX_ROWS \
     (DS4_DSPARK_SCHEDULER_MAX_REQUESTS * \
      (DS4_HYBRID_LC_MAX_DRAFT + 1u))
@@ -28307,6 +28403,10 @@ struct ds4_session {
     uint64_t dspark_rn_cost_dirty;
     uint64_t dspark_rn_hw_fingerprint;
     char *dspark_rn_hw_profile_path;
+    ds4_dspark_sps_profile dspark_rn_sps_profile;
+    uint64_t dspark_rn_sps_fingerprint;
+    uint64_t dspark_rn_sps_curve_hits;
+    uint64_t dspark_rn_sps_curve_misses;
     uint32_t dspark_last_early_stop;
     uint32_t dspark_last_champion;
     double dspark_anchor_ewma;
@@ -28409,6 +28509,7 @@ static double dspark_stable_cycle_rate(
         const ds4_session *s, uint32_t k);
 static void dspark_rn_hardware_profile_load(ds4_session *s);
 static void dspark_rn_hardware_profile_save(ds4_session *s);
+static void dspark_rn_sps_profile_load(ds4_session *s);
 
 static bool dspark_hybrid_lc_store_requested(void) {
     return ds4_env_enabled("DS4_DSPARK_HYBRID_LC") ||
@@ -32653,6 +32754,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     if (e->dspark_ready) {
         dspark_rn_hardware_profile_load(s);
+        dspark_rn_sps_profile_load(s);
     }
 #endif
     *out = s;
@@ -37086,9 +37188,11 @@ static void dspark_rn_log_cohort(
         uint32_t request_count,
         const char *executor,
         const char *fallback,
+        int path_class,
         uint32_t drafted,
         uint32_t committed,
         uint32_t emitted,
+        uint32_t batch,
         uint32_t rows,
         double draft_seconds,
         double verify_seconds,
@@ -37104,18 +37208,38 @@ static void dspark_rn_log_cohort(
             wait_us = requests[r].rendezvous_wait_us;
         }
     }
+    uint32_t context_bucket = 0u;
+    for (uint32_t r = 0; r < request_count; r++) {
+        const ds4_session *session = requests[r].session;
+        uint64_t lane_bucket =
+            session && session->checkpoint.len > 0
+                ? (uint64_t)session->checkpoint.len >> 15u
+                : 0u;
+        if (lane_bucket >= DS4_DSPARK_CONTEXT_BUCKETS) {
+            lane_bucket = DS4_DSPARK_CONTEXT_BUCKETS - 1u;
+        }
+        if (lane_bucket > context_bucket) context_bucket = lane_bucket;
+    }
+    const char *path = path_class == 0
+        ? "neural"
+        : (path_class == 1
+           ? "hybrid" : "unknown");
     fprintf(stderr,
             "ds4: dspark cohort timing cohort=%llu requested_r=%u "
-            "executor=%s fallback=%s drafted=%u committed=%u "
-            "emitted=%u rows=%u wait_us=%llu draft=%.3f ms "
+            "executor=%s fallback=%s path=%s bucket=%u "
+            "drafted=%u committed=%u "
+            "emitted=%u batch=%u rows=%u wait_us=%llu draft=%.3f ms "
             "verify=%.3f ms total=%.3f ms\n",
             (unsigned long long)requests[0].cohort_id,
             request_count,
             executor ? executor : "unknown",
             fallback ? fallback : "none",
+            path,
+            context_bucket,
             drafted,
             committed,
             emitted,
+            batch,
             rows,
             (unsigned long long)wait_us,
             draft_seconds * 1000.0,
@@ -37214,6 +37338,78 @@ static uint64_t dspark_rn_hardware_fingerprint(
                 hash, (uint64_t)executable.st_mtim.tv_nsec);
     }
     return hash ? hash : UINT64_C(1);
+}
+
+static uint64_t dspark_rn_sps_fingerprint(
+        const ds4_session *s) {
+    if (!s || !s->engine) return 0u;
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = dspark_rn_fingerprint_mix(
+            hash, DS4_DSPARK_SPS_PROFILE_VERSION);
+    hash = dspark_rn_fingerprint_mix(
+            hash, DS4_DSPARK_SPS_KERNEL_ABI);
+    hash = dspark_rn_fingerprint_mix(hash, DS4_MODEL_VARIANT);
+    hash = dspark_rn_fingerprint_mix(hash, DS4_DSPARK_BLOCK_SIZE);
+    hash = dspark_rn_fingerprint_mix(
+            hash, (uint64_t)s->engine->backend);
+    hash = dspark_rn_fingerprint_mix(
+            hash, (uint64_t)s->engine->power_percent);
+    hash = dspark_rn_fingerprint_mix(hash, s->engine->model.size);
+    hash = dspark_rn_fingerprint_mix(
+            hash, s->engine->dspark_model.size);
+
+    const int fds[] = {
+        s->engine->model.fd,
+        s->engine->dspark_model.fd,
+    };
+    for (uint32_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++) {
+        struct stat st;
+        if (fds[i] >= 0 && fstat(fds[i], &st) == 0) {
+            hash = dspark_rn_fingerprint_mix(
+                    hash, (uint64_t)st.st_size);
+            hash = dspark_rn_fingerprint_mix(
+                    hash, (uint64_t)st.st_mtim.tv_sec);
+            hash = dspark_rn_fingerprint_mix(
+                    hash, (uint64_t)st.st_mtim.tv_nsec);
+        }
+    }
+    return hash ? hash : UINT64_C(1);
+}
+
+static void dspark_rn_sps_profile_load(ds4_session *s) {
+    if (!s || s->shared_scratch_lane || !s->engine ||
+        !s->engine->dspark_ready) {
+        return;
+    }
+    const char *path = getenv("DS4_DSPARK_SPS_PROFILE");
+    if (!path || !path[0]) return;
+    s->dspark_rn_sps_fingerprint = dspark_rn_sps_fingerprint(s);
+    fprintf(stderr,
+            "ds4: DSpark offline SPS fingerprint=%016llx profile=%s\n",
+            (unsigned long long)s->dspark_rn_sps_fingerprint, path);
+
+    char err[256];
+    errno = 0;
+    if (ds4_dspark_sps_profile_load(
+            path,
+            s->dspark_rn_sps_fingerprint,
+            &s->dspark_rn_sps_profile,
+            err,
+            sizeof(err)) != 0) {
+        if (errno != ENOENT || getenv("DS4_DSPARK_LOG") != NULL) {
+            fprintf(stderr,
+                    "ds4: offline DSpark SPS profile unavailable: %s "
+                    "(%s); using the complete generic curve\n",
+                    path, err[0] ? err : "load failed");
+        }
+        return;
+    }
+    fprintf(stderr,
+            "ds4: immutable offline DSpark SPS profile loaded: %s "
+            "(records=%u complete-groups=%u)\n",
+            path,
+            s->dspark_rn_sps_profile.record_count,
+            s->dspark_rn_sps_profile.complete_groups);
 }
 
 static void dspark_rn_hardware_profile_load(ds4_session *s) {
@@ -37500,14 +37696,51 @@ static void dspark_rn_cost_profile_note(
 
 typedef struct {
     ds4_session *owner;
+    ds4_speculative_request *requests;
     double draft_seconds;
     uint8_t context_bucket;
+    uint8_t executor;
+    bool allow_profile_curve;
+    bool prefer_row_curve;
     uint8_t lane_context_bucket[DS4_DSPARK_SCHEDULER_MAX_REQUESTS];
     uint32_t queries;
-    uint32_t hits;
+    uint32_t profile_hits;
+    uint32_t model_hits;
+    uint32_t mature_model_hits;
 } dspark_rn_shape_curve;
 
-static double dspark_rn_physical_shape_sps(
+static double dspark_rn_serial_shape_verify_seconds(
+        const dspark_rn_shape_curve *curve,
+        const uint32_t *prefix,
+        uint32_t request_count,
+        bool *mature_out) {
+    if (mature_out) *mature_out = false;
+    if (!curve || !curve->requests || !prefix ||
+        request_count == 0u) {
+        return 0.0;
+    }
+    bool mature = true;
+    double verify_seconds = 0.0;
+    for (uint32_t r = 0; r < request_count; r++) {
+        ds4_session *session = curve->requests[r].session;
+        if (!session) return 0.0;
+        const uint32_t verifier_k =
+            prefix[r] != 0u ? prefix[r] : 1u;
+        uint32_t samples = 0u;
+        double mad = 0.0;
+        const double lane_seconds = dspark_robust_verify_cost(
+                session, verifier_k, &samples, &mad);
+        if (!(lane_seconds > 0.0) || !isfinite(lane_seconds)) {
+            return 0.0;
+        }
+        verify_seconds += lane_seconds;
+        if (samples < 3u) mature = false;
+    }
+    if (mature_out) *mature_out = mature;
+    return verify_seconds;
+}
+
+static double dspark_rn_executor_shape_sps(
         const uint32_t *prefix,
         uint32_t request_count,
         uint32_t batch_size,
@@ -37515,37 +37748,167 @@ static double dspark_rn_physical_shape_sps(
     dspark_rn_shape_curve *curve =
         (dspark_rn_shape_curve *)opaque;
     if (!curve || !curve->owner || !prefix ||
-        request_count == 0u) {
+        request_count == 0u ||
+        request_count > DS4_DSPARK_SCHEDULER_MAX_REQUESTS) {
         return 0.0;
     }
     curve->queries++;
+
     uint32_t profile_rows = batch_size;
     for (uint32_t r = 0; r < request_count; r++) {
         if (prefix[r] == 0u) profile_rows++;
     }
-    const uint64_t shape =
-        dspark_rn_shape_hash(
-                prefix, curve->lane_context_bucket, request_count);
+    const uint64_t shape = dspark_rn_shape_hash(
+            prefix, curve->lane_context_bucket, request_count);
     double verify_seconds = 0.0;
-    uint64_t samples = 0u;
-    if (!dspark_rn_cost_profile_lookup(
-            curve->owner,
-            DS4_DSPARK_RN_EXEC_PHYSICAL,
-            DS4_DSPARK_RN_PATH_NEURAL,
-            curve->context_bucket,
-            request_count,
-            profile_rows,
-            shape,
-            &verify_seconds,
-            &samples) ||
-        samples < DS4_DSPARK_RN_SHAPE_MIN_SAMPLES) {
+    if (curve->allow_profile_curve) {
+        uint64_t samples = 0u;
+        (void)dspark_rn_cost_profile_lookup(
+                curve->owner,
+                curve->executor,
+                DS4_DSPARK_RN_PATH_NEURAL,
+                curve->context_bucket,
+                request_count,
+                profile_rows,
+                shape,
+                &verify_seconds,
+                &samples);
+        if (samples >= DS4_DSPARK_RN_SHAPE_MIN_SAMPLES &&
+            verify_seconds > 0.0 && isfinite(verify_seconds)) {
+            const double seconds =
+                curve->draft_seconds + verify_seconds;
+            if (seconds > 0.0 && isfinite(seconds)) {
+                curve->profile_hits++;
+                return 1.0 / seconds;
+            }
+        }
+    }
+
+    /* Physical execution cannot be decomposed into independent lanes.  For
+     * serial execution the sum of robust per-lane K costs is the exact
+     * executor model, but an immutable measured row curve takes precedence
+     * until an exact online shape has enough samples. */
+    if (curve->executor != DS4_DSPARK_RN_EXEC_SERIAL ||
+        curve->prefer_row_curve) {
         return 0.0;
     }
-    const double seconds =
-        curve->draft_seconds + verify_seconds;
-    if (!(seconds > 0.0)) return 0.0;
-    curve->hits++;
+    bool mature = false;
+    verify_seconds = dspark_rn_serial_shape_verify_seconds(
+            curve, prefix, request_count, &mature);
+    const double seconds = curve->draft_seconds + verify_seconds;
+    if (!(verify_seconds > 0.0) ||
+        !(seconds > 0.0) || !isfinite(seconds)) {
+        return 0.0;
+    }
+    curve->model_hits++;
+    if (mature) curve->mature_model_hits++;
     return 1.0 / seconds;
+}
+
+static bool dspark_rn_apply_offline_sps_curve(
+        ds4_session *owner,
+        uint8_t executor,
+        uint8_t context_bucket,
+        uint32_t request_count,
+        double draft_seconds,
+        double *sps,
+        uint32_t sps_count) {
+    if (!owner || !sps ||
+        (executor != DS4_DSPARK_RN_EXEC_PHYSICAL &&
+         executor != DS4_DSPARK_RN_EXEC_SERIAL) ||
+        request_count == 0u ||
+        request_count > DS4_DSPARK_SPS_MAX_REQUESTS) {
+        return false;
+    }
+    double verify_seconds[DS4_DSPARK_SPS_MAX_ROWS + 1u];
+    memset(verify_seconds, 0, sizeof(verify_seconds));
+    if (!ds4_dspark_sps_profile_curve(
+            &owner->dspark_rn_sps_profile,
+            executor,
+            DS4_DSPARK_RN_PATH_NEURAL,
+            context_bucket,
+            request_count,
+            verify_seconds,
+            NULL,
+            DS4_DSPARK_SPS_MAX_ROWS + 1u)) {
+        owner->dspark_rn_sps_curve_misses++;
+        return false;
+    }
+    const uint32_t max_rows =
+        request_count * (DS4_DSPARK_BLOCK_SIZE + 1u);
+    if (sps_count <= max_rows) {
+        owner->dspark_rn_sps_curve_misses++;
+        return false;
+    }
+    for (uint32_t rows = request_count; rows <= max_rows; rows++) {
+        const double seconds = draft_seconds + verify_seconds[rows];
+        if (!(seconds > 0.0) || !isfinite(seconds)) {
+            owner->dspark_rn_sps_curve_misses++;
+            return false;
+        }
+    }
+    for (uint32_t rows = request_count; rows <= max_rows; rows++) {
+        sps[rows] = 1.0 / (draft_seconds + verify_seconds[rows]);
+    }
+    owner->dspark_rn_sps_curve_hits++;
+    return true;
+}
+
+static bool dspark_rn_build_serial_sps_curve(
+        ds4_session *owner,
+        ds4_speculative_request *requests,
+        const ds4_dspark_schedule_item *items,
+        uint32_t request_count,
+        double draft_seconds,
+        double *sps,
+        uint32_t sps_count) {
+    if (!owner || !requests || !items || !sps ||
+        request_count == 0u ||
+        request_count > DS4_DSPARK_SCHEDULER_MAX_REQUESTS) {
+        return false;
+    }
+    const uint32_t max_drafts =
+        request_count * DS4_DSPARK_BLOCK_SIZE;
+    const uint32_t max_rows = request_count + max_drafts;
+    if (sps_count <= max_rows) return false;
+
+    double cost[DS4_DSPARK_SCHEDULER_MAX_ROWS + 1u];
+    double next[DS4_DSPARK_SCHEDULER_MAX_ROWS + 1u];
+    for (uint32_t i = 0; i <= max_drafts; i++) cost[i] = -1.0;
+    cost[0] = 0.0;
+    uint32_t reachable = 0u;
+    for (uint32_t r = 0; r < request_count; r++) {
+        const uint32_t cap = items[r].request.max_prefix;
+        for (uint32_t i = 0; i <= max_drafts; i++) next[i] = -1.0;
+        for (uint32_t admitted = 0u;
+             admitted <= reachable; admitted++) {
+            if (cost[admitted] < 0.0) continue;
+            for (uint32_t k = 0u; k <= cap; k++) {
+                const uint32_t total = admitted + k;
+                const uint32_t verifier_k = k != 0u ? k : 1u;
+                const double lane =
+                    dspark_verify_cost_estimate(
+                            requests[r].session, verifier_k);
+                const double candidate = cost[admitted] + lane;
+                if (candidate > next[total]) next[total] = candidate;
+            }
+        }
+        reachable += cap;
+        memcpy(cost, next, (reachable + 1u) * sizeof(cost[0]));
+    }
+
+    for (uint32_t admitted = 0u; admitted <= reachable; admitted++) {
+        const uint32_t rows = request_count + admitted;
+        double verify_seconds = cost[admitted];
+        if (owner->dspark_rn_serial_verify_samples[rows] >= 2u) {
+            verify_seconds =
+                owner->dspark_rn_serial_verify_ewma[rows];
+        }
+        const double seconds = draft_seconds + verify_seconds;
+        if (!(seconds > 0.0) || !isfinite(seconds)) return false;
+        sps[rows] = 1.0 / seconds;
+    }
+    return true;
 }
 
 static void dspark_rn_finalize_lane(
@@ -37737,7 +38100,7 @@ int ds4_sessions_eval_speculative_sample_rn(
         const double elapsed = now_sec() - cohort_t0;
         dspark_rn_log_cohort(
                 requests, request_count, "fallback",
-                "forced-serial-singleton", 0u, 0u, emitted, 0u,
+                "forced-serial-singleton", -1, 0u, 0u, emitted, 0u, 0u,
                 0.0, elapsed, elapsed);
         return serial_rc;
     }
@@ -37753,8 +38116,8 @@ int ds4_sessions_eval_speculative_sample_rn(
     }
     const double elapsed = now_sec() - cohort_t0;
     dspark_rn_log_cohort(
-            requests, request_count, "fallback", "non-cuda",
-            0u, 0u, emitted, 0u, 0.0, elapsed, elapsed);
+            requests, request_count, "fallback", "non-cuda", -1,
+            0u, 0u, emitted, 0u, 0u, 0.0, elapsed, elapsed);
     return serial_rc;
 #else
     const bool force_physical =
@@ -37856,7 +38219,7 @@ int ds4_sessions_eval_speculative_sample_rn(
         dspark_rn_log_cohort(
                 requests, request_count, "fallback",
                 fallback_reason ? fallback_reason : "incompatible",
-                0u, 0u, emitted, 0u, 0.0, elapsed, elapsed);
+                -1, 0u, 0u, emitted, 0u, 0u, 0.0, elapsed, elapsed);
         return serial_rc;
     }
 
@@ -37881,10 +38244,10 @@ int ds4_sessions_eval_speculative_sample_rn(
             const double elapsed = now_sec() - cohort_t0;
             dspark_rn_log_cohort(
                     requests, request_count, "target-only",
-                    "historical", 0u, 0u,
+                    "historical", -1, 0u, 0u,
                     requests[0].result > 0
                         ? (uint32_t)requests[0].result : 0u,
-                    1u, 0.0, elapsed, elapsed);
+                    1u, 1u, 0.0, elapsed, elapsed);
             return requests[0].result >= 0 ? 0 : 1;
         }
     }
@@ -38002,7 +38365,7 @@ int ds4_sessions_eval_speculative_sample_rn(
         const double elapsed = now_sec() - cohort_t0;
         dspark_rn_log_cohort(
                 requests, request_count, "fallback", "draft-failed",
-                0u, 0u, emitted, 0u,
+                -1, 0u, 0u, emitted, 0u, 0u,
                 cohort_draft_seconds,
                 elapsed - cohort_draft_seconds,
                 elapsed);
@@ -38051,8 +38414,10 @@ int ds4_sessions_eval_speculative_sample_rn(
 
     const uint32_t max_rows =
         request_count * (DS4_DSPARK_BLOCK_SIZE + 1u);
-    double sps[max_rows + 1u];
-    memset(sps, 0, sizeof(sps));
+    double physical_sps[max_rows + 1u];
+    double serial_sps[max_rows + 1u];
+    memset(physical_sps, 0, sizeof(physical_sps));
+    memset(serial_sps, 0, sizeof(serial_sps));
     double anchor_sum = 0.0;
     for (uint32_t r = 0; r < request_count; r++) {
         double anchor = requests[r].session->dspark_anchor_ewma;
@@ -38074,95 +38439,261 @@ int ds4_sessions_eval_speculative_sample_rn(
         }
         const double seconds =
             cohort_draft_seconds + verify_seconds;
-        sps[rows] = seconds > 0.0 ? 1.0 / seconds : 0.0;
+        physical_sps[rows] =
+            seconds > 0.0 ? 1.0 / seconds : 0.0;
+    }
+    if (!dspark_rn_build_serial_sps_curve(
+            owner, requests, items, request_count,
+            cohort_draft_seconds, serial_sps, max_rows + 1u)) {
+        memcpy(serial_sps, physical_sps, sizeof(serial_sps));
     }
 
     const uint8_t cost_context_bucket =
         dspark_rn_context_bucket(requests, request_count);
-    dspark_rn_shape_curve shape_curve = {
-        .owner = owner,
-        .draft_seconds = cohort_draft_seconds,
-        .context_bucket = cost_context_bucket,
-    };
+    uint8_t lane_context_bucket[request_count];
     for (uint32_t r = 0; r < request_count; r++) {
-        shape_curve.lane_context_bucket[r] =
+        lane_context_bucket[r] =
             (uint8_t)dspark_context_bucket(requests[r].session);
     }
+    const bool physical_offline_sps =
+        dspark_rn_apply_offline_sps_curve(
+                owner,
+                DS4_DSPARK_RN_EXEC_PHYSICAL,
+                cost_context_bucket,
+                request_count,
+                cohort_draft_seconds,
+                physical_sps,
+                max_rows + 1u);
+    const bool serial_offline_sps =
+        dspark_rn_apply_offline_sps_curve(
+                owner,
+                DS4_DSPARK_RN_EXEC_SERIAL,
+                cost_context_bucket,
+                request_count,
+                cohort_draft_seconds,
+                serial_sps,
+                max_rows + 1u);
+    dspark_rn_shape_curve physical_shape_curve = {
+        .owner = owner,
+        .requests = requests,
+        .draft_seconds = cohort_draft_seconds,
+        .context_bucket = cost_context_bucket,
+        .executor = DS4_DSPARK_RN_EXEC_PHYSICAL,
+        .allow_profile_curve = true,
+        .prefer_row_curve = physical_offline_sps,
+    };
+    dspark_rn_shape_curve serial_shape_curve = {
+        .owner = owner,
+        .requests = requests,
+        .draft_seconds = cohort_draft_seconds,
+        .context_bucket = cost_context_bucket,
+        .executor = DS4_DSPARK_RN_EXEC_SERIAL,
+        .allow_profile_curve = true,
+        .prefer_row_curve = serial_offline_sps,
+    };
+    memcpy(physical_shape_curve.lane_context_bucket,
+           lane_context_bucket,
+           request_count * sizeof(lane_context_bucket[0]));
+    memcpy(serial_shape_curve.lane_context_bucket,
+           lane_context_bucket,
+           request_count * sizeof(lane_context_bucket[0]));
+    ds4_dspark_schedule_step_result physical_step;
+    ds4_dspark_schedule_step_result serial_step;
     ds4_dspark_schedule_step_result schedule_step;
+    memset(&physical_step, 0, sizeof(physical_step));
+    memset(&serial_step, 0, sizeof(serial_step));
     memset(&schedule_step, 0, sizeof(schedule_step));
-    rc = ds4_dspark_hardware_schedule_step_shape(
+    const ds4_dspark_scheduler_state scheduler_before =
+        owner->dspark_rn_hw_scheduler;
+    rc = ds4_dspark_hardware_schedule_step_pair_shape(
             &owner->dspark_rn_hw_scheduler,
             items,
             request_count,
-            sps,
+            physical_sps,
+            dspark_rn_executor_shape_sps,
+            &physical_shape_curve,
+            serial_sps,
+            dspark_rn_executor_shape_sps,
+            &serial_shape_curve,
             max_rows + 1u,
-            dspark_rn_physical_shape_sps,
-            &shape_curve,
-            &schedule_step);
+            &physical_step,
+            &serial_step);
+    const uint32_t physical_shape_probe_queries =
+        physical_shape_curve.queries;
+    const uint32_t physical_shape_probe_hits =
+        physical_shape_curve.profile_hits;
+    const uint32_t serial_shape_probe_queries =
+        serial_shape_curve.queries;
+    const uint32_t serial_shape_probe_hits =
+        serial_shape_curve.profile_hits +
+        serial_shape_curve.model_hits;
+    const bool serial_shape_probe_mixed =
+        serial_shape_curve.profile_hits != 0u &&
+        serial_shape_curve.model_hits != 0u;
+    bool physical_shape_active =
+        rc == 0 &&
+        physical_shape_probe_queries != 0u &&
+        physical_shape_probe_hits == physical_shape_probe_queries;
+    bool serial_shape_active =
+        rc == 0 &&
+        serial_shape_probe_queries != 0u &&
+        serial_shape_probe_hits == serial_shape_probe_queries;
+    if (rc == 0 &&
+        (!physical_shape_active ||
+         !serial_shape_active ||
+         serial_shape_probe_mixed)) {
+        owner->dspark_rn_hw_scheduler = scheduler_before;
+        if (serial_shape_probe_mixed) {
+            serial_shape_curve.allow_profile_curve = false;
+        }
+        physical_shape_curve.queries = 0u;
+        physical_shape_curve.profile_hits = 0u;
+        physical_shape_curve.model_hits = 0u;
+        physical_shape_curve.mature_model_hits = 0u;
+        serial_shape_curve.queries = 0u;
+        serial_shape_curve.profile_hits = 0u;
+        serial_shape_curve.model_hits = 0u;
+        serial_shape_curve.mature_model_hits = 0u;
+        rc = ds4_dspark_hardware_schedule_step_pair_shape(
+                &owner->dspark_rn_hw_scheduler,
+                items,
+                request_count,
+                physical_sps,
+                physical_shape_active
+                    ? dspark_rn_executor_shape_sps : NULL,
+                physical_shape_active
+                    ? &physical_shape_curve : NULL,
+                serial_sps,
+                serial_shape_active
+                    ? dspark_rn_executor_shape_sps : NULL,
+                serial_shape_active
+                    ? &serial_shape_curve : NULL,
+                max_rows + 1u,
+                &physical_step,
+                &serial_step);
+        if (rc != 0) {
+            physical_shape_active = false;
+            serial_shape_active = false;
+        }
+    }
+    const bool physical_shape_runtime_complete =
+        !physical_shape_active ||
+        (physical_shape_curve.queries != 0u &&
+         physical_shape_curve.profile_hits ==
+             physical_shape_curve.queries);
+    const bool serial_shape_runtime_complete =
+        !serial_shape_active ||
+        (serial_shape_curve.queries != 0u &&
+         ((serial_shape_curve.allow_profile_curve &&
+           serial_shape_curve.profile_hits ==
+               serial_shape_curve.queries &&
+           serial_shape_curve.model_hits == 0u) ||
+          (!serial_shape_curve.allow_profile_curve &&
+           serial_shape_curve.model_hits ==
+               serial_shape_curve.queries &&
+           serial_shape_curve.profile_hits == 0u)));
+    if (rc == 0 &&
+        (!physical_shape_runtime_complete ||
+         !serial_shape_runtime_complete)) {
+        /* A mixed first pass can expose shapes whose exact profile is mature
+         * even though their per-lane model is not.  If the coherent second
+         * pass cannot model every one of those shapes, discard that entire
+         * shape curve and run the candidate rows-only. */
+        owner->dspark_rn_hw_scheduler = scheduler_before;
+        if (!physical_shape_runtime_complete) {
+            physical_shape_active = false;
+        }
+        if (!serial_shape_runtime_complete) {
+            serial_shape_active = false;
+        }
+        physical_shape_curve.queries = 0u;
+        physical_shape_curve.profile_hits = 0u;
+        physical_shape_curve.model_hits = 0u;
+        physical_shape_curve.mature_model_hits = 0u;
+        serial_shape_curve.queries = 0u;
+        serial_shape_curve.profile_hits = 0u;
+        serial_shape_curve.model_hits = 0u;
+        serial_shape_curve.mature_model_hits = 0u;
+        rc = ds4_dspark_hardware_schedule_step_pair_shape(
+                &owner->dspark_rn_hw_scheduler,
+                items,
+                request_count,
+                physical_sps,
+                physical_shape_active
+                    ? dspark_rn_executor_shape_sps : NULL,
+                physical_shape_active
+                    ? &physical_shape_curve : NULL,
+                serial_sps,
+                serial_shape_active
+                    ? dspark_rn_executor_shape_sps : NULL,
+                serial_shape_active
+                    ? &serial_shape_curve : NULL,
+                max_rows + 1u,
+                &physical_step,
+                &serial_step);
+        if (rc != 0) {
+            physical_shape_active = false;
+            serial_shape_active = false;
+        }
+    }
     if (rc != 0) {
-        schedule_step.selected.request_count = request_count;
-        schedule_step.selected.batch_size = request_count;
-        schedule_step.selected.expected_tokens =
+        physical_step.selected.request_count = request_count;
+        physical_step.selected.batch_size = request_count;
+        physical_step.selected.expected_tokens =
             (double)request_count;
         for (uint32_t r = 0; r < request_count; r++) {
-            schedule_step.selected.prefix[r] =
+            physical_step.selected.prefix[r] =
                 (uint32_t)dspark_choose_verify_len(
                         requests[r].session,
                         draft[r].confidence_logits,
                         verify_cap[r],
                         lane_draft_seconds);
-            if (schedule_step.selected.prefix[r] <
+            if (physical_step.selected.prefix[r] <
                 items[r].request.minimum_prefix) {
-                schedule_step.selected.prefix[r] =
+                physical_step.selected.prefix[r] =
                     items[r].request.minimum_prefix;
             }
             double survival = 1.0;
             for (uint32_t i = 0;
-                 i < schedule_step.selected.prefix[r]; i++) {
+                 i < physical_step.selected.prefix[r]; i++) {
                 survival *= items[r].request.conditional[i];
-                schedule_step.selected.expected_tokens += survival;
+                physical_step.selected.expected_tokens += survival;
             }
-            schedule_step.selected.batch_size +=
-                schedule_step.selected.prefix[r];
+            physical_step.selected.batch_size +=
+                physical_step.selected.prefix[r];
         }
-        schedule_step.selected.throughput =
-            schedule_step.selected.expected_tokens *
-            sps[schedule_step.selected.batch_size];
+        physical_step.selected.throughput =
+            physical_step.selected.expected_tokens *
+            physical_sps[physical_step.selected.batch_size];
+        physical_step.selected.capacity_batch_size =
+            physical_step.selected.batch_size;
+        physical_step.selected.capacity_throughput =
+            physical_step.selected.throughput;
+        serial_step = physical_step;
+        serial_step.selected.throughput =
+            serial_step.selected.expected_tokens *
+            serial_sps[serial_step.selected.batch_size];
+        serial_step.selected.capacity_throughput =
+            serial_step.selected.throughput;
         rc = 0;
     }
 
-    uint32_t serial_rows = request_count;
+    const uint32_t serial_rows =
+        serial_step.selected.batch_size;
     uint32_t serial_profile_rows = request_count;
-    double serial_expected = (double)request_count;
-    double serial_verify_seconds = 0.0;
     for (uint32_t r = 0; r < request_count; r++) {
-        uint32_t selected = dspark_choose_verify_len(
-                requests[r].session,
-                draft[r].confidence_logits,
-                verify_cap[r],
-                lane_draft_seconds);
-        if (selected < items[r].request.minimum_prefix) {
-            selected = items[r].request.minimum_prefix;
-        }
+        uint32_t selected = serial_step.selected.prefix[r];
         if (selected > verify_cap[r]) selected = verify_cap[r];
         serial_prefix[r] = selected;
-        serial_rows += selected;
         serial_profile_rows += selected != 0u ? selected : 1u;
-        double survival = 1.0;
-        for (uint32_t i = 0; i < selected; i++) {
-            survival *= items[r].request.conditional[i];
-            serial_expected += survival;
-        }
-        serial_verify_seconds += dspark_verify_cost_estimate(
-                requests[r].session, selected);
     }
     const uint64_t serial_shape =
         dspark_rn_shape_hash(
-                serial_prefix, shape_curve.lane_context_bucket,
+                serial_prefix, lane_context_bucket,
                 request_count);
     uint64_t serial_profile_samples = 0u;
     double serial_profile_seconds = 0.0;
-    if (dspark_rn_cost_profile_lookup(
+    (void)dspark_rn_cost_profile_lookup(
             owner,
             DS4_DSPARK_RN_EXEC_SERIAL,
             DS4_DSPARK_RN_PATH_NEURAL,
@@ -38171,34 +38702,49 @@ int ds4_sessions_eval_speculative_sample_rn(
             serial_profile_rows,
             serial_shape,
             &serial_profile_seconds,
-            &serial_profile_samples)) {
-        serial_verify_seconds = serial_profile_seconds;
-    } else if (serial_rows <= DS4_DSPARK_SCHEDULER_MAX_ROWS &&
-        owner->dspark_rn_serial_verify_samples[serial_rows] >= 2u) {
-        serial_verify_seconds =
-            owner->dspark_rn_serial_verify_ewma[serial_rows];
+            &serial_profile_samples);
+    const bool serial_profile_ready =
+        serial_profile_samples >= DS4_DSPARK_RN_SHAPE_MIN_SAMPLES &&
+        serial_profile_seconds > 0.0 &&
+        isfinite(serial_profile_seconds);
+    const bool serial_profile_curve_active =
+        serial_shape_active &&
+        serial_shape_curve.allow_profile_curve &&
+        serial_profile_ready;
+    if (serial_profile_curve_active) {
+        const double seconds =
+            cohort_draft_seconds + serial_profile_seconds;
+        serial_step.selected.throughput = seconds > 0.0
+            ? serial_step.selected.expected_tokens / seconds
+            : 0.0;
     }
-    const double serial_predicted_seconds =
-        cohort_draft_seconds + serial_verify_seconds;
-    const double serial_rate = serial_predicted_seconds > 0.0
-        ? serial_expected / serial_predicted_seconds : 0.0;
+    bool serial_model_mature = false;
+    const double serial_model_verify_seconds =
+        dspark_rn_serial_shape_verify_seconds(
+                &serial_shape_curve,
+                serial_prefix,
+                request_count,
+                &serial_model_mature);
+    const double serial_rate =
+        serial_step.selected.throughput;
 
-    const uint32_t scheduled_rows = schedule_step.selected.batch_size;
+    const uint32_t scheduled_rows =
+        physical_step.selected.batch_size;
     uint32_t physical_profile_rows = scheduled_rows;
     for (uint32_t r = 0; r < request_count; r++) {
-        if (schedule_step.selected.prefix[r] == 0u) {
+        if (physical_step.selected.prefix[r] == 0u) {
             physical_profile_rows++;
         }
     }
     const uint64_t physical_shape = dspark_rn_shape_hash(
-            schedule_step.selected.prefix,
-            shape_curve.lane_context_bucket,
+            physical_step.selected.prefix,
+            lane_context_bucket,
             request_count);
     uint64_t physical_profile_samples = 0u;
     double physical_profile_seconds = 0.0;
-    double physical_rate = schedule_step.selected.throughput;
-    const bool physical_profile_ready =
-        dspark_rn_cost_profile_lookup(
+    double physical_rate =
+        physical_step.selected.throughput;
+    (void)dspark_rn_cost_profile_lookup(
             owner,
             DS4_DSPARK_RN_EXEC_PHYSICAL,
             DS4_DSPARK_RN_PATH_NEURAL,
@@ -38208,12 +38754,17 @@ int ds4_sessions_eval_speculative_sample_rn(
             physical_shape,
             &physical_profile_seconds,
             &physical_profile_samples);
-    if (physical_profile_ready &&
+    const bool physical_profile_ready =
+        physical_profile_samples >= DS4_DSPARK_RN_SHAPE_MIN_SAMPLES &&
+        physical_profile_seconds > 0.0 &&
+        isfinite(physical_profile_seconds);
+    if (physical_shape_active &&
+        physical_profile_ready &&
         physical_profile_seconds > 0.0) {
         const double seconds =
             cohort_draft_seconds + physical_profile_seconds;
         physical_rate = seconds > 0.0
-            ? schedule_step.selected.expected_tokens / seconds
+            ? physical_step.selected.expected_tokens / seconds
             : 0.0;
     }
     double physical_single_sample_rate = 0.0;
@@ -38224,7 +38775,7 @@ int ds4_sessions_eval_speculative_sample_rn(
                 physical_profile_samples,
                 cohort_draft_seconds,
                 physical_profile_seconds,
-                schedule_step.selected.expected_tokens,
+                physical_step.selected.expected_tokens,
                 serial_rate,
                 DS4_DSPARK_RN_CONFIRM_GAIN,
                 &physical_single_sample_rate);
@@ -38235,13 +38786,43 @@ int ds4_sessions_eval_speculative_sample_rn(
     const uint64_t coordinator_step = owner->dspark_rn_hw_scheduler.step;
     const uint64_t warmup_cycles = 8u;
     const uint64_t probe_interval = 64u;
+    const bool paired_offline_sps =
+        physical_offline_sps && serial_offline_sps;
+    const bool warmup_probe =
+        !paired_offline_sps &&
+        coordinator_step <= warmup_cycles;
     const bool periodic_probe =
+        !paired_offline_sps &&
         coordinator_step % probe_interval == 0u;
     const bool physical_shape_mature =
-        physical_profile_samples >= 2u;
-    /* The completed physical executor is profitable for the common GB10 R=2
-     * and R=3 shapes below ten scheduled rows. Keep an explicit diagnostic
-     * override, but let measured physical/serial profiles decide by default. */
+        physical_profile_samples >=
+            DS4_DSPARK_RN_SHAPE_MIN_SAMPLES;
+    const bool serial_shape_mature =
+        serial_profile_samples >=
+            DS4_DSPARK_RN_SHAPE_MIN_SAMPLES;
+    const bool physical_cost_mature =
+        physical_offline_sps ||
+        (physical_shape_active && physical_shape_mature);
+    const bool serial_cost_mature =
+        serial_offline_sps ||
+        (serial_shape_active &&
+         (serial_shape_mature || serial_model_mature));
+    /* A complete serial lane model is generally better calibrated than a
+     * cold physical row curve.  Require physical execution to beat serial by
+     * a confidence margin; shrink that margin as both cost sources mature. */
+    const double physical_required_gain =
+        paired_offline_sps
+            ? DS4_DSPARK_RN_PHYSICAL_GAIN_PAIRED
+            : (physical_cost_mature && serial_cost_mature
+                ? DS4_DSPARK_RN_PHYSICAL_GAIN_MATURE
+                : DS4_DSPARK_RN_PHYSICAL_GAIN_COLD);
+    const bool serial_exploration_probe =
+        !paired_offline_sps &&
+        !serial_cost_mature &&
+        coordinator_step > warmup_cycles &&
+        coordinator_step % 128u == 32u;
+    /* Keep the explicit diagnostic override, but let the independently
+     * measured physical and serial candidates decide by default. */
     uint32_t min_physical_rows = 0u;
     const char *min_rows_env =
         getenv("DS4_DSPARK_RN_MIN_PHYSICAL_ROWS");
@@ -38253,17 +38834,26 @@ int ds4_sessions_eval_speculative_sample_rn(
             min_physical_rows = (uint32_t)parsed;
         }
     }
-    bool use_physical =
-        coordinator_step <= warmup_cycles ||
-        periodic_probe ||
-        physical_confirmation_probe ||
-        physical_rate >= serial_rate * 1.01;
-    const char *decision_reason =
-        coordinator_step <= warmup_cycles ? "warmup" :
-        periodic_probe ? "probe" : "predicted";
-    if (physical_confirmation_probe &&
-        coordinator_step > warmup_cycles &&
-        !periodic_probe) {
+    bool use_physical = true;
+    const char *decision_reason = paired_offline_sps
+        ? "offline-shape"
+        : "shape-predicted";
+    if (serial_exploration_probe) {
+        use_physical = false;
+        decision_reason = "serial-probe";
+    } else if (physical_rate <
+               serial_rate * physical_required_gain) {
+        use_physical = false;
+    }
+    if (warmup_probe) {
+        use_physical = true;
+        decision_reason = "warmup";
+    } else if (periodic_probe) {
+        use_physical = true;
+        decision_reason = "probe";
+    } else if (!paired_offline_sps &&
+               physical_confirmation_probe) {
+        use_physical = true;
         decision_reason = "confirm-probe";
     }
     if (force_physical) {
@@ -38278,13 +38868,15 @@ int ds4_sessions_eval_speculative_sample_rn(
                use_physical &&
                request_count > 1u &&
                !periodic_probe &&
-               !physical_confirmation_probe &&
+               !serial_exploration_probe &&
+               (paired_offline_sps || !physical_confirmation_probe) &&
                coordinator_step > warmup_cycles &&
                !physical_shape_mature &&
                scheduled_rows < min_physical_rows) {
         use_physical = false;
         decision_reason = "small-batch-serial";
     }
+    schedule_step = use_physical ? physical_step : serial_step;
     if (getenv("DS4_DSPARK_LOG") != NULL) {
         /* Keep one atomic, replayable admission record per cohort.  The
          * conditional confidence vectors and both candidate prefix vectors
@@ -38307,8 +38899,48 @@ int ds4_sessions_eval_speculative_sample_rn(
             fprintf(stderr, "%s%u", r == 0u ? "" : ",",
                     schedule_step.selected.prefix[r]);
         }
-        fprintf(stderr, " shape_curve=%u/%u serial_prefix=",
-                shape_curve.hits, shape_curve.queries);
+        fprintf(stderr,
+                " sps_curve=%s physical_curve=%s serial_curve=%s "
+                "shape_curve=%u/%u "
+                "physical_shape_curve=%u/%u "
+                "serial_shape_curve=%u/%u physical_prefix=",
+                use_physical
+                    ? (physical_shape_active &&
+                       physical_profile_ready
+                        ? "shape"
+                        : (physical_offline_sps
+                            ? "offline" : "generic"))
+                    : (serial_profile_curve_active
+                        ? "shape"
+                        : (serial_offline_sps
+                            ? "offline"
+                            : (serial_shape_active
+                                ? "lane-model" : "generic"))),
+                physical_shape_active &&
+                physical_profile_ready
+                    ? "shape"
+                    : (physical_offline_sps ? "offline" : "generic"),
+                serial_profile_curve_active
+                    ? "shape"
+                    : (serial_offline_sps
+                        ? "offline"
+                        : (serial_shape_active
+                            ? "lane-model" : "generic")),
+                use_physical
+                    ? physical_shape_probe_hits
+                    : serial_shape_probe_hits,
+                use_physical
+                    ? physical_shape_probe_queries
+                    : serial_shape_probe_queries,
+                physical_shape_probe_hits,
+                physical_shape_probe_queries,
+                serial_shape_probe_hits,
+                serial_shape_probe_queries);
+        for (uint32_t r = 0; r < request_count; r++) {
+            fprintf(stderr, "%s%u", r == 0u ? "" : ",",
+                    physical_step.selected.prefix[r]);
+        }
+        fprintf(stderr, " serial_prefix=");
         for (uint32_t r = 0; r < request_count; r++) {
             fprintf(stderr, "%s%u", r == 0u ? "" : ",",
                     serial_prefix[r]);
@@ -38324,22 +38956,24 @@ int ds4_sessions_eval_speculative_sample_rn(
         fprintf(stderr, "\n");
         funlockfile(stderr);
     }
-    if (!use_physical) {
-        for (uint32_t r = 0; r < request_count; r++) {
-            schedule_step.selected.prefix[r] = serial_prefix[r];
-        }
-    }
     if (getenv("DS4_DSPARK_LOG") != NULL) {
         fprintf(stderr,
                 "ds4: dspark coordinator mode=%s R=%u "
-                "scheduled_batch=%u physical_rate=%.2f "
+                "scheduled_batch=%u physical_batch=%u physical_rate=%.2f "
                 "serial_batch=%u serial_rate=%.2f "
                 "physical_samples=%llu serial_samples=%llu "
                 "physical_shape_samples=%llu "
                 "serial_shape_samples=%llu bucket=%u "
-                "shape_mature=%u step=%llu reason=%s\n",
+                "shape_mature=%u serial_shape_mature=%u "
+                "serial_model_mature=%u serial_model_ms=%.3f "
+                "shape_active=%u/%u "
+                "shape_preflight=%u/%u:%u/%u "
+                "shape_queries=%u/%u shape_hits=%u/%u "
+                "shape_models=%u/%u physical_gain=%.3f "
+                "step=%llu reason=%s\n",
                 use_physical ? "physical" : "serial",
                 request_count,
+                schedule_step.selected.batch_size,
                 scheduled_rows,
                 physical_rate,
                 serial_rows,
@@ -38356,6 +38990,22 @@ int ds4_sessions_eval_speculative_sample_rn(
                 (unsigned long long)serial_profile_samples,
                 cost_context_bucket,
                 physical_shape_mature ? 1u : 0u,
+                serial_shape_mature ? 1u : 0u,
+                serial_model_mature ? 1u : 0u,
+                serial_model_verify_seconds * 1000.0,
+                physical_shape_active ? 1u : 0u,
+                serial_shape_active ? 1u : 0u,
+                physical_shape_probe_hits,
+                physical_shape_probe_queries,
+                serial_shape_probe_hits,
+                serial_shape_probe_queries,
+                physical_shape_curve.queries,
+                serial_shape_curve.queries,
+                physical_shape_curve.profile_hits,
+                serial_shape_curve.profile_hits,
+                serial_shape_curve.model_hits,
+                serial_shape_curve.mature_model_hits,
+                physical_required_gain,
                 (unsigned long long)coordinator_step,
                 decision_reason);
     }
@@ -38382,10 +39032,10 @@ int ds4_sessions_eval_speculative_sample_rn(
         }
         dspark_rn_log_cohort(
                 requests, request_count, "target-only",
-                "scheduler-k0", verify_cap[0], 0u,
+                "scheduler-k0", -1, verify_cap[0], 0u,
                 requests[0].result > 0
                     ? (uint32_t)requests[0].result : 0u,
-                1u, cohort_draft_seconds,
+                1u, 1u, cohort_draft_seconds,
                 elapsed - cohort_draft_seconds,
                 elapsed);
         return requests[0].result >= 0 ? 0 : 1;
@@ -38675,8 +39325,10 @@ int ds4_sessions_eval_speculative_sample_rn(
     const double cycle_seconds = done - cycle_t0;
     bool pure_neural_cohort = true;
     uint32_t observed_prefix[request_count];
+    uint32_t observed_batch = request_count;
     for (uint32_t r = 0; r < request_count; r++) {
         observed_prefix[r] = total_drafted[r];
+        observed_batch += observed_prefix[r];
         if (total_drafted[r] != neural_drafted[r]) {
             pure_neural_cohort = false;
         }
@@ -38686,7 +39338,7 @@ int ds4_sessions_eval_speculative_sample_rn(
         : DS4_DSPARK_RN_PATH_HYBRID;
     const uint64_t observed_shape =
         dspark_rn_shape_hash(
-                observed_prefix, shape_curve.lane_context_bucket,
+                observed_prefix, lane_context_bucket,
                 request_count);
     const uint32_t observed_profile_rows = physical_rows;
 
@@ -38838,9 +39490,11 @@ int ds4_sessions_eval_speculative_sample_rn(
                 ? "fallback"
                 : (use_physical ? "physical" : "serial"),
             verifier_fallback ? "verifier-failed" : "none",
+            verifier_fallback ? -1 : (int)observed_path_class,
             cohort_drafted,
             cohort_committed,
             cohort_emitted,
+            observed_batch,
             physical_rows,
             cohort_draft_seconds,
             cohort_total_seconds - cohort_draft_seconds,

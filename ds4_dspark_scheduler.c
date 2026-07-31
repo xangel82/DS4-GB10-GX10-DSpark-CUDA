@@ -573,6 +573,61 @@ int ds4_dspark_hardware_schedule_step(
             NULL, NULL, result);
 }
 
+int ds4_dspark_hardware_schedule_step_pair_shape(
+        ds4_dspark_scheduler_state *state,
+        const ds4_dspark_schedule_item *items,
+        uint32_t request_count,
+        const double *first_sps,
+        ds4_dspark_shape_sps_fn first_shape_sps,
+        void *first_shape_sps_opaque,
+        const double *second_sps,
+        ds4_dspark_shape_sps_fn second_shape_sps,
+        void *second_shape_sps_opaque,
+        uint32_t sps_count,
+        ds4_dspark_schedule_step_result *first_result,
+        ds4_dspark_schedule_step_result *second_result) {
+    if (!state || !items || !first_sps || !second_sps ||
+        !first_result || !second_result ||
+        first_result == second_result) {
+        return 1;
+    }
+
+    ds4_dspark_scheduler_state first_state = *state;
+    ds4_dspark_scheduler_state second_state = *state;
+    if (ds4_dspark_hardware_schedule_step_shape(
+            &first_state, items, request_count,
+            first_sps, sps_count,
+            first_shape_sps, first_shape_sps_opaque,
+            first_result) != 0 ||
+        ds4_dspark_hardware_schedule_step_shape(
+            &second_state, items, request_count,
+            second_sps, sps_count,
+            second_shape_sps, second_shape_sps_opaque,
+            second_result) != 0 ||
+        memcmp(&first_state, &second_state, sizeof(first_state)) != 0) {
+        return 1;
+    }
+
+    *state = first_state;
+    return 0;
+}
+
+int ds4_dspark_hardware_schedule_step_pair(
+        ds4_dspark_scheduler_state *state,
+        const ds4_dspark_schedule_item *items,
+        uint32_t request_count,
+        const double *first_sps,
+        const double *second_sps,
+        uint32_t sps_count,
+        ds4_dspark_schedule_step_result *first_result,
+        ds4_dspark_schedule_step_result *second_result) {
+    return ds4_dspark_hardware_schedule_step_pair_shape(
+            state, items, request_count,
+            first_sps, NULL, NULL,
+            second_sps, NULL, NULL,
+            sps_count, first_result, second_result);
+}
+
 int ds4_dspark_schedule_flatten(
         const ds4_dspark_schedule_result *schedule,
         const ds4_dspark_schedule_item *items,

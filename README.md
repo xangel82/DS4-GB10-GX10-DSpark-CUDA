@@ -48,11 +48,13 @@ the target sampling distribution.
 
 The current release combines the compact Q2 DSpark and lossless HybridLC work,
 the exact fused-D2R dispatch fix and a hardware-aware multi-session scheduler
-validated on 29 July 2026. Q2 remains the default sidecar and HybridLC remains
-target-verified. The scheduler can coalesce two independent requests into one
-physical verifier cohort, while KV-aware routing and chunk-boundary handoffs
-keep long prefills from starving active decode. Target sampling and per-session
-KV, RNG and rejection state remain unchanged.
+validated on 31 July 2026. Q2 remains the default sidecar and HybridLC remains
+target-verified. The scheduler evaluates physical and lane-partitioned
+execution independently for `R=1..3`, using immutable offline SPS curves
+measured on the actual GB10 verifier rather than assuming smooth hardware
+scaling. KV-aware routing and chunk-boundary handoffs keep long prefills from
+starving active decode. Target sampling and per-session KV, RNG and rejection
+state remain unchanged.
 
 Multi-session serving is deliberately conservative on a 128 GB GB10: the
 promoted profile starts with two independent KV frontiers and activates a third
@@ -89,8 +91,9 @@ or substantially adapted here; full lineage and license attribution are kept in
   boundary.
 - Canonical KV checkpoints and frontier reuse for append-only chat and
   tool-call workloads.
-- Hardware-aware DSpark R=2 cohorts with exact-shape cost profiles, KV-aware
-  routing and cooperative prefill/decode scheduling.
+- Hardware-aware DSpark `R=1..3` cohorts with exact-shape cost profiles,
+  immutable offline SPS calibration, KV-aware routing and cooperative
+  prefill/decode scheduling.
 - Pipelined model upload, compact Q2 DSpark packaging and release of copied
   GGUF pages.
 - GB10 memory profiles, 256k and experimental 1M launchers, reproducible CUDA

@@ -38,8 +38,10 @@ grep -Fq 'R=1 K=3 n=2 neural_accept=83.33%' "$OUT"
 grep -Fq 'verifier-width=3 n=2 accept=83.33%' "$OUT"
 
 printf '%s\n' \
+  'ds4: dspark admission R=2 executor=physical batch=8 capacity_batch=8 capacity_age=2 expected=7.0 rate=25.0 capacity_rate=25.0 hw_prefix=3,3 sps_curve=offline physical_curve=offline serial_curve=offline shape_curve=3/4 physical_prefix=3,3 serial_prefix=2,2 conditional=0.9/0.9' \
   'ds4: dspark coordinator mode=physical R=2 scheduled_batch=8 physical_rate=25.00 serial_batch=8 serial_rate=18.18 physical_samples=2 serial_samples=2 physical_shape_samples=2 serial_shape_samples=2 bucket=0 shape_mature=1 step=7 reason=predicted' \
   'ds4: dspark cohort timing cohort=7 requested_r=2 executor=physical fallback=none drafted=6 committed=4 emitted=7 rows=8 wait_us=1000 draft=40.000 ms verify=240.000 ms total=280.000 ms' \
+  'ds4: dspark admission R=2 executor=serial batch=8 capacity_batch=8 capacity_age=2 expected=6.0 rate=18.18 capacity_rate=18.18 hw_prefix=3,3 sps_curve=lane-model physical_curve=generic serial_curve=lane-model shape_curve=5/5 physical_prefix=3,3 serial_prefix=3,3 conditional=0.8/0.8' \
   'ds4: dspark coordinator mode=serial R=2 scheduled_batch=8 physical_rate=17.00 serial_batch=8 serial_rate=18.18 physical_samples=2 serial_samples=2 physical_shape_samples=2 serial_shape_samples=2 bucket=0 shape_mature=1 step=8 reason=predicted' \
   'ds4: dspark cohort timing cohort=8 requested_r=2 executor=serial fallback=none drafted=6 committed=3 emitted=6 rows=8 wait_us=2000 draft=40.000 ms verify=290.000 ms total=330.000 ms' \
   'ds4-server: decode summary req=chatcmpl-1 kind=chat prompt=128 gen=100 seconds=10.000000 tps=10.000 finish=stop' \
@@ -56,6 +58,12 @@ grep -Fq 'serial R=2 n=1 aggregate=18.182t/s accept=50.00% rows=8.000' "$OUT"
 grep -Fq 'Coordinator dispatch reasons: predicted=2' "$OUT"
 grep -Fq 'dispatch physical R=2 reason=predicted n=1' "$OUT"
 grep -Fq 'dispatch serial R=2 reason=predicted n=1' "$OUT"
+grep -Fq 'Hardware shape curve:      8 / 9 hits (88.89%), full=1/2 cohorts' "$OUT"
 grep -Fq 'Per-request decode (overlap): 10.000 t/s (1 summaries; not aggregate)' "$OUT"
+grep -Fq 'Offline SPS curves:       1/1 cohorts (100.00%), generic=0' "$OUT"
+grep -Fq 'Shape-aware SPS selections: shape=0 lane-model=1' "$OUT"
+grep -Fq 'physical candidate: offline=1 generic=1' "$OUT"
+grep -Fq 'serial candidate:   offline=1 generic=0' "$OUT"
+grep -Fq 'exact/model curves:  physical-shape=0 serial-shape=0 serial-lane-model=1' "$OUT"
 
 printf 'dspark analyzer shadow regression: OK\n'

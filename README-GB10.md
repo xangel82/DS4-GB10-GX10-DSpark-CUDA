@@ -923,16 +923,27 @@ lane, ordinando coppie `(bucket,K)` invece dei soli `K`: una lane lunga con
 `K=1` non viene quindi confusa con una lane corta con `K=1`, ne' con la forma
 ottenuta scambiando i due prefissi fra contesti diversi.
 
-Una forma guida la scelta del prefisso soltanto dopo otto campioni. Le normali
-decisioni physical/serial possono continuare a confermare una forma dopo due
-misure, ma il planner non modifica `K` sulla base di un EWMA ancora rumoroso.
-Prima della maturita', oppure quando la forma non e' mai stata osservata, il
-callback restituisce zero e lo scheduler ricade sulla curva rows-only
-esistente. La ricerca asincrona continua a
-scegliere la capacita' usando esclusivamente confidence dello step `t-2`;
-l'hardware profile sostituisce solo il costo `SPS` della forma candidata.
-Confidence corrente, token target, acceptance e risultato della verifica non
-entrano quindi nella scelta retrospettiva.
+Le misure esatte possono guidare `K`, ma soltanto quando coprono tutte le
+forme visitate dalla ricerca e ogni forma dispone di almeno otto campioni.
+Il planner esegue quindi un preflight senza modificare la storia causale. Se
+la curva fisica e' incompleta, l'intero candidato fisico viene ricalcolato
+con la curva rows-only offline o generica; non essendo scomponibile per lane,
+non viene mai stimata una sua singola forma mancante.
+
+Il candidato seriale ha invece un modello esatto naturale: la somma dei costi
+robusti misurati per ciascuna lane e per il suo `K`. Se tutte le forme online
+sono presenti usa il profilo esatto; se la prima passata mescola profilo e
+modello, la seconda disabilita il profilo e usa il modello per tutte le forme.
+Se anche questo replay non copre ogni forma, un ultimo replay disabilita
+l'intera curva shape e usa la curva rows-only. Una curva offline completa
+resta il fallback hardware misurato; solo un profilo shape completo e maturo
+puo' sostituirla. In nessun caso una stessa ottimizzazione confronta righe
+provenienti da sorgenti diverse.
+
+Entrambi i candidati vengono valutati su copie dello stesso stato `t-2`; solo
+dopo il confronto viene avanzata una volta la storia condivisa. Il preflight
+non vede acceptance o token correnti e non altera RNG, logits, KV o rejection
+sampling.
 
 Le misure neurali e HybridLC sono separate. Il profilo registra la forma
 realmente verificata dopo l'eventuale estensione retrieval, non quella
@@ -968,16 +979,143 @@ dopo appena due campioni. Il formato V2 corregge entrambe; il fingerprint
 versionato invalida automaticamente il file V1. I numeri V1 restano qui come
 traccia diagnostica e non rappresentano uno stato promosso.
 
-Con `DS4_TELEMETRY=1`, ogni riga `dspark admission` espone
-`shape_curve=hit/query`. Il report aggregato mostra direttamente:
+I numeri V1 restano leggibili come traccia storica. Nel formato V2,
+`shape_curve=hit/query` e i contatori separati physical/serial descrivono il
+preflight; `sps_curve`, `physical_curve` e `serial_curve` indicano invece le
+curve coerenti effettivamente usate dal planner.
+
+### SPS(B) offline autorevole - 30 luglio 2026
+
+L'implementazione production segue ora il contratto del paper: una curva
+hardware viene profilata fuori dal percorso di inferenza e caricata in sola
+lettura. La chiave e':
 
 ```text
-Hardware shape curve: ... hits (...%), full=... cohorts
+executor, neural/HybridLC, bucket contesto 32K, R, batch logico B
 ```
 
-Questa e' intenzionalmente la sola base hardware. Una futura curva adattiva
-di acceptance dovra' essere gerarchica, regolarizzata verso il profilo STS e
-aggiornata piu' lentamente; non viene mescolata a questi costi fisici.
+`batch` e `rows` sono entrambi presenti nella telemetria. `batch` e' la
+dimensione logica usata da Algorithm 1; `rows` e' il lavoro fisico reale e puo'
+essere maggiore quando una lane `K=0` richiede la shadow row del verifier.
+
+Un gruppo e' attivabile soltanto se contiene tutte le misure
+`B=R..R*(Kmax+1)`. Il loader valida versione, fingerprint, coordinate,
+duplicati, tempi finiti e completezza. Se manca anche una sola misura, il
+gruppo non viene esposto e l'intera decisione usa la curva generica. Non
+esiste fallback per singola riga.
+
+Il fingerprint SPS include modello target, sidecar, backend, power target e
+una versione esplicita dell'ABI kernel. Non include il timestamp
+dell'eseguibile: una ricompilazione identica non invalida la calibrazione,
+mentre una modifica del percorso fisico deve incrementare l'ABI.
+
+Il launcher cerca per default:
+
+```text
+$DS4_MODEL_DIR/dspark-sps-q2.conf
+$DS4_MODEL_DIR/dspark-sps-q4.conf
+```
+
+Se il profilo non e' presente nella model directory, il launcher cerca il
+corrispondente artefatto versionato in `profiles/`. Un percorso esplicito usa
+`DS4_DSPARK_SPS_PROFILE=/path/file.conf`; il fingerprint impedisce di applicare
+la curva a una combinazione target/sidecar/backend incompatibile.
+
+Per raccogliere tutte le batch `B` per `R=1..3`, confrontare fisico e seriale
+e calibrare nello stesso avvio:
+
+```bash
+DS4_DSPARK_SPS_PREFIX=98304 ./profile-dspark-sps.sh
+```
+
+La smoke usa lo stesso verifier production, confronta numericamente il
+microbatch fisico con le lane seriali e ripristina la frontier fra le prove.
+Per ogni `B` enumera tutte le partizioni non equivalenti delle righe tra le
+lane, per esempio `[1,5]`, `[2,4]` e `[3,3]`: una sola forma bilanciata
+produrrebbe una curva troppo ottimistica. Ogni partizione viene scaldata
+separatamente per escludere l'eventuale istanziazione della CUDA Graph e deve
+superare la parita' numerica col verifier seriale prima di essere misurata
+dieci volte. Il calibratore applica il filtro MAD e calcola la mediana dentro
+ciascuna forma; la riga `SPS(B)` usa poi il costo peggiore tra le mediane delle
+forme complete. Il profilo rimane quindi conservativo anche quando il planner
+incontra una partizione sfavorevole. `DS4_DSPARK_SPS_MAX_R=2` limita una
+raccolta diagnostica a `R=1..2`; il default resta `R=1..3`.
+
+La calibrazione GB10 Q2 a 98.304 token ha inoltre esposto una scogliera reale:
+con `R=2` il verifier fisico resta esatto e vale circa `1,5-1,6x` fino a
+cinque righe complessive; a partire da sei righe la diversa geometria delle
+riduzioni modifica leggermente attention e il MoE quantizzato amplifica lo
+scarto. Il runtime non accetta questa approssimazione: per `N>=6` esegue le
+lane complete separatamente e ricompone i logits nella stessa arena fisica,
+ottenendo `rel-RMSE=0` rispetto al verifier indipendente. La curva registra
+anche questo costo quasi seriale, consentendo allo scheduler di preferire la
+frontiera fisica veloce senza sacrificare la distribuzione target. La smoke
+iniziale ha prodotto 34 record e quattro gruppi completi (fisico e seriale,
+`R=1..2`), con parita' finale esatta e speedup `1,496x` sulla forma R=2 di
+controllo. La calibrazione Q2 completa su GB10 ha poi raccolto `7.120`
+campioni, generando `1.248` record e `128` gruppi completi: `R=1` copre tutti i
+bucket fino a circa 1M token, mentre `R=2..3` coprono i bucket fino a 512K per
+rispettare il limite di memoria della raccolta multi-lane. Il profilo promosso
+e' `profiles/dspark-sps-q2.conf`, fingerprint `8751cba0622dd9a3`. Questa
+modifica incrementa l'ABI SPS: un server precedente non puo' caricare
+accidentalmente la curva misurata sul percorso lane-partitioned.
+
+Lo script dedicato non scarta altri campioni perche' il warm-up e' gia'
+esplicito e richiede almeno otto misure residue per ogni partizione. Per
+calibrare un altro bucket 32K basta cambiare `DS4_DSPARK_SPS_PREFIX`. Piu' log
+dedicati possono essere uniti passando ripetutamente `--log` a
+`tools/calibrate_dspark_sps.py`. I normali log operativi non hanno copertura
+garantita delle forme e vengono accettati soltanto con
+`--allow-operational`.
+
+Un file parziale puo' essere scritto con `--allow-no-complete-group` per
+analisi, ma il runtime continuera' a ignorarne i gruppi incompleti.
+
+Il runtime costruisce due candidati dallo stesso stato causale `t-2`: il
+candidato fisico usa la curva `executor=physical`, mentre quello
+lane-partitioned usa `executor=serial`. Solo dopo aver ottimizzato
+indipendentemente i due prefissi confronta il throughput previsto e avanza la
+storia dello scheduler una volta sola. Quando entrambe le curve offline sono
+complete non servono warm-up o probe dell'esecutore. Nei bucket non calibrati
+il gate con replay coerente ammette un profilo esatto soltanto con copertura
+totale; altrimenti usa per tutto il candidato la curva generica fisica o il
+modello robusto per-lane seriale. Se anche il replay model-only seriale e'
+incompleto, l'intero candidato torna rows-only.
+
+La scelta dell'executor richiede invece che il candidato fisico superi quello
+seriale dell'1% con due curve offline accoppiate, del 5% con due sorgenti
+mature e del 15% durante il cold start. Il modello per-lane seriale e' piu'
+affidabile di una curva fisica generica ancora fredda; il margine evita quindi
+di inseguire una previsione fisica ottimistica. Restano probe fisici radi per
+raccogliere evidenza e non cristallizzare la decisione.
+
+La riga `dspark admission` espone la curva dell'esecutore scelto tramite
+`sps_curve=offline|generic|shape|lane-model` e aggiunge
+`physical_curve=... serial_curve=...`; il report mostra:
+
+```text
+Offline SPS curves: ... cohorts (...%), generic=...
+  physical candidate: offline=... generic=...
+  serial candidate:   offline=... generic=...
+Shape-aware SPS selections: shape=... lane-model=...
+  exact/model curves: physical-shape=... serial-shape=... serial-lane-model=...
+```
+
+La smoke finale del gate ha elaborato 64 coorti con acceptance `99,45%`: la
+copertura grezza delle forme era soltanto `39,89%`, quindi nessuna curva
+esatta parziale e' stata ammessa. Il candidato fisico ha usato integralmente
+il fallback rows-only e quello seriale integralmente il modello per-lane.
+Nel successivo controllo warm con tre richieste identiche, i tre output sono
+risultati esatti, l'acceptance e' stata `99,79%` e il throughput aggregato
+`31,58 t/s`. Due probe fisici R=3 hanno misurato `8,48 t/s`; il coordinatore
+e' quindi passato al seriale R=3 per 34 coorti, misurando `33,30 t/s`. Il
+modello seriale aveva previsto circa `34,4 t/s`: il margine conservativo ha
+impedito alla curva fisica generica, ancora ottimistica, di dominare la
+selezione. Sono smoke controllate, non un claim sul carico operativo.
+
+Una futura curva adattiva di acceptance dovra' essere gerarchica,
+regolarizzata verso il profilo STS e aggiornata piu' lentamente; non viene
+mescolata a questi costi fisici.
 
 ### STS offline autentico
 
@@ -3948,6 +4086,7 @@ DS4_DSPARK_STS_PROFILE=...      profilo STS offline versionato e immutabile
 DS4_DSPARK_STS_CAPTURE=...      CSV held-out; forza K=5 nel solo run di raccolta
 DS4_DSPARK_STS_TEMPERATURES=... fallback online: cinque temperature iniziali
 DS4_DSPARK_STS_DISABLE=1        disabilita il vecchio adattamento online
+DS4_DSPARK_SPS_PROFILE=...      curva SPS(B) offline completa e fingerprintata
 DS4_DSPARK_CONF_BIAS=...        bias della sigmoid confidence
 DS4_DSPARK_CONF_THRESHOLD=...   interrompe K quando confidence scende sotto soglia
 DS4_DSPARK_CAUSAL_MIN_K=...     minimo K dello scheduler stabile precedente (default 2)

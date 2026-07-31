@@ -2086,6 +2086,13 @@ Per costruire una sola variante usare `--dspark q4` oppure `--dspark q2`.
 Download e GGUF gia' completi vengono riutilizzati; `--force-sidecar` forza
 soltanto la rigenerazione dei sidecar.
 
+La regression CUDA richiede la UMA libera e, per default, l'installer si ferma
+se rileva un qualunque processo `ds4-server`, anche appartenente a un altro
+checkout. Con `--skip-regression` download, conversione e compilazione possono
+invece proseguire mentre quel server rimane attivo; prima di promuovere il build
+occorre fermarlo ed eseguire separatamente `make -B cuda-regression
+CUDA_ARCH=sm_121a`.
+
 ### 1. Checkout
 
 Nuova installazione:

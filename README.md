@@ -204,7 +204,10 @@ To save disk and conversion time, build only the desired sidecar:
 Downloads are resumable and existing GGUF files are reused. Run with
 `--force-sidecar` only when an existing sidecar must be regenerated. The
 installer stops before the CUDA regression if another `ds4-server` process is
-active, protecting unified-memory headroom.
+active, protecting unified-memory headroom. `--skip-regression` now permits
+download, sidecar conversion and compilation while a server from this or
+another checkout is running; stop the server and run the regression separately
+before promoting that build.
 
 Preview paths and planned work without downloading:
 

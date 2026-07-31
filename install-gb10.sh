@@ -160,9 +160,10 @@ if [[ ! -x "$NVCC" ]]; then
   exit 2
 fi
 
-if pgrep -x ds4-server >/dev/null 2>&1; then
-  echo "A ds4-server process is running. Stop it before installation so the" >&2
-  echo "CUDA regression has enough unified-memory headroom." >&2
+if [[ "$SKIP_REGRESSION" == "0" ]] && pgrep -x ds4-server >/dev/null 2>&1; then
+  echo "A ds4-server process is running. Stop it before the CUDA regression" >&2
+  echo "so the test has enough unified-memory headroom, or rerun with" >&2
+  echo "--skip-regression to download, convert and build without the test." >&2
   exit 2
 fi
 

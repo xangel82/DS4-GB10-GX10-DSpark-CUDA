@@ -8,6 +8,9 @@
 /ds4_test
 /ds4_agent_test
 /tests/test_q4k_dot
+/tests/test_dspark_scheduler
+/tests/test_dspark_sps
+/tests/test_dspark_sts
 /ds4flash.gguf
 /TODO.md
 /gguf/

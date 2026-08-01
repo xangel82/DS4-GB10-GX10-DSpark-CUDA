@@ -533,8 +533,9 @@ Per il canary attivo isolato da HybridLC:
 cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_NIGHTJAR=1 DS4_DSPARK_HYBRID_LC=0 DS4_TELEMETRY=1 ./run-dspark-server.sh 2>&1 | tee /tmp/ds4-nightjar.log
 ```
 
-Il default applica Nightjar soltanto a `R=1`, dove il test controllato ha gia'
-mostrato un vantaggio. L'estensione multi-sessione richiede un canary esplicito:
+Nightjar e' ora promosso fino a `R=3`, dopo gate controllati separati per il
+singleton e per le coorti multi-sessione. Per isolarlo da HybridLC durante una
+misurazione:
 
 ```bash
 cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_NIGHTJAR=1 DS4_DSPARK_NIGHTJAR_MAX_R=3 DS4_DSPARK_HYBRID_LC=0 DS4_TELEMETRY=1 ./run-dspark-server.sh 2>&1 | tee /tmp/ds4-nightjar-r3.log
@@ -587,7 +588,7 @@ regressione prevista:
 
 ```bash
 DS4_DSPARK_NIGHTJAR_MAX_PREDICTED_REGRESSION=0.03
-DS4_DSPARK_NIGHTJAR_MAX_R=1
+DS4_DSPARK_NIGHTJAR_MAX_R=3
 ```
 
 Quando il guard interviene, viene eseguito lo scheduler hardware-aware stabile.
@@ -634,9 +635,10 @@ non vengono piu' mescolati fra executor:
 Nel passaggio warm il guard ha ancora protetto il 49,5% delle decisioni. Gli
 arm Nightjar hanno preferito il physical executor; le misure effettive hanno
 confermato che il seriale era piu' lento nelle coorti osservate. Per questo il
-supporto `R=2/3` resta un canary esplicito e `DS4_DSPARK_NIGHTJAR_MAX_R=1`
-rimane il limite predefinito: il vantaggio singleton e' isolato dalle sessioni multiple
-finche' i profili di forma non sono piu' maturi.
+supporto `R=2/3` era rimasto un canary esplicito e
+`DS4_DSPARK_NIGHTJAR_MAX_R=1` il limite predefinito. Il gate dedicato seguente
+ha poi verificato l'estensione sulle sessioni multiple con un campione piu'
+lungo e il guard anti-regressione attivo.
 
 #### Gate di promozione R1
 
@@ -653,10 +655,30 @@ HybridLC attivo, cinque run da 256 token, prompt e seed invariati:
 Il fixture greedy ha poi avviato baseline e candidato come processi separati:
 5/5 prompt hanno prodotto contenuto, reasoning e finish reason identici. Il
 candidato ha committato gli stessi 200 token draft del baseline. Nightjar viene
-quindi promosso per il singleton; `DS4_DSPARK_NIGHTJAR=1` e
-`DS4_DSPARK_NIGHTJAR_MAX_R=1` sono i default. Le sessioni R2/R3 continuano a
-usare lo scheduler hardware-aware stabile finche' il loro gate dedicato non
-viene superato. Il rollback completo resta `DS4_DSPARK_NIGHTJAR=0`.
+quindi promosso per il singleton. Il rollback completo resta
+`DS4_DSPARK_NIGHTJAR=0`.
+
+#### Gate di promozione R2/R3
+
+Il gate multi-sessione ha confrontato lo stesso binario, lo stesso profilo
+hardware privo di reward Nightjar preesistenti e tre run da 256 token per
+coorte, con HybridLC attivo, temperatura `0,95` e seed invariato:
+
+| Coorte | Hardware-aware stabile | Nightjar | Delta |
+| --- | ---: | ---: | ---: |
+| `R=2` mediana | 14,70 t/s | 15,28 t/s | +3,9% |
+| `R=2` intervallo | 14,20..14,77 | 14,24..15,77 | - |
+| `R=3` mediana | 13,89 t/s | 14,74 t/s | +6,1% |
+| `R=3` intervallo | 13,83..14,42 | 14,13..14,74 | - |
+| Acceptance verifier | 43,91% | 44,80% | +0,89 punti |
+| Swap processo | 0 | 0 | invariato |
+
+Il guard ha respinto l'84,73% delle decisioni Nightjar non sufficientemente
+convincenti e ha eseguito al loro posto il piano hardware-aware. Il vantaggio
+misurato deriva quindi da un numero limitato di scelte adattive protette dal
+fallback, non da esplorazione indiscriminata. Dopo questo gate,
+`DS4_DSPARK_NIGHTJAR=1` e `DS4_DSPARK_NIGHTJAR_MAX_R=3` sono i default per
+`R=1..3`; la soglia anti-regressione resta al 3%.
 
 Prima del coordinatore, un test operativo con due client HTTP indipendenti ha
 mantenuto due socket contemporanei ma ha eseguito le richieste in alternanza

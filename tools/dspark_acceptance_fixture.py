@@ -47,7 +47,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path,
                         default=Path("/tmp/ds4-dspark-acceptance"))
     parser.add_argument("--prompt", action="append", dest="prompts")
+    parser.add_argument(
+        "--baseline-env", action="append", default=[], metavar="KEY=VALUE",
+        help="environment override applied only to the baseline server",
+    )
+    parser.add_argument(
+        "--candidate-env", action="append", default=[], metavar="KEY=VALUE",
+        help="environment override applied only to the candidate server",
+    )
     return parser.parse_args()
+
+
+def parse_environment(values: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for value in values:
+        key, separator, item = value.partition("=")
+        if not separator or not key:
+            raise ValueError(f"invalid environment override: {value!r}")
+        result[key] = item
+    return result
 
 
 def fixture_environment(dspark: bool) -> dict[str, str]:
@@ -163,15 +181,19 @@ def stop_server(process: subprocess.Popen[bytes]) -> None:
 
 
 def run_mode(args: argparse.Namespace, prompts: list[str], binary: Path,
-             label: str) -> tuple[list[dict[str, object]], Path]:
+             label: str,
+             env_overrides: dict[str, str]
+             ) -> tuple[list[dict[str, object]], Path]:
     log_path = args.output_dir / f"{label}.log"
     results: list[dict[str, object]] = []
     with log_path.open("wb") as log:
+        environment = fixture_environment(True)
+        environment.update(env_overrides)
         process = subprocess.Popen(
             server_command(args, binary),
             stdout=log,
             stderr=subprocess.STDOUT,
-            env=fixture_environment(True),
+            env=environment,
             start_new_session=True,
         )
         try:
@@ -206,6 +228,12 @@ def dspark_stats(log_path: Path) -> dict[str, int]:
 
 def main() -> int:
     args = parse_args()
+    try:
+        baseline_env = parse_environment(args.baseline_env)
+        candidate_env = parse_environment(args.candidate_env)
+    except ValueError as exc:
+        print(f"fixture: {exc}", file=sys.stderr)
+        return 2
     prompts = args.prompts or DEFAULT_PROMPTS
     for label, binary in (("baseline", args.baseline_binary),
                           ("candidate", args.binary)):
@@ -219,10 +247,10 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     baseline, baseline_log = run_mode(
-        args, prompts, args.baseline_binary, "baseline"
+        args, prompts, args.baseline_binary, "baseline", baseline_env
     )
     candidate, candidate_log = run_mode(
-        args, prompts, args.binary, "candidate"
+        args, prompts, args.binary, "candidate", candidate_env
     )
     mismatches = 0
     rows = []

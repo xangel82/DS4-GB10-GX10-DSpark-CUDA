@@ -560,8 +560,9 @@ ha chiuso a `14,88 t/s`: neutro sul wall-clock rispetto alla baseline, ma con
 throughput del solo ciclo verifier salito da `12,446` a `13,361 t/s`
 (`+7,35%`). Il throughput delle coorti e' passato da `15,400` a
 `15,425 t/s`. Il beneficio interno viene ancora assorbito da divergenza delle
-lane, tail e probe fisici `R=3`; Nightjar resta quindi opt-in finche' questi
-costi non saranno ridotti e i bucket di contesto lunghi non saranno validati.
+lane, tail e probe fisici `R=3`; questo risultato ha mantenuto Nightjar opt-in
+per le coorti multi-sessione. Il successivo gate R1 ne ha invece consentito la
+promozione nel singleton, senza estendere automaticamente la policy a R2/R3.
 
 Topologia target, logits, KV, RNG e rejection sampling p/q non cambiano. Il
 numero di proposte puo' cambiare e quindi una risposta campionata puo' divergere
@@ -614,10 +615,10 @@ misurato:
 | `R=3` | 13,32 t/s | 13,14 t/s | -1,4% |
 
 E' un test diagnostico a un solo run, quindi non sostituisce la matrice lunga.
-Dimostra pero' perche' `DS4_DSPARK_NIGHTJAR=0` resta il default promosso:
-il target-only adattivo e' promettente nel singleton, mentre il budget adattivo
-multi-sessione non ha ancora mostrato un vantaggio stabile. Il guard preserva
-il percorso consolidato, ma non trasforma un canary neutro in un guadagno.
+Questo primo test spiegava perche' Nightjar non era ancora promosso: il
+target-only adattivo appariva promettente nel singleton, mentre il budget
+adattivo multi-sessione non mostrava ancora un vantaggio stabile. Il successivo
+gate executor-paired, riportato sotto, ha superato questa limitazione per R1.
 
 La successiva correzione executor-paired e' stata verificata sullo stesso
 binario, con 128 token per lane, temperatura `0,95`, profilo hardware condiviso
@@ -634,8 +635,28 @@ Nel passaggio warm il guard ha ancora protetto il 49,5% delle decisioni. Gli
 arm Nightjar hanno preferito il physical executor; le misure effettive hanno
 confermato che il seriale era piu' lento nelle coorti osservate. Per questo il
 supporto `R=2/3` resta un canary esplicito e `DS4_DSPARK_NIGHTJAR_MAX_R=1`
-rimane il default: il vantaggio singleton e' isolato dalle sessioni multiple
+rimane il limite predefinito: il vantaggio singleton e' isolato dalle sessioni multiple
 finche' i profili di forma non sono piu' maturi.
+
+#### Gate di promozione R1
+
+Il gate definitivo ha confrontato lo stesso binario e profilo hardware con
+HybridLC attivo, cinque run da 256 token, prompt e seed invariati:
+
+| Metrica | Nightjar off | Nightjar R1 | Delta |
+| --- | ---: | ---: | ---: |
+| Mediana decode | 13,28 t/s | 15,83 t/s | +19,2% |
+| Intervallo dei cinque run | 13,17..14,28 | 15,39..15,90 | separato |
+| Acceptance verifier | 43,22% | 48,39% | +5,17 punti |
+| Swap processo | 0 | 0 | invariato |
+
+Il fixture greedy ha poi avviato baseline e candidato come processi separati:
+5/5 prompt hanno prodotto contenuto, reasoning e finish reason identici. Il
+candidato ha committato gli stessi 200 token draft del baseline. Nightjar viene
+quindi promosso per il singleton; `DS4_DSPARK_NIGHTJAR=1` e
+`DS4_DSPARK_NIGHTJAR_MAX_R=1` sono i default. Le sessioni R2/R3 continuano a
+usare lo scheduler hardware-aware stabile finche' il loro gate dedicato non
+viene superato. Il rollback completo resta `DS4_DSPARK_NIGHTJAR=0`.
 
 Prima del coordinatore, un test operativo con due client HTTP indipendenti ha
 mantenuto due socket contemporanei ma ha eseguito le richieste in alternanza

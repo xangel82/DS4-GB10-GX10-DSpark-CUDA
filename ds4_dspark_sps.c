@@ -60,6 +60,7 @@ static uint32_t ds4_dspark_sps_entry_index(
 int ds4_dspark_sps_profile_load(
         const char *path,
         uint64_t expected_fingerprint,
+        int force_fingerprint,
         ds4_dspark_sps_profile *profile,
         char *err,
         size_t errlen) {
@@ -85,7 +86,9 @@ int ds4_dspark_sps_profile_load(
         sscanf(line, "DS4_DSPARK_SPS_V%u %llx",
                &version, &fingerprint) != 2 ||
         version != DS4_DSPARK_SPS_PROFILE_VERSION ||
-        (uint64_t)fingerprint != expected_fingerprint) {
+        fingerprint == 0u ||
+        (!force_fingerprint &&
+         (uint64_t)fingerprint != expected_fingerprint)) {
         fclose(fp);
         ds4_dspark_sps_error(
                 err, errlen, "stale or incompatible SPS profile");
@@ -179,7 +182,7 @@ int ds4_dspark_sps_profile_load(
             }
         }
     }
-    profile->fingerprint = expected_fingerprint;
+    profile->fingerprint = (uint64_t)fingerprint;
     return 0;
 }
 

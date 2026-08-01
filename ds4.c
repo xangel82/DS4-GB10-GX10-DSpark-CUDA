@@ -28247,7 +28247,7 @@ static void ds4_acquire_instance_lock(void) {
 #define DS4_DSPARK_RN_PHYSICAL_GAIN_PAIRED 1.01
 #define DS4_DSPARK_RN_PHYSICAL_GAIN_MATURE 1.05
 #define DS4_DSPARK_RN_PHYSICAL_GAIN_COLD 1.15
-#define DS4_DSPARK_HW_PROFILE_VERSION 2u
+#define DS4_DSPARK_HW_PROFILE_VERSION 3u
 #define DS4_DSPARK_NIGHTJAR_PERSIST_MIN_SAMPLES 4u
 #define DS4_DSPARK_SPS_KERNEL_ABI 3u
 #define DS4_DSPARK_RN_PROFILE_MAX_ROWS \
@@ -37822,22 +37822,10 @@ static uint64_t dspark_rn_sps_fingerprint(
     hash = dspark_rn_fingerprint_mix(hash, s->engine->model.size);
     hash = dspark_rn_fingerprint_mix(
             hash, s->engine->dspark_model.size);
-
-    const int fds[] = {
-        s->engine->model.fd,
-        s->engine->dspark_model.fd,
-    };
-    for (uint32_t i = 0; i < sizeof(fds) / sizeof(fds[0]); i++) {
-        struct stat st;
-        if (fds[i] >= 0 && fstat(fds[i], &st) == 0) {
-            hash = dspark_rn_fingerprint_mix(
-                    hash, (uint64_t)st.st_size);
-            hash = dspark_rn_fingerprint_mix(
-                    hash, (uint64_t)st.st_mtim.tv_sec);
-            hash = dspark_rn_fingerprint_mix(
-                    hash, (uint64_t)st.st_mtim.tv_nsec);
-        }
-    }
+    /* SPS measures executor geometry, not weight values. File mtimes made an
+     * identical GGUF copy invalidate a valid calibration. Model variant,
+     * quantized artifact sizes, backend, power target and kernel ABI are the
+     * stable structural identity required by this curve. */
     return hash ? hash : UINT64_C(1);
 }
 
@@ -37855,9 +37843,12 @@ static void dspark_rn_sps_profile_load(ds4_session *s) {
 
     char err[256];
     errno = 0;
+    const bool force_fingerprint =
+        ds4_env_enabled("DS4_DSPARK_SPS_FORCE_PROFILE");
     if (ds4_dspark_sps_profile_load(
             path,
             s->dspark_rn_sps_fingerprint,
+            force_fingerprint,
             &s->dspark_rn_sps_profile,
             err,
             sizeof(err)) != 0) {
@@ -37868,6 +37859,15 @@ static void dspark_rn_sps_profile_load(ds4_session *s) {
                     path, err[0] ? err : "load failed");
         }
         return;
+    }
+    if (s->dspark_rn_sps_profile.fingerprint !=
+        s->dspark_rn_sps_fingerprint) {
+        fprintf(stderr,
+                "ds4: forced DSpark SPS profile fingerprint "
+                "%016llx onto runtime %016llx\n",
+                (unsigned long long)
+                    s->dspark_rn_sps_profile.fingerprint,
+                (unsigned long long)s->dspark_rn_sps_fingerprint);
     }
     fprintf(stderr,
             "ds4: immutable offline DSpark SPS profile loaded: %s "
@@ -38806,7 +38806,8 @@ int ds4_sessions_eval_speculative_sample_rn(
                 (void)ds4_dspark_nightjar_reject(
                         &owner->dspark_nightjar,
                         nightjar_context,
-                        nightjar_arm);
+                        nightjar_arm,
+                        request_count >= 3u);
             }
         }
     }
@@ -39385,7 +39386,8 @@ int ds4_sessions_eval_speculative_sample_rn(
                 (void)ds4_dspark_nightjar_reject(
                         &owner->dspark_nightjar,
                         nightjar_context,
-                        nightjar_arm);
+                        nightjar_arm,
+                        request_count >= 3u);
             } else {
                 physical_step.selected = locked_physical;
                 serial_step.selected = locked_serial;
@@ -39508,9 +39510,10 @@ int ds4_sessions_eval_speculative_sample_rn(
     const uint64_t coordinator_step = owner->dspark_rn_hw_scheduler.step;
     const bool paired_offline_sps =
         physical_offline_sps && serial_offline_sps;
-    /* Row-only offline curves are priors, not proof for the exact lane shape.
-     * Measure each frequently observed shape twice on the missing executor,
-     * then refresh a losing shape only after another 64 observations. */
+    /* Complete paired offline curves are the conservative executor baseline.
+     * Exact lane-shape samples supersede them when available; otherwise probe
+     * recurring shapes without imposing a cold-start margin on calibrated
+     * physical-versus-serial decisions. */
     const bool physical_discovery_probe =
         request_count > 1u &&
         physical_profile_samples < 2u &&
@@ -39535,9 +39538,10 @@ int ds4_sessions_eval_speculative_sample_rn(
     const bool serial_shape_mature =
         serial_profile_samples >=
             DS4_DSPARK_RN_SHAPE_MIN_SAMPLES;
-    const bool physical_cost_mature = physical_shape_mature;
+    const bool physical_cost_mature =
+        paired_offline_sps || physical_shape_mature;
     const bool serial_cost_mature =
-        serial_shape_mature || serial_model_mature;
+        paired_offline_sps || serial_shape_mature || serial_model_mature;
     /* A complete serial lane model is generally better calibrated than a
      * cold physical row curve.  Require physical execution to beat serial by
      * a confidence margin; shrink that margin as both cost sources mature. */

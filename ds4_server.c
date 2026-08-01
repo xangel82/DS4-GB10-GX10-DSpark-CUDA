@@ -4660,6 +4660,52 @@ static bool parse_generated_message_ex(const char *text, bool require_thinking_c
             return true;
         }
         tool_search = think_end + 8;
+
+        /* The 0731 model can continue a recovered stanza with <invoke>
+         * directly: the opening sampled in reasoning is immediately followed
+         * by the forced </think>, while the executable half starts after the
+         * close.  Normalize only that exact recovery shape by supplying the
+         * missing outer wrapper to the parser.  The sampled transcript and KV
+         * remain untouched, and DSML that stays wholly inside reasoning is
+         * still ignored. */
+        size_t recovered_start = 0;
+        size_t recovered_end = 0;
+        const size_t close_pos = (size_t)(think_end - text);
+        const char *exec = skip_ascii_ws(tool_search);
+        const char *implicit_wrapper = NULL;
+        if (find_recovered_think_tool_marker(
+                text, 0, close_pos + strlen("</think>"),
+                &recovered_start, &recovered_end) &&
+            recovered_end == close_pos) {
+            const char *marker = text + recovered_start;
+            if (!strncmp(marker, DS4_TOOL_CALLS_START,
+                         strlen(DS4_TOOL_CALLS_START)) &&
+                !strncmp(exec, DS4_INVOKE_START,
+                         strlen(DS4_INVOKE_START))) {
+                implicit_wrapper = DS4_TOOL_CALLS_START;
+            } else if (!strncmp(marker, DS4_TOOL_CALLS_START_SHORT,
+                                strlen(DS4_TOOL_CALLS_START_SHORT)) &&
+                       !strncmp(exec, DS4_INVOKE_START_SHORT,
+                                strlen(DS4_INVOKE_START_SHORT))) {
+                implicit_wrapper = DS4_TOOL_CALLS_START_SHORT;
+            } else if (!strncmp(marker, "<tool_calls>",
+                                strlen("<tool_calls>")) &&
+                       !strncmp(exec, "<invoke", strlen("<invoke"))) {
+                implicit_wrapper = "<tool_calls>";
+            }
+        }
+        if (implicit_wrapper) {
+            buf normalized = {0};
+            buf_append(&normalized, text,
+                       (size_t)(tool_search - text));
+            buf_puts(&normalized, "\n\n");
+            buf_puts(&normalized, implicit_wrapper);
+            buf_puts(&normalized, tool_search);
+            const bool ok = parse_generated_message_ex(
+                normalized.ptr, true, content_out, reasoning_out, calls);
+            buf_free(&normalized);
+            return ok;
+        }
     }
 
     const char *start = strstr(tool_search, "\n\n" DS4_TOOL_CALLS_START);
@@ -12880,11 +12926,12 @@ static bool server_lane_activation_pressure_locked(const server *root) {
     return true;
 }
 
-/* The first two lanes remain hot. A configured third lane is only materialized
- * when every resident lane already owns work and unified memory can absorb its
- * private KV/compressor state while retaining an explicit OS reserve. CUDA
- * allocations are serialized with inference, but root->mu is released while
- * the comparatively expensive session allocation runs. */
+/* Configured lanes are materialized only when unified memory can absorb the
+ * private KV/compressor state while retaining an explicit OS reserve. At very
+ * long contexts this intentionally leaves one resident lane: extra sessions
+ * use the bounded queue and durable KV replay instead of overcommitting UMA.
+ * CUDA allocations are serialized with inference, but root->mu is released
+ * while the comparatively expensive session allocation runs. */
 static void server_maybe_activate_lane(server *s) {
     server *root = server_root(s);
     if (!root) return;
@@ -13036,7 +13083,8 @@ static bool enqueue(server *s, job *j) {
     const uint32_t selected = route.lane_id;
     j->lane_id = selected;
     server *lane = root->lanes ? root->lanes[selected] : root;
-    if (getenv("DS4_DSPARK_LOG") != NULL && root->lane_count > 1u) {
+    if (getenv("DS4_DSPARK_LOG") != NULL &&
+        root->lane_capacity > 1u) {
         uint32_t total_assigned = 1u;
         uint32_t active_workers = 0u;
         for (uint32_t i = 0u; i < root->lane_count; i++) {
@@ -13995,20 +14043,23 @@ int main(int argc, char **argv) {
             requested_hot_lanes = (uint32_t)parsed;
         }
     }
-    if (requested_lanes > 1u && requested_hot_lanes < 2u) {
-        server_log(DS4_LOG_WARNING,
-                   "ds4-server: elastic DSpark serving requires two "
-                   "pristine hot lanes; using hot=2");
-        requested_hot_lanes = 2u;
-    }
     if (requested_lanes > 1u &&
         ds4_engine_has_dspark(engine) &&
         cfg.engine.backend == DS4_BACKEND_CUDA) {
         s.lane_capacity = requested_lanes;
-        s.lane_hot_count = requested_hot_lanes;
         s.lane_memory_reserve_bytes = server_env_mb(
             "DS4_SERVER_DSPARK_LANE_RESERVE_MB",
             DS4_SERVER_DSPARK_LANE_RESERVE_MB, 65536u) * 1048576u;
+        s.lane_private_device_bytes =
+            ds4_session_private_device_bytes(session);
+        if (s.lane_private_device_bytes == 0u) {
+            const ds4_context_memory lane_memory =
+                ds4_context_memory_estimate_with_prefill(
+                        cfg.engine.backend,
+                        cfg.ctx_size,
+                        cfg.engine.prefill_chunk);
+            s.lane_private_device_bytes = lane_memory.total_bytes;
+        }
         for (uint32_t lane_id = 1u; lane_id < requested_lanes; lane_id++) {
             server *lane = xmalloc(sizeof(*lane));
             memset(lane, 0, sizeof(*lane));
@@ -14025,14 +14076,31 @@ int main(int argc, char **argv) {
         for (uint32_t lane_id = 1u;
              lane_id < requested_hot_lanes;
              lane_id++) {
+            const uint64_t available =
+                server_memory_available_bytes();
+            if (!server_lane_memory_fits(
+                    available,
+                    s.lane_private_device_bytes,
+                    s.lane_memory_reserve_bytes)) {
+                server_log(DS4_LOG_WARNING,
+                           "ds4-server: startup DSpark lane %u deferred "
+                           "by adaptive UMA admission (resident=%u/%u "
+                           "need=%.2f MiB reserve=%.2f MiB "
+                           "available=%.2f MiB); excess sessions will "
+                           "run serially with KV replay",
+                           lane_id, s.lane_count, s.lane_capacity,
+                           (double)s.lane_private_device_bytes / 1048576.0,
+                           (double)s.lane_memory_reserve_bytes / 1048576.0,
+                           (double)available / 1048576.0);
+                break;
+            }
             ds4_session *shared = NULL;
             if (ds4_session_create_shared(&shared, session) != 0) {
                 server_log(DS4_LOG_WARNING,
                            "ds4-server: shared DSpark lane %u unavailable; "
-                           "continuing with %u lane(s)",
+                           "continuing with %u resident lane(s) and "
+                           "bounded serial fallback",
                            lane_id, s.lane_count);
-                s.lane_capacity = s.lane_count;
-                s.lane_hot_count = s.lane_count;
                 break;
             }
             server *lane = s.lanes[lane_id];
@@ -14041,18 +14109,14 @@ int main(int argc, char **argv) {
             s.lane_private_device_bytes =
                 ds4_session_private_device_bytes(shared);
         }
-        for (uint32_t lane_id = s.lane_capacity;
-             lane_id < requested_lanes;
-             lane_id++) {
-            free(s.lanes[lane_id]);
-            s.lanes[lane_id] = NULL;
-        }
-        if (s.lane_count > 1u) {
+        s.lane_hot_count = s.lane_count;
+        if (s.lane_capacity > 1u) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: DSpark cohort coordinator active "
-                       "(resident=%u max=%u hot=%u, coalesce=%ldus, "
+                       "(resident=%u max=%u requested-hot=%u, "
+                       "coalesce=%ldus, "
                        "KV-cost-aware dispatch, physical R=1..%u)",
-                       s.lane_count, s.lane_capacity, s.lane_hot_count,
+                       s.lane_count, s.lane_capacity, requested_hot_lanes,
                        server_coalesce_us(), s.lane_capacity);
             if (s.lane_capacity > s.lane_count) {
                 server_log(DS4_LOG_DEFAULT,
@@ -15726,6 +15790,34 @@ static void test_dsml_tool_args_preserve_call_order(void) {
     TEST_ASSERT(description < command);
     TEST_ASSERT(command < timeout);
     buf_free(&b);
+    tool_calls_free(&calls);
+}
+
+static void test_recovered_thinking_tool_implicit_wrapper_is_executable(void) {
+    const char *generated =
+        "need a directory listing\n\n"
+        DS4_TOOL_CALLS_START "</think>\n\n"
+        DS4_INVOKE_START " name=\"list_files\">\n"
+        DS4_PARAM_START " name=\"path\" string=\"true\">."
+        DS4_PARAM_END "\n"
+        DS4_INVOKE_END "\n"
+        DS4_TOOL_CALLS_END;
+
+    char *content = NULL;
+    char *reasoning = NULL;
+    tool_calls calls = {0};
+    TEST_ASSERT(parse_generated_message_ex(generated, true,
+                                           &content, &reasoning, &calls));
+    TEST_ASSERT(calls.len == 1);
+    TEST_ASSERT(calls.v[0].name &&
+                !strcmp(calls.v[0].name, "list_files"));
+    TEST_ASSERT(calls.v[0].arguments &&
+                strstr(calls.v[0].arguments, "\"path\": \".\""));
+    TEST_ASSERT(reasoning && !strcmp(reasoning, "need a directory listing"));
+    TEST_ASSERT(content && content[0] == '\0');
+
+    free(content);
+    free(reasoning);
     tool_calls_free(&calls);
 }
 
@@ -18940,6 +19032,10 @@ static void test_elastic_lane_pressure_and_memory_guard(void) {
     TEST_ASSERT(!server_lane_memory_fits(3u * gib - 1u, 2u * gib, 1u * gib));
     TEST_ASSERT(!server_lane_memory_fits(0u, 2u * gib, 1u * gib));
     TEST_ASSERT(!server_lane_memory_fits(4u * gib, 0u, 1u * gib));
+    TEST_ASSERT(!server_lane_memory_fits(
+                3u * gib, 3u * gib, 1u * gib));
+    TEST_ASSERT(server_lane_memory_fits(
+                5u * gib, 3u * gib, 1u * gib));
 }
 
 static void ds4_server_unit_tests_run(void) {
@@ -18976,6 +19072,7 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_recovered_thinking_tool_marker_is_not_projected();
+    test_recovered_thinking_tool_implicit_wrapper_is_executable();
     test_openai_tool_stream_sends_partial_arguments();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();

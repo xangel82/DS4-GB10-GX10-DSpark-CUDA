@@ -49,7 +49,7 @@ int main(void) {
 
     write_profile(path, fingerprint, 0, 0);
     require_true(ds4_dspark_sps_profile_load(
-                     path, fingerprint, &profile,
+                     path, fingerprint, 0, &profile,
                      err, sizeof(err)) == 0,
                  "complete profile did not load");
     require_true(profile.record_count == 22u &&
@@ -75,13 +75,19 @@ int main(void) {
                  "serial curve values changed during parsing");
 
     require_true(ds4_dspark_sps_profile_load(
-                     path, fingerprint + 1u, &profile,
+                     path, fingerprint + 1u, 0, &profile,
                      err, sizeof(err)) != 0,
                  "stale fingerprint was accepted");
+    require_true(ds4_dspark_sps_profile_load(
+                     path, fingerprint + 1u, 1, &profile,
+                     err, sizeof(err)) == 0,
+                 "forced fingerprint was rejected");
+    require_true(profile.fingerprint == fingerprint,
+                 "forced profile lost its source fingerprint");
 
     write_profile(path, fingerprint, 0, 1);
     require_true(ds4_dspark_sps_profile_load(
-                     path, fingerprint, &profile,
+                     path, fingerprint, 0, &profile,
                      err, sizeof(err)) == 0,
                  "valid partial profile should remain inspectable");
     memset(curve, 0, sizeof(curve));
@@ -97,7 +103,7 @@ int main(void) {
 
     write_profile(path, fingerprint, 1, 0);
     require_true(ds4_dspark_sps_profile_load(
-                     path, fingerprint, &profile,
+                     path, fingerprint, 0, &profile,
                      err, sizeof(err)) != 0,
                  "duplicate profile row was accepted");
     unlink(path);

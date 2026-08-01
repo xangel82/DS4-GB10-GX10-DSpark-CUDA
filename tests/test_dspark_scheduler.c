@@ -651,11 +651,49 @@ static void test_nightjar_exposes_stale_lock_reference_loss(void) {
                      decision.reference_loss * 1.03,
                  "Nightjar did not expose a guardable stale lock");
     require_true(ds4_dspark_nightjar_reject(
-                     &state, context, decision.arm) == 0 &&
+                     &state, context, decision.arm, 0u) == 0 &&
                  !state.context[0].locked &&
                  !state.context[0].previous_valid &&
+                 state.context[0].arm[0].reject_until == 0u &&
+                 state.context[0].arm[0].reject_streak == 0u &&
                  state.context[0].revoked_pending,
-                 "Nightjar rejected decision retained stale state");
+                 "Nightjar non-R3 rejection changed scheduling state");
+}
+
+static void test_nightjar_rejected_arm_cools_down_and_recovers(void) {
+    ds4_dspark_nightjar_state state;
+    ds4_dspark_nightjar_state_reset(&state);
+    const uint64_t context = UINT64_C(0x7333);
+    const ds4_dspark_nightjar_candidate candidates[] = {
+        {.arm = 2u, .predicted_loss = 0.020, .switch_loss = 0.0},
+        {.arm = 4u, .predicted_loss = 0.021, .switch_loss = 0.0},
+    };
+    ds4_dspark_nightjar_decision decision;
+    require_true(ds4_dspark_nightjar_select(
+                     &state, context, candidates, 2u, 1.10,
+                     &decision) == 0 && decision.arm == 2u,
+                 "Nightjar cooldown setup did not select best arm");
+    require_true(ds4_dspark_nightjar_reject(
+                     &state, context, 2u, 1u) == 0,
+                 "Nightjar cooldown reject failed");
+    require_true(ds4_dspark_nightjar_select(
+                     &state, context, candidates, 2u, 1.10,
+                     &decision) == 0 && decision.arm == 4u,
+                 "Nightjar immediately retried a guarded arm");
+    require_true(ds4_dspark_nightjar_observe(
+                     &state, context, 4u, 0.021, 1u) == 0,
+                 "Nightjar cooldown progress observation failed");
+    require_true(ds4_dspark_nightjar_select(
+                     &state, context, candidates, 2u, 1.10,
+                     &decision) == 0 && decision.arm == 4u,
+                 "Nightjar cooldown expired before its bounded horizon");
+    require_true(ds4_dspark_nightjar_observe(
+                     &state, context, 4u, 0.021, 1u) == 0,
+                 "Nightjar cooldown expiry observation failed");
+    require_true(ds4_dspark_nightjar_select(
+                     &state, context, candidates, 2u, 1.10,
+                     &decision) == 0 && decision.arm == 2u,
+                 "Nightjar rejected arm did not recover after cooldown");
 }
 
 static ds4_dspark_schedule_item schedule_item(
@@ -1260,6 +1298,7 @@ int main(void) {
     test_nightjar_mature_measurements_override_stale_prior();
     test_nightjar_seed_is_bounded_and_adaptive();
     test_nightjar_exposes_stale_lock_reference_loss();
+    test_nightjar_rejected_arm_cools_down_and_recovers();
     test_shape_aware_step_and_fallback();
     test_stateful_two_step_barrier();
     test_executor_pair_advances_history_once();

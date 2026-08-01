@@ -39,13 +39,14 @@ typedef struct {
     uint32_t complete_groups;
 } ds4_dspark_sps_profile;
 
-/* Load an immutable offline SPS(B) profile. The file is accepted only when
- * its fingerprint matches and every record is unique and internally valid.
- * Incomplete groups may be present, but production lookup never exposes them.
- */
+/* Load an immutable offline SPS(B) profile. A forced load may bypass only the
+ * target fingerprint comparison; version, coordinates, uniqueness and record
+ * validity remain mandatory. Incomplete groups may be present, but production
+ * lookup never exposes them. */
 int ds4_dspark_sps_profile_load(
         const char *path,
         uint64_t expected_fingerprint,
+        int force_fingerprint,
         ds4_dspark_sps_profile *profile,
         char *err,
         size_t errlen);

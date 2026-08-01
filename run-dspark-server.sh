@@ -46,6 +46,7 @@ COORDINATOR_LANE_RESERVE_MB="${DS4_SERVER_DSPARK_LANE_RESERVE_MB:-1536}"
 COORDINATOR_COALESCE_US="${DS4_SERVER_DSPARK_COALESCE_US:-500}"
 COORDINATOR_ACTIVE_COALESCE_US="${DS4_SERVER_DSPARK_ACTIVE_COALESCE_US:-20000}"
 COORDINATOR_MIN_PHYSICAL_ROWS="${DS4_DSPARK_RN_MIN_PHYSICAL_ROWS:-0}"
+SPS_FORCE_PROFILE="${DS4_DSPARK_SPS_FORCE_PROFILE:-0}"
 HARDWARE_PROFILE="${DS4_DSPARK_HW_PROFILE:-$MODEL_DIR/dspark-hardware-${DSPARK_VARIANT}.profile}"
 if [[ -n "${DS4_DSPARK_SPS_PROFILE+x}" ]]; then
   SPS_PROFILE="$DS4_DSPARK_SPS_PROFILE"
@@ -150,6 +151,10 @@ case "$NIGHTJAR_MAX_R" in
   1|2|3) ;;
   *) echo "Invalid DS4_DSPARK_NIGHTJAR_MAX_R: $NIGHTJAR_MAX_R (expected 1, 2 or 3)" >&2; exit 2 ;;
 esac
+case "$SPS_FORCE_PROFILE" in
+  0|1) ;;
+  *) echo "Invalid DS4_DSPARK_SPS_FORCE_PROFILE: $SPS_FORCE_PROFILE (expected 0 or 1)" >&2; exit 2 ;;
+esac
 case "$COORDINATOR_LANES" in
   1|2|3) ;;
   *) echo "Invalid DS4_SERVER_DSPARK_LANES: $COORDINATOR_LANES (expected 1, 2 or 3)" >&2; exit 2 ;;
@@ -160,10 +165,6 @@ case "$COORDINATOR_HOT_LANES" in
 esac
 if (( COORDINATOR_HOT_LANES > COORDINATOR_LANES )); then
   echo "Invalid DS4_SERVER_DSPARK_HOT_LANES: $COORDINATOR_HOT_LANES exceeds max lanes $COORDINATOR_LANES" >&2
-  exit 2
-fi
-if (( COORDINATOR_LANES > 1 && COORDINATOR_HOT_LANES < 2 )); then
-  echo "Invalid DS4_SERVER_DSPARK_HOT_LANES: elastic lanes require two pristine hot lanes" >&2
   exit 2
 fi
 if ! [[ "$COORDINATOR_LANE_RESERVE_MB" =~ ^[0-9]+$ ]]; then
@@ -402,6 +403,7 @@ export DS4_SERVER_DSPARK_ACTIVE_COALESCE_US="$COORDINATOR_ACTIVE_COALESCE_US"
 export DS4_DSPARK_RN_MIN_PHYSICAL_ROWS="$COORDINATOR_MIN_PHYSICAL_ROWS"
 export DS4_DSPARK_HW_PROFILE="$HARDWARE_PROFILE"
 export DS4_DSPARK_SPS_PROFILE="$SPS_PROFILE"
+export DS4_DSPARK_SPS_FORCE_PROFILE="$SPS_FORCE_PROFILE"
 if [[ -n "$STS_PROFILE" ]]; then
   if [[ ! -f "$STS_PROFILE" ]]; then
     echo "DSpark STS profile not found: $STS_PROFILE" >&2
@@ -422,10 +424,10 @@ echo "KV:     policy=$DS4_KV_PREFILL_CHECKPOINT_POLICY keep-long-text-hits=$DS4_
 echo "Context guard: physical=$CTX advertise=${ADVERTISE_CONTEXT_PCT}%"
 echo "DSpark scheduler: hardware-aware Algorithm 1 + exact t-2 production capacity, full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY shadow=$SCHEDULER_SHADOW deterministic=$SCHEDULER_DETERMINISTIC"
 echo "DSpark Nightjar: active=$NIGHTJAR shadow=$NIGHTJAR_SHADOW max-r=$NIGHTJAR_MAX_R aggregate-budget=1..R*$DRAFT (B=0 singleton-only) t-2-capacity current-confidence-ranked executor=paired-physical/serial exact-shape-aware recent-reward=pure-neural-ms/token max-predicted-regression=$NIGHTJAR_MAX_REGRESSION persistent-warm-start=bounded"
-echo "DSpark coordinator: resident=$COORDINATOR_HOT_LANES max=$COORDINATOR_LANES reserve=${COORDINATOR_LANE_RESERVE_MB}MiB coalesce=${COORDINATOR_COALESCE_US}us active-rendezvous=${COORDINATOR_ACTIVE_COALESCE_US}us min-physical-rows=$COORDINATOR_MIN_PHYSICAL_ROWS load-aware-prefix=1 physical-R1..R${COORDINATOR_LANES}=profiled serial-fallback=1"
+echo "DSpark coordinator: requested-hot=$COORDINATOR_HOT_LANES max=$COORDINATOR_LANES adaptive-UMA-admission=1 reserve=${COORDINATOR_LANE_RESERVE_MB}MiB coalesce=${COORDINATOR_COALESCE_US}us active-rendezvous=${COORDINATOR_ACTIVE_COALESCE_US}us min-physical-rows=$COORDINATOR_MIN_PHYSICAL_ROWS load-aware-prefix=1 physical-R1..R${COORDINATOR_LANES}=profiled bounded-serial-KV-replay=1"
 echo "DSpark STS: profile=${STS_PROFILE:-online-fallback} capture=${DS4_DSPARK_STS_CAPTURE:-disabled}"
 echo "DSpark hardware profile: $DS4_DSPARK_HW_PROFILE (versioned model/binary fingerprint)"
-echo "DSpark offline SPS: $DS4_DSPARK_SPS_PROFILE (immutable complete-curve calibration; generic fallback)"
+echo "DSpark offline SPS: $DS4_DSPARK_SPS_PROFILE (immutable complete-curve calibration; force-fingerprint=$SPS_FORCE_PROFILE; generic fallback)"
 echo "DSpark parity: confidence-input=$CONFIDENCE_INPUT, verifier-topology-cache=$GRAPH_TOPOLOGY_CACHE"
 echo "DSpark sampling: lossless p/q rejection for top_k=0 top_p=1 min-p policy (rollback DS4_DSPARK_REJECTION_DISABLE=1)"
 echo "HybridLC: enabled=$HYBRID_LC shadow=$HYBRID_LC_SHADOW indexed-suffix=8-token transition-q=top8 BlockV=lossless max-draft=15 graph-rows=8/12/16 forced-width=${HYBRID_WIDTH:-auto}"

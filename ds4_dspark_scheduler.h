@@ -106,7 +106,9 @@ typedef struct {
     double total_latency;
     uint64_t total_tokens;
     uint64_t samples;
+    uint64_t reject_until;
     uint32_t recent_samples;
+    uint32_t reject_streak;
     uint32_t in_use;
 } ds4_dspark_nightjar_arm;
 
@@ -265,7 +267,8 @@ int ds4_dspark_nightjar_observe(
 int ds4_dspark_nightjar_reject(
         ds4_dspark_nightjar_state *state,
         uint64_t context_key,
-        uint32_t arm);
+        uint32_t arm,
+        uint32_t cooldown_enabled);
 
 void ds4_dspark_scheduler_state_reset(
         ds4_dspark_scheduler_state *state);

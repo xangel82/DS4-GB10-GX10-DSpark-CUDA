@@ -506,6 +506,14 @@ static ds4_dspark_nightjar_arm *ds4_dspark_nightjar_arm_get(
     return free_arm;
 }
 
+static int ds4_dspark_nightjar_arm_available(
+        const ds4_dspark_nightjar_context *context,
+        const ds4_dspark_nightjar_arm *arm) {
+    return context && arm &&
+        (arm->reject_until == 0u ||
+         context->observations >= arm->reject_until);
+}
+
 int ds4_dspark_nightjar_seed_arm(
         ds4_dspark_nightjar_state *state,
         uint64_t context_key,
@@ -542,6 +550,8 @@ int ds4_dspark_nightjar_seed_arm(
     slot->mean_loss = mean_loss;
     slot->recent_loss = recent_loss;
     slot->recent_samples = effective_recent;
+    slot->reject_until = 0u;
+    slot->reject_streak = 0u;
     if (UINT64_MAX - context->observations < effective_samples) {
         context->observations = UINT64_MAX;
     } else {
@@ -626,6 +636,20 @@ int ds4_dspark_nightjar_select(
     if (!context) return 1;
     context->safe_ratio = safe_ratio;
 
+    uint32_t available_arms = 0u;
+    for (uint32_t i = 0; i < candidate_count; i++) {
+        ds4_dspark_nightjar_arm *slot =
+            ds4_dspark_nightjar_arm_get(
+                    context, candidates[i].arm, 1);
+        if (!slot) return 1;
+        if (ds4_dspark_nightjar_arm_available(context, slot)) {
+            available_arms++;
+        }
+    }
+#define DS4_NIGHTJAR_ARM_SKIP(slot_) \
+    (available_arms != 0u && \
+     !ds4_dspark_nightjar_arm_available(context, (slot_)))
+
     int selected_index = -1;
     int bootstrap_index = -1;
     double bootstrap_loss = DBL_MAX;
@@ -636,6 +660,7 @@ int ds4_dspark_nightjar_select(
                 ds4_dspark_nightjar_arm_get(
                         context, candidates[i].arm, 1);
             if (!slot) return 1;
+            if (DS4_NIGHTJAR_ARM_SKIP(slot)) continue;
             double loss = ds4_dspark_nightjar_arm_loss(
                     slot, candidates[i].predicted_loss);
             if (context->previous_valid &&
@@ -651,6 +676,7 @@ int ds4_dspark_nightjar_select(
                 ds4_dspark_nightjar_arm_get(
                         context, candidates[i].arm, 1);
             if (!slot) return 1;
+            if (DS4_NIGHTJAR_ARM_SKIP(slot)) continue;
             if (slot->samples != 0u) continue;
             double loss = candidates[i].predicted_loss;
             if (context->previous_valid &&
@@ -669,10 +695,19 @@ int ds4_dspark_nightjar_select(
             }
         }
     }
-    const int locked_index = context->locked
+    int locked_index = context->locked
         ? ds4_dspark_nightjar_candidate_index(
                 candidates, candidate_count, context->locked_arm)
         : -1;
+    if (locked_index >= 0) {
+        ds4_dspark_nightjar_arm *locked_slot =
+            ds4_dspark_nightjar_arm_get(
+                    context, candidates[locked_index].arm, 0);
+        if (!locked_slot || DS4_NIGHTJAR_ARM_SKIP(locked_slot)) {
+            locked_index = -1;
+            context->locked = 0u;
+        }
+    }
     const uint32_t reused_lock = locked_index >= 0 ? 1u : 0u;
     uint32_t exploration = 0u;
     double exploration_probability = 0.0;
@@ -708,6 +743,10 @@ int ds4_dspark_nightjar_select(
                     ds4_dspark_nightjar_arm_get(
                             context, candidates[i].arm, 1);
                 if (!slot) return 1;
+                if (DS4_NIGHTJAR_ARM_SKIP(slot)) {
+                    current_loss[i] = DBL_MAX;
+                    continue;
+                }
                 double loss = ds4_dspark_nightjar_arm_loss(
                         slot, candidates[i].predicted_loss);
                 if (context->previous_valid &&
@@ -728,7 +767,8 @@ int ds4_dspark_nightjar_select(
             if (best_current_index < 0) return 1;
             const double limit = best_current * safe_ratio;
             for (uint32_t i = 0; i < candidate_count; i++) {
-                if (current_loss[i] <= limit) {
+                if (current_loss[i] < DBL_MAX &&
+                    current_loss[i] <= limit) {
                     safe[safe_count++] = i;
                 }
             }
@@ -771,6 +811,7 @@ int ds4_dspark_nightjar_select(
                     ds4_dspark_nightjar_arm_get(
                             context, candidates[i].arm, 1);
                 if (!slot) return 1;
+                if (DS4_NIGHTJAR_ARM_SKIP(slot)) continue;
                 double loss = ds4_dspark_nightjar_arm_loss(
                         slot, candidates[i].predicted_loss);
                 if (context->previous_valid &&
@@ -829,6 +870,7 @@ int ds4_dspark_nightjar_select(
             ds4_dspark_nightjar_arm_get(
                     context, candidates[i].arm, 1);
         if (!slot) return 1;
+        if (DS4_NIGHTJAR_ARM_SKIP(slot)) continue;
         double loss = ds4_dspark_nightjar_arm_loss(
                 slot, candidates[i].predicted_loss);
         if (context->previous_valid && context->previous_arm == 0u &&
@@ -862,6 +904,7 @@ int ds4_dspark_nightjar_select(
             context->bin_index = 1u;
         }
     }
+#undef DS4_NIGHTJAR_ARM_SKIP
     return 0;
 }
 
@@ -893,6 +936,8 @@ int ds4_dspark_nightjar_observe(
         ? sample_loss
         : slot->recent_loss * (1.0 - alpha) + sample_loss * alpha;
     slot->recent_samples++;
+    slot->reject_until = 0u;
+    slot->reject_streak = 0u;
     context->observations++;
 
     if (context->locked && context->locked_arm == arm) {
@@ -925,11 +970,20 @@ int ds4_dspark_nightjar_observe(
 int ds4_dspark_nightjar_reject(
         ds4_dspark_nightjar_state *state,
         uint64_t context_key,
-        uint32_t arm) {
+        uint32_t arm,
+        uint32_t cooldown_enabled) {
     ds4_dspark_nightjar_context *context =
         ds4_dspark_nightjar_context_get(state, context_key, 0);
     if (!context) return 1;
-    if (!ds4_dspark_nightjar_arm_get(context, arm, 0)) return 1;
+    ds4_dspark_nightjar_arm *slot =
+        ds4_dspark_nightjar_arm_get(context, arm, 0);
+    if (!slot) return 1;
+    if (cooldown_enabled) {
+        if (slot->reject_streak < 5u) slot->reject_streak++;
+        const uint64_t cooldown = UINT64_C(1) << slot->reject_streak;
+        slot->reject_until = context->observations > UINT64_MAX - cooldown
+            ? UINT64_MAX : context->observations + cooldown;
+    }
     if (context->locked && context->locked_arm == arm) {
         context->locked = 0u;
     }

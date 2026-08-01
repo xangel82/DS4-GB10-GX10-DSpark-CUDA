@@ -599,6 +599,20 @@ su 152 reward valide; alla chiusura sono stati salvati 10 bracci. Il secondo
 avvio dello stesso binario ha caricato correttamente `nightjar_arms=10`,
 verificando il warm-start end-to-end.
 
+Il gate R3 del 1 agosto ha inoltre eliminato un loop di selezione: un braccio
+R3 respinto dal guard hardware entra ora in un cooldown causale e limitato
+(`2..32` osservazioni, crescita esponenziale). Nightjar prova quindi un altro
+budget/executor sicuro invece di riproporre immediatamente la stessa forma;
+una misura reale sul braccio azzera il cooldown. R1 e R2 mantengono la policy
+consolidata, perche' il loop era specifico della maggiore cardinalita' R3.
+Nel gate breve il numero dei guard e' sceso da 155 a 51-63 per run, R1 ha
+misurato 14,13-14,49 t/s e R3 13,38 t/s mediani (13,22-13,54). Il percorso
+fisico R2 ha mantenuto 17,00 t/s; la minore metrica wall-clock di una prova
+derivava dalla coda finale fra due risposte di durata diversa, non dal kernel
+di coorte. `B=0` non viene eliminato artificialmente: nel singleton misurato
+ha raggiunto circa 16,0-16,4 t/s e resta quindi corretto conservarlo quando il
+draft non ripaga il proprio costo.
+
 Per evitare i test operativi da circa 40 minuti, la matrice breve esegue
 `R=1,2,3` nello stesso comando e salva un JSON riproducibile:
 
@@ -904,16 +918,39 @@ una verifica di sicurezza della memoria, non una modalita' di scaling. Sopra
 tre client residenti il comportamento promosso e' quindi coda bounded e
 servizio seriale sulle lane disponibili.
 
+#### Ammissione UMA adattiva fino a 1M
+
+`DS4_SERVER_DSPARK_HOT_LANES` indica ora il numero richiesto di lane calde, non
+forza un'allocazione non sicura. Prima di materializzare ogni sessione il
+coordinatore confronta `MemAvailable` con la stima conservativa completa della
+lane piu' la riserva `DS4_SERVER_DSPARK_LANE_RESERVE_MB`. Se non entra, conserva
+la capacita' logica e accoda le sessioni eccedenti sulle frontier residenti;
+checkpoint KV e replay persistente permettono il cambio di conversazione. Lo
+swap Linux non viene considerato memoria CUDA disponibile.
+
+Il gate reale a context `1048576` ha stimato `13661,15 MiB` per una lane. Con
+`3257,01 MiB` disponibili e una riserva di `1536 MiB`, la seconda lane e' stata
+rinviata e il server e' partito `resident=1/3`. Due client concorrenti hanno
+completato 128 token in 11,67 secondi (`10,97 t/s` aggregati); tre client hanno
+completato 96 token in 8,58 secondi (`11,19 t/s`). I lavori sono stati eseguiti
+in serie sulla lane residente, senza OOM e con `VmSwap: 0 kB`. Questi numeri
+validano la sicurezza e la continuita' multi-sessione a 1M, non uno scaling di
+throughput: il parallelismo fisico viene riattivato automaticamente soltanto
+quando la UMA puo' realmente contenerlo.
+
 #### Stato operativo e limiti della release
 
-La configurazione promossa parte con due lane residenti e una capacita' massima
-di tre. La terza lane viene materializzata soltanto quando entrambe le lane
-calde hanno gia' lavoro assegnato e `MemAvailable` puo' contenere il suo stato
-privato piu' una riserva esplicita. Sul profilo misurato richiede
+La configurazione promossa richiede due lane calde e una capacita' massima di
+tre. Ogni lane oltre la prima viene pero' materializzata soltanto quando le
+lane residenti hanno lavoro e `MemAvailable` puo' contenere il suo stato
+privato piu' una riserva esplicita. A 262K il profilo misurato richiede
 `2368,66 MiB`; il launcher conserva per default altri `1536 MiB` e non usa lo
 swap Linux come tier di capacita' CUDA. `R=4` non e' considerato sicuro con il
 margine UMA osservato su Athena. Pesi, cache Q8->F16 e arena transiente sono
-condivisi, mentre ogni lane conserva il proprio stato di conversazione.
+condivisi, mentre ogni lane conserva il proprio stato di conversazione. A
+850K/1M la stessa regola puo' mantenere una sola lane residente e serializzare
+gli agenti aggiuntivi: e' il fallback intenzionale che sostituisce
+l'overcommit e l'OOM.
 
 ```bash
 DS4_SERVER_DSPARK_LANES=3
@@ -1277,8 +1314,14 @@ controllo. La calibrazione Q2 completa su GB10 ha poi raccolto `7.120`
 campioni, generando `1.248` record e `128` gruppi completi: `R=1` copre tutti i
 bucket fino a circa 1M token, mentre `R=2..3` coprono i bucket fino a 512K per
 rispettare il limite di memoria della raccolta multi-lane. Il profilo promosso
-e' `profiles/dspark-sps-q2.conf`, fingerprint `8751cba0622dd9a3`. Questa
-modifica incrementa l'ABI SPS: un server precedente non puo' caricare
+e' `profiles/dspark-sps-q2.conf`, fingerprint strutturale
+`98d0652c1bea215f`. Il fingerprint identifica geometria dell'esecutore, ABI
+dei kernel, variante, backend, power target e dimensioni degli artefatti; non
+dipende dal percorso o dal timestamp dei GGUF. La stessa curva e' quindi
+ufficiale sia per la preview sia per la release 0731 quando questa identita'
+strutturale coincide. Il controllo rimane stretto per configurazioni diverse;
+`DS4_DSPARK_SPS_FORCE_PROFILE=1` e' soltanto un override diagnostico esplicito.
+Questa modifica incrementa l'ABI SPS: un server precedente non puo' caricare
 accidentalmente la curva misurata sul percorso lane-partitioned.
 
 Lo script dedicato non scarta altri campioni perche' il warm-up e' gia'

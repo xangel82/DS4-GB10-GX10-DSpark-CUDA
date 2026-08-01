@@ -558,6 +558,56 @@ numero di proposte puo' cambiare e quindi una risposta campionata puo' divergere
 bit per bit, ma ogni token resta accettato o corretto dal modello target con la
 stessa distribuzione lossless.
 
+#### Persistenza bounded e guard anti-regressione - 1 agosto 2026
+
+Il canary ora conserva nel medesimo profilo hardware sia le forme dell'executor
+(`P`) sia i reward Nightjar maturi (`N`). Il file resta legato al fingerprint
+esatto di binario, modello target e sidecar: una build o un GGUF differente
+viene ignorato, senza riutilizzare misure incompatibili. Un braccio entra nel
+file soltanto dopo quattro osservazioni. Al riavvio vengono ripristinati al
+massimo otto campioni storici e quattro recenti; lock, round e revoche non sono
+mai persistiti, perche' contesa e request mix possono essere cambiati.
+
+Il percorso attivo applica inoltre due guard lossless. Prima del draft rifiuta
+una stima peggiore del miglior braccio noto oltre la soglia configurata; dopo il
+draft confronta il budget bloccato con i candidati physical e serial calcolati
+sulla forma realmente eseguibile. Il default ammette al massimo il 3% di
+regressione prevista:
+
+```bash
+DS4_DSPARK_NIGHTJAR_MAX_PREDICTED_REGRESSION=0.03
+```
+
+Quando il guard interviene, viene eseguito lo scheduler hardware-aware stabile.
+Il reward viene ora attribuito al budget effettivamente eseguito, non al budget
+Nightjar rifiutato: il canary impara quindi anche dalle proprie correzioni. Nel
+primo test freddo questa chiusura del feedback ha registrato 148 coorti protette
+su 152 reward valide; alla chiusura sono stati salvati 10 bracci. Il secondo
+avvio dello stesso binario ha caricato correttamente `nightjar_arms=10`,
+verificando il warm-start end-to-end.
+
+Per evitare i test operativi da circa 40 minuti, la matrice breve esegue
+`R=1,2,3` nello stesso comando e salva un JSON riproducibile:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && python3 tools/benchmark_dspark_concurrency.py --concurrency 1 2 3 --runs 2 --max-tokens 256 --temperature 0.95 --label nightjar-short --json-output /tmp/ds4-nightjar-short.json
+```
+
+Un confronto rapido a parita' di binario, profilo caldo e 128 token per lane ha
+misurato:
+
+| Coorte | Hardware-aware stabile | Nightjar warm | Delta |
+| --- | ---: | ---: | ---: |
+| `R=1` | 11,71 t/s | 14,84 t/s | +26,7% |
+| `R=2` | 14,01 t/s | 13,06 t/s | -6,8% |
+| `R=3` | 13,32 t/s | 13,14 t/s | -1,4% |
+
+E' un test diagnostico a un solo run, quindi non sostituisce la matrice lunga.
+Dimostra pero' perche' `DS4_DSPARK_NIGHTJAR=0` resta il default promosso:
+il target-only adattivo e' promettente nel singleton, mentre il budget adattivo
+multi-sessione non ha ancora mostrato un vantaggio stabile. Il guard preserva
+il percorso consolidato, ma non trasforma un canary neutro in un guadagno.
+
 Prima del coordinatore, un test operativo con due client HTTP indipendenti ha
 mantenuto due socket contemporanei ma ha eseguito le richieste in alternanza
 strettamente seriale. Fra `chatcmpl-9` e `chatcmpl-26` sono stati generati 7.953
@@ -769,6 +819,14 @@ lane alloca il proprio contesto ma non duplica i pesi; nel canary a 262K ha
 richiesto circa 2,25-2,37 GiB di stato privato. Il terzo slot e' configurato per
 default ma resta elastico; `R=4` resta escluso perche' non lascia un margine UMA
 sicuro sul GB10 da 128 GiB.
+
+Le richieste oltre la capacita' residente non causano nuove allocazioni CUDA.
+Un canary con quattro client simultanei ha registrato `resident=3`,
+`assigned=4` e `admission=bounded-queue`: il quarto lavoro e' rimasto sulla
+coda di una lane esistente. Ha completato 252 token a 12,18 t/s aggregate; e'
+una verifica di sicurezza della memoria, non una modalita' di scaling. Sopra
+tre client residenti il comportamento promosso e' quindi coda bounded e
+servizio seriale sulle lane disponibili.
 
 #### Stato operativo e limiti della release
 

@@ -28248,6 +28248,7 @@ static void ds4_acquire_instance_lock(void) {
 #define DS4_DSPARK_RN_PHYSICAL_GAIN_MATURE 1.05
 #define DS4_DSPARK_RN_PHYSICAL_GAIN_COLD 1.15
 #define DS4_DSPARK_HW_PROFILE_VERSION 2u
+#define DS4_DSPARK_NIGHTJAR_PERSIST_MIN_SAMPLES 4u
 #define DS4_DSPARK_SPS_KERNEL_ABI 3u
 #define DS4_DSPARK_RN_PROFILE_MAX_ROWS \
     (DS4_DSPARK_SCHEDULER_MAX_REQUESTS * \
@@ -28402,6 +28403,7 @@ struct ds4_session {
         dspark_rn_cost_profile[DS4_DSPARK_RN_COST_SLOTS];
     uint64_t dspark_rn_cost_clock;
     uint64_t dspark_rn_cost_dirty;
+    uint64_t dspark_nightjar_dirty;
     uint64_t dspark_rn_hw_fingerprint;
     char *dspark_rn_hw_profile_path;
     ds4_dspark_sps_profile dspark_rn_sps_profile;
@@ -37775,78 +37777,114 @@ static void dspark_rn_hardware_profile_load(ds4_session *s) {
     }
 
     ds4_dspark_rn_cost_profile loaded[DS4_DSPARK_RN_COST_SLOTS];
+    ds4_dspark_nightjar_state *loaded_nightjar =
+        xcalloc(1, sizeof(*loaded_nightjar));
     memset(loaded, 0, sizeof(loaded));
     uint32_t count = 0u;
+    uint32_t nightjar_count = 0u;
     uint64_t clock = 0u;
     bool valid = true;
     while (fgets(line, sizeof(line), fp)) {
         if (line[0] == '\0' || line[0] == '\n' || line[0] == '#') {
             continue;
         }
-        unsigned executor = 0u;
-        unsigned path_class = 0u;
-        unsigned context_bucket = 0u;
-        unsigned request_count = 0u;
-        unsigned rows = 0u;
-        unsigned long long shape = 0u;
-        unsigned long long samples = 0u;
-        unsigned long long last_seen = 0u;
-        double ewma = 0.0;
-        if (sscanf(line, "P %u %u %u %u %u %llx %lf %llu %llu",
-                   &executor, &path_class, &context_bucket,
-                   &request_count, &rows, &shape, &ewma,
-                   &samples, &last_seen) != 9 ||
-            count >= DS4_DSPARK_RN_COST_SLOTS ||
-            (executor != DS4_DSPARK_RN_EXEC_PHYSICAL &&
-             executor != DS4_DSPARK_RN_EXEC_SERIAL) ||
-            path_class > DS4_DSPARK_RN_PATH_HYBRID ||
-            context_bucket >= DS4_DSPARK_CONTEXT_BUCKETS ||
-            request_count == 0u ||
-            request_count > DS4_DSPARK_SCHEDULER_MAX_REQUESTS ||
-            rows == 0u ||
-            rows > DS4_DSPARK_RN_PROFILE_MAX_ROWS ||
-            shape == 0u || samples == 0u ||
-            !(ewma > 0.0) || !isfinite(ewma)) {
+        if (line[0] == 'P' && isspace((unsigned char)line[1])) {
+            unsigned executor = 0u;
+            unsigned path_class = 0u;
+            unsigned context_bucket = 0u;
+            unsigned request_count = 0u;
+            unsigned rows = 0u;
+            unsigned long long shape = 0u;
+            unsigned long long samples = 0u;
+            unsigned long long last_seen = 0u;
+            double ewma = 0.0;
+            if (sscanf(line, "P %u %u %u %u %u %llx %lf %llu %llu",
+                       &executor, &path_class, &context_bucket,
+                       &request_count, &rows, &shape, &ewma,
+                       &samples, &last_seen) != 9 ||
+                count >= DS4_DSPARK_RN_COST_SLOTS ||
+                (executor != DS4_DSPARK_RN_EXEC_PHYSICAL &&
+                 executor != DS4_DSPARK_RN_EXEC_SERIAL) ||
+                path_class > DS4_DSPARK_RN_PATH_HYBRID ||
+                context_bucket >= DS4_DSPARK_CONTEXT_BUCKETS ||
+                request_count == 0u ||
+                request_count > DS4_DSPARK_SCHEDULER_MAX_REQUESTS ||
+                rows == 0u ||
+                rows > DS4_DSPARK_RN_PROFILE_MAX_ROWS ||
+                shape == 0u || samples == 0u ||
+                !(ewma > 0.0) || !isfinite(ewma)) {
+                valid = false;
+                break;
+            }
+            loaded[count] = (ds4_dspark_rn_cost_profile) {
+                .shape = (uint64_t)shape,
+                .last_seen = (uint64_t)last_seen,
+                .ewma = ewma,
+                .samples = (uint64_t)samples,
+                .rows = rows,
+                .request_count = (uint16_t)request_count,
+                .context_bucket = (uint8_t)context_bucket,
+                .executor = (uint8_t)executor,
+                .path_class = (uint8_t)path_class,
+                .used = true,
+            };
+            if ((uint64_t)last_seen > clock) {
+                clock = (uint64_t)last_seen;
+            }
+            count++;
+        } else if (line[0] == 'N' && isspace((unsigned char)line[1])) {
+            unsigned long long context_key = 0u;
+            unsigned arm = 0u;
+            double mean_loss = 0.0;
+            double recent_loss = 0.0;
+            unsigned long long samples = 0u;
+            unsigned recent_samples = 0u;
+            if (sscanf(line, "N %llx %u %lf %lf %llu %u",
+                       &context_key, &arm, &mean_loss, &recent_loss,
+                       &samples, &recent_samples) != 6 ||
+                arm >= DS4_DSPARK_NIGHTJAR_MAX_ARMS ||
+                samples < DS4_DSPARK_NIGHTJAR_PERSIST_MIN_SAMPLES ||
+                ds4_dspark_nightjar_seed_arm(
+                    loaded_nightjar,
+                    (uint64_t)context_key,
+                    arm,
+                    mean_loss,
+                    recent_loss,
+                    (uint64_t)samples,
+                    recent_samples) != 0) {
+                valid = false;
+                break;
+            }
+            nightjar_count++;
+        } else {
             valid = false;
             break;
         }
-        loaded[count] = (ds4_dspark_rn_cost_profile) {
-            .shape = (uint64_t)shape,
-            .last_seen = (uint64_t)last_seen,
-            .ewma = ewma,
-            .samples = (uint64_t)samples,
-            .rows = rows,
-            .request_count = (uint16_t)request_count,
-            .context_bucket = (uint8_t)context_bucket,
-            .executor = (uint8_t)executor,
-            .path_class = (uint8_t)path_class,
-            .used = true,
-        };
-        if ((uint64_t)last_seen > clock) {
-            clock = (uint64_t)last_seen;
-        }
-        count++;
     }
     if (fclose(fp) != 0) valid = false;
     if (!valid) {
+        free(loaded_nightjar);
         fprintf(stderr,
                 "ds4: ignored malformed DSpark hardware profile %s\n",
                 path);
         return;
     }
     memcpy(s->dspark_rn_cost_profile, loaded, sizeof(loaded));
+    s->dspark_nightjar = *loaded_nightjar;
+    free(loaded_nightjar);
     s->dspark_rn_cost_clock = clock;
     fprintf(stderr,
             "ds4: persistent DSpark hardware profile loaded: %s "
-            "(shapes=%u fingerprint=%016llx)\n",
-            path, count,
+            "(shapes=%u nightjar_arms=%u fingerprint=%016llx)\n",
+            path, count, nightjar_count,
             (unsigned long long)s->dspark_rn_hw_fingerprint);
 }
 
 static void dspark_rn_hardware_profile_save(ds4_session *s) {
     if (!s || s->shared_scratch_lane ||
         !s->dspark_rn_hw_profile_path ||
-        s->dspark_rn_cost_dirty == 0u) {
+        (s->dspark_rn_cost_dirty == 0u &&
+         s->dspark_nightjar_dirty == 0u)) {
         return;
     }
     const size_t path_len = strlen(s->dspark_rn_hw_profile_path);
@@ -37867,6 +37905,7 @@ static void dspark_rn_hardware_profile_save(ds4_session *s) {
             DS4_DSPARK_HW_PROFILE_VERSION,
             (unsigned long long)s->dspark_rn_hw_fingerprint) > 0;
     uint32_t count = 0u;
+    uint32_t nightjar_count = 0u;
     for (uint32_t i = 0;
          ok && i < DS4_DSPARK_RN_COST_SLOTS; i++) {
         const ds4_dspark_rn_cost_profile *profile =
@@ -37888,6 +37927,32 @@ static void dspark_rn_hardware_profile_save(ds4_session *s) {
                 (unsigned long long)profile->last_seen) > 0;
         count++;
     }
+    for (uint32_t c = 0u;
+         ok && c < DS4_DSPARK_NIGHTJAR_MAX_CONTEXTS; c++) {
+        const ds4_dspark_nightjar_context *context =
+            &s->dspark_nightjar.context[c];
+        if (!context->in_use) continue;
+        for (uint32_t a = 0u;
+             ok && a < DS4_DSPARK_NIGHTJAR_MAX_ARMS; a++) {
+            const ds4_dspark_nightjar_arm *arm = &context->arm[a];
+            if (!arm->in_use ||
+                arm->samples < DS4_DSPARK_NIGHTJAR_PERSIST_MIN_SAMPLES ||
+                !(arm->mean_loss > 0.0) || !isfinite(arm->mean_loss) ||
+                !(arm->recent_loss > 0.0) || !isfinite(arm->recent_loss) ||
+                arm->recent_samples == 0u) {
+                continue;
+            }
+            ok = fprintf(
+                    fp, "N %016llx %u %.17g %.17g %llu %u\n",
+                    (unsigned long long)context->key,
+                    arm->arm,
+                    arm->mean_loss,
+                    arm->recent_loss,
+                    (unsigned long long)arm->samples,
+                    arm->recent_samples) > 0;
+            nightjar_count++;
+        }
+    }
     if (ok) ok = fflush(fp) == 0;
     if (ok) ok = fsync(fileno(fp)) == 0;
     if (fclose(fp) != 0) ok = false;
@@ -37903,10 +37968,11 @@ static void dspark_rn_hardware_profile_save(ds4_session *s) {
                 saved ? strerror(saved) : "write error");
     } else {
         s->dspark_rn_cost_dirty = 0u;
+        s->dspark_nightjar_dirty = 0u;
         fprintf(stderr,
                 "ds4: persistent DSpark hardware profile saved: %s "
-                "(shapes=%u)\n",
-                s->dspark_rn_hw_profile_path, count);
+                "(shapes=%u nightjar_arms=%u)\n",
+                s->dspark_rn_hw_profile_path, count, nightjar_count);
     }
     free(tmp);
 }
@@ -38559,9 +38625,16 @@ int ds4_sessions_eval_speculative_sample_rn(
     const bool nightjar_requested =
         nightjar_active || nightjar_shadow;
     bool nightjar_selected = false;
+    bool nightjar_guarded = false;
     uint64_t nightjar_context = 0u;
     uint32_t nightjar_budget = 0u;
+    uint32_t nightjar_reward_budget = 0u;
     uint32_t nightjar_t2 = 0u;
+    double nightjar_baseline_rate = 0.0;
+    double nightjar_locked_rate = 0.0;
+    const double nightjar_max_regression = dspark_env_double(
+            "DS4_DSPARK_NIGHTJAR_MAX_PREDICTED_REGRESSION",
+            0.03, 0.0, 0.50);
     uint32_t nightjar_cap[DS4_PHYSICAL_DSPARK_MAX_REQUESTS] = {0};
     ds4_dspark_nightjar_decision nightjar_decision;
     memset(&nightjar_decision, 0, sizeof(nightjar_decision));
@@ -38574,10 +38647,22 @@ int ds4_sessions_eval_speculative_sample_rn(
                 &nightjar_decision) == 0) {
             nightjar_selected = true;
             nightjar_budget = nightjar_decision.arm;
+            nightjar_reward_budget = nightjar_budget;
+            if (nightjar_decision.reference_loss > 0.0 &&
+                nightjar_decision.estimated_loss >
+                    nightjar_decision.reference_loss *
+                    (1.0 + nightjar_max_regression)) {
+                nightjar_guarded = true;
+                (void)ds4_dspark_nightjar_reject(
+                        &owner->dspark_nightjar,
+                        nightjar_context,
+                        nightjar_budget);
+            }
         }
     }
 
-    if (nightjar_selected && nightjar_active && nightjar_budget == 0u) {
+    if (nightjar_selected && nightjar_active && !nightjar_guarded &&
+        nightjar_budget == 0u) {
         uint32_t emitted = 0u;
         int target_rc = 0;
         for (uint32_t r = 0; r < request_count; r++) {
@@ -38597,12 +38682,14 @@ int ds4_sessions_eval_speculative_sample_rn(
         }
         const double elapsed = now_sec() - cohort_t0;
         if (target_rc == 0 && emitted != 0u) {
-            (void)ds4_dspark_nightjar_observe(
+            if (ds4_dspark_nightjar_observe(
                     &owner->dspark_nightjar,
                     nightjar_context,
                     nightjar_budget,
                     elapsed,
-                    emitted);
+                    emitted) == 0) {
+                owner->dspark_nightjar_dirty++;
+            }
         }
         if (getenv("DS4_DSPARK_LOG") != NULL) {
             fprintf(stderr,
@@ -39094,7 +39181,7 @@ int ds4_sessions_eval_speculative_sample_rn(
         rc = 0;
     }
 
-    if (nightjar_selected && nightjar_active) {
+    if (nightjar_selected && nightjar_active && !nightjar_guarded) {
         ds4_dspark_schedule_request current[request_count];
         for (uint32_t r = 0; r < request_count; r++) {
             current[r] = items[r].request;
@@ -39117,8 +39204,39 @@ int ds4_sessions_eval_speculative_sample_rn(
                     &serial_shape_curve,
                     &locked_serial);
         if (physical_rc == 0 && serial_rc == 0) {
-            physical_step.selected = locked_physical;
-            serial_step.selected = locked_serial;
+            const double baseline_physical =
+                isfinite(physical_step.selected.throughput) &&
+                physical_step.selected.throughput > 0.0
+                    ? physical_step.selected.throughput : 0.0;
+            const double baseline_serial =
+                isfinite(serial_step.selected.throughput) &&
+                serial_step.selected.throughput > 0.0
+                    ? serial_step.selected.throughput : 0.0;
+            const double locked_physical_rate =
+                isfinite(locked_physical.throughput) &&
+                locked_physical.throughput > 0.0
+                    ? locked_physical.throughput : 0.0;
+            const double locked_serial_rate =
+                isfinite(locked_serial.throughput) &&
+                locked_serial.throughput > 0.0
+                    ? locked_serial.throughput : 0.0;
+            nightjar_baseline_rate = baseline_physical > baseline_serial
+                ? baseline_physical : baseline_serial;
+            nightjar_locked_rate =
+                locked_physical_rate > locked_serial_rate
+                    ? locked_physical_rate : locked_serial_rate;
+            if (nightjar_baseline_rate > 0.0 &&
+                nightjar_locked_rate < nightjar_baseline_rate *
+                    (1.0 - nightjar_max_regression)) {
+                nightjar_guarded = true;
+                (void)ds4_dspark_nightjar_reject(
+                        &owner->dspark_nightjar,
+                        nightjar_context,
+                        nightjar_budget);
+            } else {
+                physical_step.selected = locked_physical;
+                serial_step.selected = locked_serial;
+            }
         } else {
             nightjar_selected = false;
         }
@@ -39337,6 +39455,12 @@ int ds4_sessions_eval_speculative_sample_rn(
     }
     schedule_step = use_physical ? physical_step : serial_step;
     if (nightjar_selected && nightjar_active) {
+        nightjar_reward_budget = 0u;
+        for (uint32_t r = 0; r < request_count; r++) {
+            nightjar_reward_budget += schedule_step.selected.prefix[r];
+        }
+    }
+    if (nightjar_selected && nightjar_active && !nightjar_guarded) {
         /* Capacity is causal (t-2), while its lane allocation must describe
          * the current confidence ranking.  Keep telemetry aligned with the
          * prefix that the selected executor will actually verify. */
@@ -39349,6 +39473,8 @@ int ds4_sessions_eval_speculative_sample_rn(
                 ? "nightjar-locked"
                 : (nightjar_decision.exploration
                     ? "nightjar-explore" : "nightjar-exploit"));
+    } else if (nightjar_selected && nightjar_active && nightjar_guarded) {
+        decision_reason = "nightjar-guard";
     }
 
     if (nightjar_selected && getenv("DS4_DSPARK_LOG") != NULL) {
@@ -39374,7 +39500,9 @@ int ds4_sessions_eval_speculative_sample_rn(
                 " executor=%s rows=%u "
                 "block=%u bin=%u round=%u lock=%u explore=%u "
                 "revoked=%u t2=%u/%u "
-                "p=%.6f samples=%u predicted_loss=%.6f ms/token "
+                "guard=%u max_regression=%.4f baseline_rate=%.6f "
+                "locked_rate=%.6f p=%.6f samples=%u "
+                "predicted_loss=%.6f reference_loss=%.6f ms/token "
                 "observed=0\n",
                 use_physical ? "physical" : "serial",
                 schedule_step.selected.batch_size,
@@ -39386,9 +39514,14 @@ int ds4_sessions_eval_speculative_sample_rn(
                 nightjar_decision.revoked,
                 nightjar_t2,
                 request_count,
+                nightjar_guarded ? 1u : 0u,
+                nightjar_max_regression,
+                nightjar_baseline_rate,
+                nightjar_locked_rate,
                 nightjar_decision.exploration_probability,
                 nightjar_decision.arm_samples,
-                nightjar_decision.estimated_loss * 1000.0);
+                nightjar_decision.estimated_loss * 1000.0,
+                nightjar_decision.reference_loss * 1000.0);
         funlockfile(stderr);
     }
     if (getenv("DS4_DSPARK_LOG") != NULL) {
@@ -39997,26 +40130,33 @@ int ds4_sessions_eval_speculative_sample_rn(
         }
     }
     const double cohort_total_seconds = now_sec() - cycle_t0;
-    if (nightjar_selected && nightjar_active && pure_neural_cohort &&
+    if (nightjar_selected && nightjar_active &&
+        pure_neural_cohort &&
         !verifier_fallback && rc == 0 && cohort_emitted != 0u) {
-        (void)ds4_dspark_nightjar_observe(
+        const int nightjar_observe_rc = ds4_dspark_nightjar_observe(
                 &owner->dspark_nightjar,
                 nightjar_context,
-                nightjar_budget,
+                nightjar_reward_budget,
                 cohort_total_seconds,
                 cohort_emitted);
-        if (getenv("DS4_DSPARK_LOG") != NULL) {
-            fprintf(stderr,
-                    "ds4: dspark nightjar reward R=%u bucket=%u "
-                    "context=%016llx budget=%u emitted=%u "
-                    "latency=%.6f ms/token pure_neural=1\n",
-                    request_count,
-                    cost_context_bucket,
-                    (unsigned long long)nightjar_context,
-                    nightjar_budget,
-                    cohort_emitted,
-                    cohort_total_seconds * 1000.0 /
-                        (double)cohort_emitted);
+        if (nightjar_observe_rc == 0) {
+            owner->dspark_nightjar_dirty++;
+            if (getenv("DS4_DSPARK_LOG") != NULL) {
+                fprintf(stderr,
+                        "ds4: dspark nightjar reward R=%u bucket=%u "
+                        "context=%016llx budget=%u selected_budget=%u "
+                        "guarded=%u emitted=%u latency=%.6f ms/token "
+                        "pure_neural=1\n",
+                        request_count,
+                        cost_context_bucket,
+                        (unsigned long long)nightjar_context,
+                        nightjar_reward_budget,
+                        nightjar_budget,
+                        nightjar_guarded ? 1u : 0u,
+                        cohort_emitted,
+                        cohort_total_seconds * 1000.0 /
+                            (double)cohort_emitted);
+            }
         }
     }
     dspark_rn_log_cohort(

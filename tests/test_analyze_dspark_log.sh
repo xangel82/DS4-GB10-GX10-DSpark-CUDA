@@ -41,7 +41,7 @@ printf '%s\n' \
   'ds4: dspark admission R=2 executor=physical batch=8 capacity_batch=8 capacity_age=2 expected=7.0 rate=25.0 capacity_rate=25.0 hw_prefix=3,3 sps_curve=offline physical_curve=offline serial_curve=offline shape_curve=3/4 physical_prefix=3,3 serial_prefix=2,2 conditional=0.9/0.9' \
   'ds4: dspark nightjar mode=shadow R=2 bucket=1 context=0000000101000201 gamma=3 generated=10 executor=physical rows=8 block=4 bin=2 round=2 lock=1 explore=0 p=0.500000 samples=12 predicted_loss=41.000000 ms/token observed=0' \
   'ds4: dspark nightjar reward R=2 bucket=1 context=0000000101000201 gamma=3 emitted=7 latency=40.000000 ms/token pure_neural=1' \
-  'ds4: dspark nightjar reward R=2 bucket=1 context=0000000101000201 gamma=3 emitted=3 latency=20.000000 ms/token pure_neural=1' \
+  'ds4: dspark nightjar reward R=2 bucket=1 context=0000000101000201 budget=2 selected_budget=3 guarded=1 emitted=3 latency=20.000000 ms/token pure_neural=1' \
   'ds4: dspark coordinator mode=physical R=2 scheduled_batch=8 physical_rate=25.00 serial_batch=8 serial_rate=18.18 physical_samples=2 serial_samples=2 physical_shape_samples=2 serial_shape_samples=2 bucket=0 shape_mature=1 step=7 reason=predicted' \
   'ds4: dspark cohort timing cohort=7 requested_r=2 executor=physical fallback=none drafted=6 committed=4 emitted=7 rows=8 wait_us=1000 draft=40.000 ms verify=240.000 ms total=280.000 ms' \
   'ds4: dspark admission R=2 executor=serial batch=8 capacity_batch=8 capacity_age=2 expected=6.0 rate=18.18 capacity_rate=18.18 hw_prefix=3,3 sps_curve=lane-model physical_curve=generic serial_curve=lane-model shape_curve=5/5 physical_prefix=3,3 serial_prefix=3,3 conditional=0.8/0.8' \
@@ -70,6 +70,7 @@ grep -Fq 'Nightjar lock/explore/revoke: 1 / 0 / 0 (100.00% / 0.00% / 0.00%)' "$O
 grep -Fq 'Nightjar aggregate budget: B3=1' "$OUT"
 grep -Fq 'Nightjar generated/decision: 10.00 tokens (aggregate rows across R)' "$OUT"
 grep -Fq 'Nightjar observed reward:  34.000 ms/token (2 cohorts, 10 emitted)' "$OUT"
+grep -Fq 'Nightjar guarded feedback: 1 / 2 rewarded cohorts' "$OUT"
 grep -Fq 'physical candidate: offline=1 generic=1' "$OUT"
 grep -Fq 'serial candidate:   offline=1 generic=0' "$OUT"
 grep -Fq 'exact/model curves:  physical-shape=0 serial-shape=0 serial-lane-model=1' "$OUT"

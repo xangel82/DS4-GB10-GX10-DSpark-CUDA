@@ -595,6 +595,69 @@ static void test_nightjar_mature_measurements_override_stale_prior(void) {
                  "mature measured loss did not override the stale prior");
 }
 
+static void test_nightjar_seed_is_bounded_and_adaptive(void) {
+    ds4_dspark_nightjar_state state;
+    ds4_dspark_nightjar_state_reset(&state);
+    const uint64_t context = UINT64_C(0x7331);
+    require_true(ds4_dspark_nightjar_seed_arm(
+                     &state, context, 2u, 0.050, 0.045, 100u, 40u) == 0,
+                 "Nightjar persisted-arm seed failed");
+    require_true(ds4_dspark_nightjar_seed_arm(
+                     &state, context, 5u, 0.035, 0.030, 12u, 8u) == 0,
+                 "Nightjar second persisted-arm seed failed");
+    const ds4_dspark_nightjar_context *ctx = &state.context[0];
+    require_true(ctx->observations == 16u && !ctx->locked,
+                 "Nightjar warm start must cap evidence and discard locks");
+    require_true(ctx->arm[0].samples == 8u &&
+                 ctx->arm[0].recent_samples == 4u,
+                 "Nightjar warm-start confidence was not bounded");
+
+    const ds4_dspark_nightjar_candidate candidates[] = {
+        {.arm = 2u, .predicted_loss = 0.025, .switch_loss = 0.0},
+        {.arm = 5u, .predicted_loss = 0.060, .switch_loss = 0.0},
+    };
+    ds4_dspark_nightjar_decision decision;
+    require_true(ds4_dspark_nightjar_select(
+                     &state, context, candidates, 2u, 2.0,
+                     &decision) == 0 && decision.arm == 5u,
+                 "bounded warm start did not preserve mature arm ordering");
+    require_true(ds4_dspark_nightjar_seed_arm(
+                     &state, context, 1u, 0.0, 0.1, 4u, 4u) != 0,
+                 "Nightjar accepted an invalid persisted loss");
+}
+
+static void test_nightjar_exposes_stale_lock_reference_loss(void) {
+    ds4_dspark_nightjar_state state;
+    ds4_dspark_nightjar_state_reset(&state);
+    const uint64_t context = UINT64_C(0x7332);
+    require_true(ds4_dspark_nightjar_seed_arm(
+                     &state, context, 1u, 0.050, 0.050, 8u, 4u) == 0 &&
+                 ds4_dspark_nightjar_seed_arm(
+                     &state, context, 5u, 0.010, 0.010, 8u, 4u) == 0,
+                 "Nightjar stale-lock setup failed");
+    state.context[0].locked = 1u;
+    state.context[0].locked_arm = 1u;
+
+    const ds4_dspark_nightjar_candidate shifted[] = {
+        {.arm = 1u, .predicted_loss = 0.050, .switch_loss = 0.0},
+        {.arm = 5u, .predicted_loss = 0.010, .switch_loss = 0.0},
+    };
+    ds4_dspark_nightjar_decision decision;
+    require_true(ds4_dspark_nightjar_select(
+                     &state, context, shifted, 2u, 2.0,
+                     &decision) == 0,
+                 "Nightjar stale-lock decision failed");
+    require_true(decision.estimated_loss >
+                     decision.reference_loss * 1.03,
+                 "Nightjar did not expose a guardable stale lock");
+    require_true(ds4_dspark_nightjar_reject(
+                     &state, context, decision.arm) == 0 &&
+                 !state.context[0].locked &&
+                 !state.context[0].previous_valid &&
+                 state.context[0].revoked_pending,
+                 "Nightjar rejected decision retained stale state");
+}
+
 static ds4_dspark_schedule_item schedule_item(
         uint64_t id, double c1, double c2) {
     ds4_dspark_schedule_item item;
@@ -1195,6 +1258,8 @@ int main(void) {
     test_nightjar_switch_cost_only_wakes_drafter();
     test_nightjar_reward_is_token_weighted();
     test_nightjar_mature_measurements_override_stale_prior();
+    test_nightjar_seed_is_bounded_and_adaptive();
+    test_nightjar_exposes_stale_lock_reference_loss();
     test_shape_aware_step_and_fallback();
     test_stateful_two_step_barrier();
     test_executor_pair_advances_history_once();

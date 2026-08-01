@@ -145,12 +145,14 @@ function text_value(prefix,    i,a) {
   nightjar_locked = value("lock")
   nightjar_explore = value("explore")
   nightjar_revoked = value("revoked")
+  nightjar_guard = value("guard")
   nightjar_t2 = text_value("t2")
   if (nightjar_mode == "active") nightjar_active++
   else if (nightjar_mode == "shadow") nightjar_shadow++
   if (nightjar_locked == 1) nightjar_lock_reuse++
   if (nightjar_explore == 1) nightjar_exploration++
   if (nightjar_revoked == 1) nightjar_revocations++
+  if (nightjar_guard == 1) nightjar_guards++
   if (nightjar_t2 != "") {
     split(nightjar_t2, nightjar_t2_parts, "/")
     if (nightjar_t2_parts[1] ~ /^[0-9]+$/ &&
@@ -172,9 +174,28 @@ function text_value(prefix,    i,a) {
 }
 /dspark nightjar reward / {
   nightjar_reward_n++
+  if (value("guarded") == 1) nightjar_guarded_reward_n++
   nightjar_line_emitted = value("emitted")
   nightjar_reward_ms += value("latency") * nightjar_line_emitted
   nightjar_reward_emitted += nightjar_line_emitted
+}
+/ds4-server: coordinator dispatch lane=/ {
+  server_dispatch_n++
+  server_dispatch_queued = value("queued")
+  server_dispatch_assigned = value("assigned")
+  server_dispatch_admission = text_value("admission")
+  if (server_dispatch_queued >= 0) {
+    server_dispatch_queued_sum += server_dispatch_queued
+    if (server_dispatch_queued > server_dispatch_queued_max) {
+      server_dispatch_queued_max = server_dispatch_queued
+    }
+  }
+  if (server_dispatch_assigned > server_dispatch_assigned_max) {
+    server_dispatch_assigned_max = server_dispatch_assigned
+  }
+  if (server_dispatch_admission == "bounded-queue") {
+    server_dispatch_bounded++
+  }
 }
 /dspark coordinator mode=/ {
   coordinator_mode = text_value("mode")
@@ -585,6 +606,8 @@ END {
            100.0 * nightjar_lock_reuse / nightjar_n,
            100.0 * nightjar_exploration / nightjar_n,
            100.0 * nightjar_revocations / nightjar_n
+    printf "Nightjar anti-regression guards: %d (%.2f%%)\n",
+           nightjar_guards, 100.0 * nightjar_guards / nightjar_n
     printf "Nightjar executor:         physical=%d serial=%d\n",
            nightjar_executor_n["physical"],
            nightjar_executor_n["serial"]
@@ -606,6 +629,8 @@ END {
       printf "Nightjar observed reward:  %.3f ms/token (%d cohorts, %d emitted)\n",
              nightjar_reward_ms / nightjar_reward_emitted,
              nightjar_reward_n, nightjar_reward_emitted
+      printf "Nightjar guarded feedback: %d / %d rewarded cohorts\n",
+             nightjar_guarded_reward_n, nightjar_reward_n
     }
   }
   if (cohort_n > 0) {
@@ -687,6 +712,13 @@ END {
           }
         }
       }
+    }
+    if (server_dispatch_n > 0) {
+      printf "Server admission queue:     bounded=%d/%d mean/max queued=%.2f/%d max assigned=%d\n",
+             server_dispatch_bounded, server_dispatch_n,
+             server_dispatch_queued_sum / server_dispatch_n,
+             server_dispatch_queued_max,
+             server_dispatch_assigned_max
     }
     if (shape_curve_records > 0) {
       shape_hit_rate = shape_curve_queries > 0 ? 100.0 * shape_curve_hits / shape_curve_queries : 0.0

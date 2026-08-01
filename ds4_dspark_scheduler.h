@@ -145,6 +145,7 @@ typedef struct {
     uint32_t round_in_bin;
     uint32_t arm_samples;
     double estimated_loss;
+    double reference_loss;
     double exploration_probability;
 } ds4_dspark_nightjar_decision;
 
@@ -226,6 +227,19 @@ int ds4_dspark_hardware_schedule_fixed_capacity(
 void ds4_dspark_nightjar_state_reset(
         ds4_dspark_nightjar_state *state);
 
+/* Restore one mature arm from a fingerprint-matched runtime profile. The
+ * imported sample count is deliberately capped by the implementation: a
+ * restart keeps useful ordering information without turning old measurements
+ * into an irrevocable lock after a workload or thermal-state change. */
+int ds4_dspark_nightjar_seed_arm(
+        ds4_dspark_nightjar_state *state,
+        uint64_t context_key,
+        uint32_t arm,
+        double mean_loss,
+        double recent_loss,
+        uint64_t samples,
+        uint32_t recent_samples);
+
 /* Warm-started ADA-BINGREEDY. Offline SPS supplies a prior for unseen arms;
  * measured token-weighted loss and a recent EWMA replace it after observation.
  * Exploration is probationary rather than bin-locked, and a degraded lock is
@@ -244,6 +258,14 @@ int ds4_dspark_nightjar_observe(
         uint32_t arm,
         double latency_seconds,
         uint32_t emitted_tokens);
+
+/* Discard a selected arm that was not executed because an external hardware
+ * guard retained the baseline plan. This prevents a stale bin lock and a
+ * fictitious switch history from surviving into the next decision. */
+int ds4_dspark_nightjar_reject(
+        ds4_dspark_nightjar_state *state,
+        uint64_t context_key,
+        uint32_t arm);
 
 void ds4_dspark_scheduler_state_reset(
         ds4_dspark_scheduler_state *state);

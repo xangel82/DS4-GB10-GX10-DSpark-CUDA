@@ -13037,11 +13037,23 @@ static bool enqueue(server *s, job *j) {
     j->lane_id = selected;
     server *lane = root->lanes ? root->lanes[selected] : root;
     if (getenv("DS4_DSPARK_LOG") != NULL && root->lane_count > 1u) {
+        uint32_t total_assigned = 1u;
+        uint32_t active_workers = 0u;
+        for (uint32_t i = 0u; i < root->lane_count; i++) {
+            const server *resident = root->lanes ? root->lanes[i] : root;
+            if (!resident) continue;
+            total_assigned += resident->assigned_jobs;
+            active_workers += resident->worker_active ? 1u : 0u;
+        }
+        const uint32_t queued = total_assigned > active_workers
+            ? total_assigned - active_workers : 0u;
+        const bool bounded_queue = total_assigned > root->lane_count;
         fprintf(stderr,
                 "ds4-server: coordinator dispatch lane=%u reason=%s load=%u "
                 "prefix=%d replay=%d wait=%.3fs replay_cost=%.3fs "
                 "total=%.3fs service_ewma=%.3fs prefill_ewma=%.2f "
-                "prompt=%d\n",
+                "prompt=%d resident=%u capacity=%u assigned=%u queued=%u "
+                "admission=%s\n",
                 selected,
                 route.protocol_binding ? "binding" : "kv-cost",
                 lane->assigned_jobs,
@@ -13052,7 +13064,12 @@ static bool enqueue(server *s, job *j) {
                 route.total_sec,
                 route_service_ewma_locked(root),
                 route_prefill_tps_locked(root),
-                j->req.prompt.len);
+                j->req.prompt.len,
+                root->lane_count,
+                root->lane_capacity,
+                total_assigned,
+                queued,
+                bounded_queue ? "bounded-queue" : "resident");
     }
     lane->assigned_jobs++;
     if (root->tail) root->tail->next = j; else root->head = j;

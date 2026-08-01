@@ -5,6 +5,7 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import statistics
 import threading
 import time
 import urllib.error
@@ -16,7 +17,16 @@ def parse_args():
     parser.add_argument(
         "--base-url", default="http://127.0.0.1:30007/v1")
     parser.add_argument("--model", default="deepseek-chat")
-    parser.add_argument("--concurrency", type=int, default=2)
+    parser.add_argument(
+        "--concurrency", type=int, nargs="+", default=[2],
+        help="one or more physical concurrency levels, for example 1 2 3",
+    )
+    parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--label", default="candidate")
+    parser.add_argument(
+        "--json-output",
+        help="write all runs and median summaries to this JSON file",
+    )
     parser.add_argument("--max-tokens", type=int, default=512)
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--seed", type=int, default=4242)
@@ -102,31 +112,89 @@ def run_request(args, lane, barrier):
 
 def main():
     args = parse_args()
-    if args.concurrency < 1:
-        raise SystemExit("--concurrency must be at least 1")
-    barrier = threading.Barrier(args.concurrency)
-    wall_started = time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=args.concurrency) as executor:
-        futures = [
-            executor.submit(run_request, args, lane, barrier)
-            for lane in range(args.concurrency)
-        ]
-        results = [future.result() for future in futures]
-    wall_seconds = time.monotonic() - wall_started
-    total_tokens = sum(result["tokens"] for result in results)
-    for result in sorted(results, key=lambda item: item["lane"]):
+    if args.runs < 1:
+        raise SystemExit("--runs must be at least 1")
+    if any(value < 1 for value in args.concurrency):
+        raise SystemExit("--concurrency values must be at least 1")
+    if len(set(args.concurrency)) != len(args.concurrency):
+        raise SystemExit("--concurrency values must be unique")
+
+    records = []
+    summaries = []
+    for concurrency in args.concurrency:
+        rates = []
+        walls = []
+        for run in range(1, args.runs + 1):
+            barrier = threading.Barrier(concurrency)
+            wall_started = time.monotonic()
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=concurrency) as executor:
+                futures = [
+                    executor.submit(run_request, args, lane, barrier)
+                    for lane in range(concurrency)
+                ]
+                results = [future.result() for future in futures]
+            wall_seconds = time.monotonic() - wall_started
+            total_tokens = sum(result["tokens"] for result in results)
+            aggregate_tps = (
+                total_tokens / wall_seconds if wall_seconds > 0.0 else 0.0
+            )
+            for result in sorted(results, key=lambda item: item["lane"]):
+                print(
+                    f"label={args.label} R={concurrency} run={run} "
+                    f"lane={result['lane']} tokens={result['tokens']} "
+                    f"seconds={result['seconds']:.3f} "
+                    f"tps={result['tps']:.2f} finish={result['finish']} "
+                    f"sha256={result['sha256']}"
+                )
+            print(
+                f"label={args.label} R={concurrency} run={run} "
+                f"total_tokens={total_tokens} "
+                f"wall_seconds={wall_seconds:.3f} "
+                f"aggregate_tps={aggregate_tps:.2f}"
+            )
+            rates.append(aggregate_tps)
+            walls.append(wall_seconds)
+            records.append({
+                "label": args.label,
+                "concurrency": concurrency,
+                "run": run,
+                "total_tokens": total_tokens,
+                "wall_seconds": wall_seconds,
+                "aggregate_tps": aggregate_tps,
+                "lanes": results,
+            })
+        summary = {
+            "label": args.label,
+            "concurrency": concurrency,
+            "runs": args.runs,
+            "median_aggregate_tps": statistics.median(rates),
+            "min_aggregate_tps": min(rates),
+            "max_aggregate_tps": max(rates),
+            "median_wall_seconds": statistics.median(walls),
+        }
+        summaries.append(summary)
         print(
-            f"lane={result['lane']} tokens={result['tokens']} "
-            f"seconds={result['seconds']:.3f} "
-            f"tps={result['tps']:.2f} finish={result['finish']} "
-            f"sha256={result['sha256']}"
+            f"SUMMARY label={args.label} R={concurrency} runs={args.runs} "
+            f"median_aggregate_tps={summary['median_aggregate_tps']:.2f} "
+            f"range={summary['min_aggregate_tps']:.2f}.."
+            f"{summary['max_aggregate_tps']:.2f} "
+            f"median_wall_seconds={summary['median_wall_seconds']:.3f}"
         )
-    print(
-        f"R={args.concurrency} total_tokens={total_tokens} "
-        f"wall_seconds={wall_seconds:.3f} "
-        f"aggregate_tps={total_tokens / wall_seconds:.2f}"
-    )
+
+    if args.json_output:
+        with open(args.json_output, "w", encoding="utf-8") as output:
+            json.dump({
+                "label": args.label,
+                "base_url": args.base_url,
+                "model": args.model,
+                "prompt_mode": args.prompt_mode,
+                "max_tokens": args.max_tokens,
+                "temperature": args.temperature,
+                "records": records,
+                "summaries": summaries,
+            }, output, indent=2, sort_keys=True)
+            output.write("\n")
 
 
 if __name__ == "__main__":

@@ -69,7 +69,9 @@ Dense verifier stages are physically batched together with compatible attention
 shapes; KV/frontier state, part of compressor/indexer preparation, rejection
 and commit remain session-local. Unmatched tool, prefill or completion phases
 continue safely as R=1. Conversations beyond the resident lanes use disk
-checkpoints and replay, and prefill/decode interleaving occurs only at complete
+checkpoints and replay. Requests beyond the three-lane resident capacity enter
+a bounded queue on those existing lanes; the server does not allocate a fourth
+resident context. Prefill/decode interleaving occurs only at complete
 8192-token chunk boundaries.
 
 ![Measured DS4 GB10 prefill and decode performance](docs/gb10-performance.svg)
@@ -416,6 +418,7 @@ DS4_MODEL=$HOME/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-
 DS4_DSPARK_VARIANT=q2
 DS4_DSPARK_NIGHTJAR=0
 DS4_DSPARK_NIGHTJAR_SHADOW=0
+DS4_DSPARK_NIGHTJAR_MAX_PREDICTED_REGRESSION=0.03
 DS4_CTX=262144
 DS4_ADVERTISE_CONTEXT_PCT=85
 DS4_MAX_TOKENS=2200

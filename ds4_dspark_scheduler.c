@@ -506,6 +506,55 @@ static ds4_dspark_nightjar_arm *ds4_dspark_nightjar_arm_get(
     return free_arm;
 }
 
+int ds4_dspark_nightjar_seed_arm(
+        ds4_dspark_nightjar_state *state,
+        uint64_t context_key,
+        uint32_t arm,
+        double mean_loss,
+        double recent_loss,
+        uint64_t samples,
+        uint32_t recent_samples) {
+    if (!state || !(mean_loss > 0.0) || !isfinite(mean_loss) ||
+        !(recent_loss > 0.0) || !isfinite(recent_loss) ||
+        samples == 0u || recent_samples == 0u) {
+        return 1;
+    }
+    ds4_dspark_nightjar_context *context =
+        ds4_dspark_nightjar_context_get(state, context_key, 1);
+    if (!context) return 1;
+    ds4_dspark_nightjar_arm *slot =
+        ds4_dspark_nightjar_arm_get(context, arm, 1);
+    if (!slot) return 1;
+
+    if (context->observations >= slot->samples) {
+        context->observations -= slot->samples;
+    } else {
+        context->observations = 0u;
+    }
+    const uint64_t effective_samples = samples > 8u ? 8u : samples;
+    uint32_t effective_recent = recent_samples > 4u ? 4u : recent_samples;
+    if ((uint64_t)effective_recent > effective_samples) {
+        effective_recent = (uint32_t)effective_samples;
+    }
+    slot->samples = effective_samples;
+    slot->total_tokens = effective_samples;
+    slot->total_latency = mean_loss * (double)effective_samples;
+    slot->mean_loss = mean_loss;
+    slot->recent_loss = recent_loss;
+    slot->recent_samples = effective_recent;
+    if (UINT64_MAX - context->observations < effective_samples) {
+        context->observations = UINT64_MAX;
+    } else {
+        context->observations += effective_samples;
+    }
+    /* Never persist a bin lock. It is cheap to recover, but unsafe to carry
+     * across a restart where clocks, contention and request mix may differ. */
+    context->locked = 0u;
+    context->previous_valid = 0u;
+    context->revoked_pending = 0u;
+    return 0;
+}
+
 static uint32_t ds4_dspark_nightjar_bin_span(uint64_t horizon) {
     if (horizon == 0u) return 1u;
     const double root = sqrt((double)horizon);
@@ -774,6 +823,26 @@ int ds4_dspark_nightjar_select(
     decision->arm_samples = selected->samples > UINT32_MAX
         ? UINT32_MAX : (uint32_t)selected->samples;
     decision->estimated_loss = estimated;
+    decision->reference_loss = DBL_MAX;
+    for (uint32_t i = 0; i < candidate_count; i++) {
+        ds4_dspark_nightjar_arm *slot =
+            ds4_dspark_nightjar_arm_get(
+                    context, candidates[i].arm, 1);
+        if (!slot) return 1;
+        double loss = ds4_dspark_nightjar_arm_loss(
+                slot, candidates[i].predicted_loss);
+        if (context->previous_valid && context->previous_arm == 0u &&
+            candidates[i].arm != 0u) {
+            loss += candidates[i].switch_loss;
+        }
+        if (loss < decision->reference_loss) {
+            decision->reference_loss = loss;
+        }
+    }
+    if (!(decision->reference_loss > 0.0) ||
+        !isfinite(decision->reference_loss)) {
+        return 1;
+    }
     decision->exploration_probability = exploration_probability;
 
     context->previous_arm = decision->arm;
@@ -850,6 +919,24 @@ int ds4_dspark_nightjar_observe(
             context->revoked_pending = 1u;
         }
     }
+    return 0;
+}
+
+int ds4_dspark_nightjar_reject(
+        ds4_dspark_nightjar_state *state,
+        uint64_t context_key,
+        uint32_t arm) {
+    ds4_dspark_nightjar_context *context =
+        ds4_dspark_nightjar_context_get(state, context_key, 0);
+    if (!context) return 1;
+    if (!ds4_dspark_nightjar_arm_get(context, arm, 0)) return 1;
+    if (context->locked && context->locked_arm == arm) {
+        context->locked = 0u;
+    }
+    if (context->previous_valid && context->previous_arm == arm) {
+        context->previous_valid = 0u;
+    }
+    context->revoked_pending = 1u;
     return 0;
 }
 

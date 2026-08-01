@@ -139,6 +139,7 @@ function text_value(prefix,    i,a) {
   nightjar_n++
   nightjar_mode = text_value("mode")
   nightjar_executor = text_value("executor")
+  nightjar_hint = text_value("hint")
   nightjar_budget = value("budget")
   if (nightjar_budget < 0) nightjar_budget = value("gamma")
   nightjar_generated = value("generated")
@@ -163,6 +164,9 @@ function text_value(prefix,    i,a) {
   }
   if (nightjar_executor != "") {
     nightjar_executor_n[nightjar_executor]++
+  }
+  if (nightjar_hint != "") {
+    nightjar_hint_n[nightjar_hint]++
   }
   if (nightjar_budget >= 0 && nightjar_budget <= 64) {
     nightjar_budget_n[nightjar_budget]++
@@ -611,6 +615,9 @@ END {
     printf "Nightjar executor:         physical=%d serial=%d\n",
            nightjar_executor_n["physical"],
            nightjar_executor_n["serial"]
+    printf "Nightjar executor hint:    physical=%d serial=%d\n",
+           nightjar_hint_n["physical"],
+           nightjar_hint_n["serial"]
     if (nightjar_t2_total > 0) {
       printf "Nightjar exact t-2 input:  %d / %d lanes (%.2f%%)\n",
              nightjar_t2_ready, nightjar_t2_total,

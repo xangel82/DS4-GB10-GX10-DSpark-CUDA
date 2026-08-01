@@ -507,14 +507,17 @@ revocato subito, e le prove esplorative non occupano un intero bin quadratico.
 Il costo di riattivazione viene addebitato soltanto nel passaggio
 `B=0 -> B>0`.
 
-Il budget e l'esecutore restano decisioni distinte. Dopo il draft, il planner
-confronta il candidato fisico e quello serial/lane-partitioned. Le curve SPS
-offline forniscono il fallback, ma non impediscono piu' di sondare entrambe le
-forme reali: dopo due campioni l'EWMA della forma esatta ha priorita', viene
-confermata fino a otto campioni e poi aggiornata con probe radi. HybridLC
-continua a essere lossless e indipendente; per non attribuire al drafter
-neurale token prodotti dal retrieval, Nightjar aggiorna il proprio reward
-soltanto sulle coorti pure-neural.
+Nel singleton ogni braccio resta il solo budget `B`. In `R>1` il braccio e'
+invece la coppia `(executor, B)`: physical e serial/lane-partitioned mantengono
+prior, campioni, reward e persistenza indipendenti. Nightjar confronta quindi
+la latenza prevista della forma che verra' davvero eseguita, invece di usare il
+minimo fra due executor e attribuire poi il risultato all'altro. Le curve SPS
+offline forniscono il fallback. Gli arm sono interleaved per budget, quindi
+physical e serial dello stesso `B` sono vicini anche per l'esplorazione locale;
+dopo otto campioni l'EWMA della forma esatta ha priorita'. HybridLC continua a
+essere lossless e indipendente; per non
+attribuire al drafter neurale token prodotti dal retrieval, Nightjar aggiorna
+il proprio reward soltanto sulle coorti pure-neural.
 
 Il percorso storico resta identico quando il canary e' disattivato: draft fisso
 da cinque slot e scheduler hardware-aware esistente. Per osservare le decisioni
@@ -528,6 +531,13 @@ Per il canary attivo isolato da HybridLC:
 
 ```bash
 cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_NIGHTJAR=1 DS4_DSPARK_HYBRID_LC=0 DS4_TELEMETRY=1 ./run-dspark-server.sh 2>&1 | tee /tmp/ds4-nightjar.log
+```
+
+Il default applica Nightjar soltanto a `R=1`, dove il test controllato ha gia'
+mostrato un vantaggio. L'estensione multi-sessione richiede un canary esplicito:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_NIGHTJAR=1 DS4_DSPARK_NIGHTJAR_MAX_R=3 DS4_DSPARK_HYBRID_LC=0 DS4_TELEMETRY=1 ./run-dspark-server.sh 2>&1 | tee /tmp/ds4-nightjar-r3.log
 ```
 
 Il test operativo Q2 a `R=1`, dopo la correzione del reward e del bootstrap,
@@ -576,6 +586,7 @@ regressione prevista:
 
 ```bash
 DS4_DSPARK_NIGHTJAR_MAX_PREDICTED_REGRESSION=0.03
+DS4_DSPARK_NIGHTJAR_MAX_R=1
 ```
 
 Quando il guard interviene, viene eseguito lo scheduler hardware-aware stabile.
@@ -607,6 +618,24 @@ Dimostra pero' perche' `DS4_DSPARK_NIGHTJAR=0` resta il default promosso:
 il target-only adattivo e' promettente nel singleton, mentre il budget adattivo
 multi-sessione non ha ancora mostrato un vantaggio stabile. Il guard preserva
 il percorso consolidato, ma non trasforma un canary neutro in un guadagno.
+
+La successiva correzione executor-paired e' stata verificata sullo stesso
+binario, con 128 token per lane, temperatura `0,95`, profilo hardware condiviso
+e un run per punto. I numeri sono diagnostici, ma confermano che reward e costo
+non vengono piu' mescolati fra executor:
+
+| Coorte | Nightjar off | Paired cold | Paired warm |
+| --- | ---: | ---: | ---: |
+| `R=1` | 12,64 t/s | 14,34 t/s (+13,4%) | 14,14 t/s (+11,9%) |
+| `R=2` | 12,92 t/s | 14,86 t/s (+15,0%) | 13,35 t/s (+3,3%) |
+| `R=3` | 11,82 t/s | 11,98 t/s (+1,4%) | 12,42 t/s (+5,1%) |
+
+Nel passaggio warm il guard ha ancora protetto il 49,5% delle decisioni. Gli
+arm Nightjar hanno preferito il physical executor; le misure effettive hanno
+confermato che il seriale era piu' lento nelle coorti osservate. Per questo il
+supporto `R=2/3` resta un canary esplicito e `DS4_DSPARK_NIGHTJAR_MAX_R=1`
+rimane il default: il vantaggio singleton e' isolato dalle sessioni multiple
+finche' i profili di forma non sono piu' maturi.
 
 Prima del coordinatore, un test operativo con due client HTTP indipendenti ha
 mantenuto due socket contemporanei ma ha eseguito le richieste in alternanza

@@ -546,19 +546,6 @@ several clearly separated lineages so that reusers can tell who built what:
   profiles, profiling, packaging and subsequent adaptations made on top of the
   shared prefill stack.
 
-Source comments and commit history identify narrower adaptations, including
-the token-tile HMMA port from Entrpi/ds4 commits `47438d7` and `9de3044`.
-Detailed integration history, measurements and rejected experiments are in
-[`README-GB10.md`](README-GB10.md).
-
-This lineage was documented when the code entered the repository:
-[`4eb7441`](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA/commit/4eb74412670eb74e964123ed3ad60d9973056bdd)
-introduced the Entrpi MMQ backend with its llama.cpp provenance, and
-[`699245d`](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA/commit/699245dfa47707b5bfc6e26ff2dea426448dd32c)
-explicitly recorded the token-tile HMMA port and its Entrpi source commits.
-The current README makes the same separation prominent in English rather than
-leaving it only in the detailed integration history and runtime banner.
-
 The MIT License allows use, copy, modification, publication, distribution,
 sublicensing and sale of the software, provided that the copyright notice and
 license text are preserved in copies or substantial portions of the software.

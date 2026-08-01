@@ -2,7 +2,9 @@
 set -e
 
 REPO="antirez/deepseek-v4-gguf"
-Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+Q2_IMATRIX_0731_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
+Q2_IMATRIX_PREVIEW_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+Q2_IMATRIX_FILE="$Q2_IMATRIX_0731_FILE"
 Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
 Q2_Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed.gguf"
 PRO_Q2_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf"
@@ -24,6 +26,8 @@ DeepSeek V4 GGUF downloader
 
 Usage:
   ./download_model.sh q2-imatrix [--token TOKEN]
+  ./download_model.sh q2-imatrix-0731 [--token TOKEN]
+  ./download_model.sh q2-imatrix-preview [--token TOKEN]
   ./download_model.sh q2-q4-imatrix [--token TOKEN]
   ./download_model.sh q4-imatrix [--token TOKEN]
   ./download_model.sh pro-q2-imatrix [--token TOKEN]
@@ -35,8 +39,13 @@ Usage:
 Targets:
 
   q2-imatrix
-       2-bit routed experts, about 81 GB on disk.
+  q2-imatrix-0731
+       Final DeepSeek-V4-Flash-0731 target with 2-bit routed experts, about
+       81 GiB on disk. q2-imatrix is an alias for this recommended release.
        Recommended model for 96 and 128 GB RAM machines.
+
+  q2-imatrix-preview
+       Previous preview target, retained only for reproducibility and rollback.
 
   q2-q4-imatrix
        Mixed Flash quant: mostly q2 routed experts, with the last 6 layers
@@ -103,7 +112,8 @@ MODEL_FILES=
 LINK_MODEL=1
 
 case "$MODEL" in
-    q2-imatrix) MODEL_FILE=$Q2_IMATRIX_FILE ;;
+    q2-imatrix|q2-imatrix-0731) MODEL_FILE=$Q2_IMATRIX_0731_FILE ;;
+    q2-imatrix-preview) MODEL_FILE=$Q2_IMATRIX_PREVIEW_FILE ;;
     q2-q4-imatrix) MODEL_FILE=$Q2_Q4_IMATRIX_FILE ;;
     q4-imatrix) MODEL_FILE=$Q4_IMATRIX_FILE ;;
     pro-q2-imatrix) MODEL_FILE=$PRO_Q2_IMATRIX_FILE ;;

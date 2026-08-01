@@ -471,6 +471,93 @@ confermato logits, Top-1, rejection p/q e commit indipendente esatti
 `212,170 ms` fisici, cioe' `1,176x` e `28,28` righe target/s aggregate; la
 seconda lane ha richiesto `2.246,36 MiB` di stato privato.
 
+### Nightjar: scelta pre-draft della profondita' - 31 luglio 2026
+
+Il canary Nightjar completa la parte adattiva prima del drafter. L'unita' di
+scelta e' il budget aggregato di proposte della coorte: `B=0` esegue il
+target-only nel singleton, mentre `B=1..R*5` sceglie la capacita' fisica totale.
+In `R>1`, `B=0` resta escluso finche' il target-only non dispone di un vero
+executor fisico: far competere R decode seriali falserebbe la curva hardware.
+Il segnale storico non congela pero' l'assegnazione alle lane. Il drafter
+produce il blocco corrente completo e, una volta disponibili le confidence
+aggiornate, il budget viene redistribuito globalmente; sono quindi possibili
+profondita' come `[0,4,2]` senza imporre lo stesso K a tutte o sprecare una
+proposta su ogni sessione. Questa separazione
+e' essenziale: `t-2` determina soltanto la capacita', mentre il passo corrente
+conserva rigorosamente il rank dei candidati piu' sicuri come richiesto dalla
+Sezione 5.2 del paper.
+
+Ogni contesto e' separato per numero di richieste residenti, vettore ordinato
+delle fasce di contesto e sorgente del draft. Quando disponibile, il budget
+usa la confidence causale esatta di `t-2`; startup e buchi di scheduling
+ricadono sul prior di acceptance recente. Per assorbire differenze fra la STS
+held-out e il target quantizzato in esecuzione, la confidence ritardata pesa il
+60% e l'acceptance recente della lane il 40%. I bracci usano ADA-BINGREEDY con
+il reward realmente osservato, calcolato come latenza totale divisa per token
+emessi. Solo il migliore secondo il prior SPS riceve il bootstrap iniziale;
+gli altri budget entrano in probation se diventano competitivi o durante una
+esplorazione locale entro l'8% del migliore, limitata al 10% dei round
+eleggibili. L'esplorazione prova il budget sicuro piu' vicino, preferendo il
+meno campionato, e non puo' quindi saltare casualmente da una forma corta a
+una forma estrema. Un
+braccio richiede due osservazioni prima di poter bloccare un bin. Alla media
+storica si affianca una EWMA recente; dopo quattro campioni il reward misurato
+pesa il 90% e il prior soltanto il 10%. Un braccio bloccato che degrada viene
+revocato subito, e le prove esplorative non occupano un intero bin quadratico.
+Il costo di riattivazione viene addebitato soltanto nel passaggio
+`B=0 -> B>0`.
+
+Il budget e l'esecutore restano decisioni distinte. Dopo il draft, il planner
+confronta il candidato fisico e quello serial/lane-partitioned. Le curve SPS
+offline forniscono il fallback, ma non impediscono piu' di sondare entrambe le
+forme reali: dopo due campioni l'EWMA della forma esatta ha priorita', viene
+confermata fino a otto campioni e poi aggiornata con probe radi. HybridLC
+continua a essere lossless e indipendente; per non attribuire al drafter
+neurale token prodotti dal retrieval, Nightjar aggiorna il proprio reward
+soltanto sulle coorti pure-neural.
+
+Il percorso storico resta identico quando il canary e' disattivato: draft fisso
+da cinque slot e scheduler hardware-aware esistente. Per osservare le decisioni
+senza cambiare l'esecuzione:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_NIGHTJAR_SHADOW=1 DS4_TELEMETRY=1 ./run-dspark-server.sh 2>&1 | tee /tmp/ds4-nightjar-shadow.log
+```
+
+Per il canary attivo isolato da HybridLC:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && DS4_DSPARK_NIGHTJAR=1 DS4_DSPARK_HYBRID_LC=0 DS4_TELEMETRY=1 ./run-dspark-server.sh 2>&1 | tee /tmp/ds4-nightjar.log
+```
+
+Il test operativo Q2 a `R=1`, dopo la correzione del reward e del bootstrap,
+ha prodotto `19,41 t/s` su 512 token, con soltanto due cicli `B=0`; i bracci
+dominanti sono stati `B=2` (`20,50 t/s`, acceptance `84,66%`) e `B=5`
+(`19,11 t/s`). Due richieste simultanee hanno formato 245 coorti fisiche su
+318 e misurato `19,82 t/s` aggregate; la forma fisica `R=2` ha raggiunto
+`20,20 t/s` contro `17,07 t/s` del fallback seriale nello stesso run. Questi
+risultati sono canary operativi, non sostituiscono ancora il baseline
+controllato gia' registrato per tutti i bucket di contesto.
+
+La correzione causale e' stata verificata anche con A/B puliti `R=3`, cache KV
+separate, prompt tecnico, temperatura `0,95` e 256 token per lane. La baseline
+hardware-aware ha ottenuto `14,86 t/s` aggregate. La prima implementazione,
+che usava erroneamente `t-2` anche per scegliere la lane, scendeva a
+`14,47 t/s` e al `37,24%` di acceptance. Dopo la separazione fra capacita'
+storica e rank corrente, due run intermedi hanno ottenuto `14,99` e
+`15,04 t/s`. Il canary completo, con budget `B=1..R*5` ed esplorazione locale,
+ha chiuso a `14,88 t/s`: neutro sul wall-clock rispetto alla baseline, ma con
+throughput del solo ciclo verifier salito da `12,446` a `13,361 t/s`
+(`+7,35%`). Il throughput delle coorti e' passato da `15,400` a
+`15,425 t/s`. Il beneficio interno viene ancora assorbito da divergenza delle
+lane, tail e probe fisici `R=3`; Nightjar resta quindi opt-in finche' questi
+costi non saranno ridotti e i bucket di contesto lunghi non saranno validati.
+
+Topologia target, logits, KV, RNG e rejection sampling p/q non cambiano. Il
+numero di proposte puo' cambiare e quindi una risposta campionata puo' divergere
+bit per bit, ma ogni token resta accettato o corretto dal modello target con la
+stessa distribuzione lossless.
+
 Prima del coordinatore, un test operativo con due client HTTP indipendenti ha
 mantenuto due socket contemporanei ma ha eseguito le richieste in alternanza
 strettamente seriale. Fra `chatcmpl-9` e `chatcmpl-26` sono stati generati 7.953
@@ -2074,9 +2161,10 @@ Verifica minima:
 
 ### Installazione automatica
 
-Su una macchina nuova, lo script seguente scarica il target Q2/imatrix in
-`/home/athena/ds4`, scarica gli shard ufficiali DSpark, costruisce entrambi i
-sidecar Q4 e Q2, esegue `cuda-regression` e compila il server:
+Su una macchina nuova, lo script seguente scarica il target finale Antirez
+DeepSeek-V4-Flash-0731 Q2/imatrix in `/home/athena/ds4`, scarica gli shard
+ufficiali DSpark, costruisce entrambi i sidecar Q4 e Q2, esegue
+`cuda-regression` e compila il server:
 
 ```bash
 cd /home/athena && git clone https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA.git && cd /home/athena/DS4-GB10-GX10-DSpark-CUDA && ./install-gb10.sh --install-deps --dspark both
@@ -2085,6 +2173,18 @@ cd /home/athena && git clone https://github.com/xangel82/DS4-GB10-GX10-DSpark-CU
 Per costruire una sola variante usare `--dspark q4` oppure `--dspark q2`.
 Download e GGUF gia' completi vengono riutilizzati; `--force-sidecar` forza
 soltanto la rigenerazione dei sidecar.
+
+Il file target predefinito e':
+
+```text
+/home/athena/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
+```
+
+Se non e' presente localmente, l'installer prova a scaricarlo dal repository
+Hugging Face `antirez/deepseek-v4-gguf`. Un file remoto assente o un download
+interrotto lascia invariato il collegamento del modello attivo. Il GGUF 0731
+occupa 86,72 GB decimali: non esiste una patch binaria piccola e affidabile da
+applicare ai pesi preview, quindi l'aggiornamento richiede il file completo.
 
 La regression CUDA richiede la UMA libera e, per default, l'installer si ferma
 se rileva un qualunque processo `ds4-server`, anche appartenente a un altro
@@ -2115,7 +2215,7 @@ il deploy rsync descritto sotto.
 Il launcher predefinito richiede:
 
 ```text
-/home/athena/ds4/ds4flash.gguf
+/home/athena/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
 /home/athena/ds4/DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf
 ```
 
@@ -2125,17 +2225,31 @@ La variante Q4 opzionale usa:
 /home/athena/ds4/DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf
 ```
 
-Il target Q2/imatrix può essere scaricato con:
+Il target finale 0731 Q2/imatrix puo' essere scaricato con:
 
 ```bash
-cd ~/DS4-GB10-GX10-DSpark-CUDA && mkdir -p /home/athena/ds4 && DS4_GGUF_DIR=/home/athena/ds4 ./download_model.sh q2-imatrix
+cd ~/DS4-GB10-GX10-DSpark-CUDA && mkdir -p /home/athena/ds4 && DS4_GGUF_DIR=/home/athena/ds4 ./download_model.sh q2-imatrix-0731
 ```
 
 Dopo il download, creare o aggiornare il collegamento atteso dal launcher:
 
 ```bash
-ln -sfn /home/athena/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf /home/athena/ds4/ds4flash.gguf
+ln -sfn /home/athena/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf /home/athena/ds4/ds4flash.gguf
 ```
+
+Aggiornamento di un'installazione preview esistente, senza cancellare il
+vecchio target:
+
+```bash
+cd ~/DS4-GB10-GX10-DSpark-CUDA && git fetch origin && git pull --ff-only origin main && ./upgrade-target-0731.sh --model-dir /home/athena/ds4
+```
+
+Lo script riprende i download interrotti, valida la dimensione completa e
+aggiorna `ds4flash.gguf` soltanto alla fine. Non modifica i sidecar DSpark. Il
+launcher usa comunque il nome 0731 esplicito come default; se manca, termina
+con il comando di upgrade invece di avviare silenziosamente il preview. Per un
+rollback intenzionale usare
+`DS4_MODEL=/percorso/del/precedente.gguf ./run-dspark-server.sh`.
 
 Per costruire il sidecar servono gli shard Hugging Face 46–48 e
 `model.safetensors.index.json` in

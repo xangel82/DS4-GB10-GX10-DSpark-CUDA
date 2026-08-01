@@ -14,7 +14,8 @@ SKIP_REGRESSION=0
 DRY_RUN=0
 HF_TOKEN_VALUE="${HF_TOKEN:-}"
 
-TARGET_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+TARGET_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
+TARGET_SIZE=86720111488
 Q4_FILE="DeepSeek-V4-Flash-DSpark-Q4K-Q8.gguf"
 Q2_FILE="DeepSeek-V4-Flash-DSpark-IQ2XXS-Q2K-Q8.gguf"
 HF_REPO="deepseek-ai/DeepSeek-V4-Flash-DSpark"
@@ -124,6 +125,8 @@ fi
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "DS4 source:       $ROOT"
   echo "Model directory:  $MODEL_DIR"
+  echo "Target release:   DeepSeek-V4-Flash-0731"
+  echo "Target file:      $TARGET_FILE"
   echo "DSpark HF shards: $HF_DIR"
   echo "DSpark variants:  ${VARIANTS[*]}"
   echo "Download target:  $([[ "$SKIP_TARGET" == "1" ]] && echo no || echo yes)"
@@ -176,12 +179,18 @@ echo "DSpark variants:  ${VARIANTS[*]}"
 echo
 
 if [[ "$SKIP_TARGET" == "0" ]]; then
-  echo "==> Downloading the DeepSeek-V4-Flash Q2/imatrix target"
-  download_args=(q2-imatrix)
+  echo "==> Downloading the Antirez DeepSeek-V4-Flash-0731 Q2/imatrix target"
+  download_args=(q2-imatrix-0731)
   if [[ -n "$HF_TOKEN_VALUE" ]]; then
     download_args+=(--token "$HF_TOKEN_VALUE")
   fi
   DS4_GGUF_DIR="$MODEL_DIR" "$ROOT/download_model.sh" "${download_args[@]}"
+  actual_size="$(wc -c < "$MODEL_DIR/$TARGET_FILE" | tr -d '[:space:]')"
+  if [[ "$actual_size" != "$TARGET_SIZE" ]]; then
+    echo "Invalid 0731 target size: $actual_size bytes (expected $TARGET_SIZE)" >&2
+    echo "The active model link was not changed." >&2
+    exit 1
+  fi
   ln -sfn "$MODEL_DIR/$TARGET_FILE" "$MODEL_DIR/ds4flash.gguf"
 else
   echo "==> Skipping target download"
@@ -189,7 +198,7 @@ fi
 
 if [[ ! -s "$MODEL_DIR/ds4flash.gguf" ]]; then
   echo "Target model is missing: $MODEL_DIR/ds4flash.gguf" >&2
-  echo "Remove --skip-target or provide the expected symlink/file." >&2
+  echo "Remove --skip-target, run ./upgrade-target-0731.sh, or provide DS4_MODEL at startup." >&2
   exit 2
 fi
 
@@ -243,7 +252,8 @@ make -C "$ROOT" -B cuda-spark-graph-sm121
 
 echo
 echo "Installation complete."
-echo "Target: $MODEL_DIR/ds4flash.gguf"
+echo "Target: $MODEL_DIR/$TARGET_FILE"
+echo "Active link: $MODEL_DIR/ds4flash.gguf"
 for variant in "${VARIANTS[@]}"; do
   if [[ "$variant" == "q4" ]]; then
     echo "Q4 sidecar: $MODEL_DIR/$Q4_FILE"

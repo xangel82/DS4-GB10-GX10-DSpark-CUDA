@@ -4,7 +4,8 @@
 set -euo pipefail
 
 MODEL_DIR="${DS4_MODEL_DIR:-$HOME/ds4}"
-MODEL="${DS4_MODEL:-$MODEL_DIR/ds4flash.gguf}"
+TARGET_0731_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
+MODEL="${DS4_MODEL:-$MODEL_DIR/$TARGET_0731_FILE}"
 DSPARK_VARIANT="${DS4_DSPARK_VARIANT:-q2}"
 case "$DSPARK_VARIANT" in
   q4)
@@ -35,6 +36,8 @@ DRAFT="${DS4_DSPARK_DRAFT:-5}"
 TELEMETRY="${DS4_TELEMETRY:-0}"
 SCHEDULER_SHADOW="${DS4_DSPARK_SCHEDULER_SHADOW:-$TELEMETRY}"
 SCHEDULER_DETERMINISTIC="${DS4_DSPARK_SCHEDULER_DETERMINISTIC:-0}"
+NIGHTJAR="${DS4_DSPARK_NIGHTJAR:-0}"
+NIGHTJAR_SHADOW="${DS4_DSPARK_NIGHTJAR_SHADOW:-0}"
 COORDINATOR_LANES="${DS4_SERVER_DSPARK_LANES:-3}"
 COORDINATOR_HOT_LANES="${DS4_SERVER_DSPARK_HOT_LANES:-2}"
 COORDINATOR_LANE_RESERVE_MB="${DS4_SERVER_DSPARK_LANE_RESERVE_MB:-1536}"
@@ -87,6 +90,15 @@ HYBRID_WIDTH="${DS4_DSPARK_HYBRID_WIDTH:-}"
 
 if [[ ! -f "$MODEL" ]]; then
   echo "Main model not found: $MODEL" >&2
+  if [[ -z "${DS4_MODEL:-}" ]]; then
+    echo "The default target is now the Antirez DeepSeek-V4-Flash-0731 GGUF." >&2
+    echo "Download and activate it with:" >&2
+    echo "  ./upgrade-target-0731.sh --model-dir $MODEL_DIR" >&2
+    if [[ -e "$MODEL_DIR/ds4flash.gguf" ]]; then
+      echo "An older ds4flash.gguf is present. To run it explicitly for rollback:" >&2
+      echo "  DS4_MODEL=$MODEL_DIR/ds4flash.gguf ./run-dspark-server.sh" >&2
+    fi
+  fi
   exit 2
 fi
 if [[ ! -f "$DSPARK" ]]; then
@@ -120,6 +132,18 @@ case "$SCHEDULER_DETERMINISTIC" in
   0|1) ;;
   *) echo "Invalid DS4_DSPARK_SCHEDULER_DETERMINISTIC: $SCHEDULER_DETERMINISTIC (expected 0 or 1)" >&2; exit 2 ;;
 esac
+case "$NIGHTJAR" in
+  0|1) ;;
+  *) echo "Invalid DS4_DSPARK_NIGHTJAR: $NIGHTJAR (expected 0 or 1)" >&2; exit 2 ;;
+esac
+case "$NIGHTJAR_SHADOW" in
+  0|1) ;;
+  *) echo "Invalid DS4_DSPARK_NIGHTJAR_SHADOW: $NIGHTJAR_SHADOW (expected 0 or 1)" >&2; exit 2 ;;
+esac
+if [[ "$NIGHTJAR" == "1" && "$NIGHTJAR_SHADOW" == "1" ]]; then
+  echo "DS4_DSPARK_NIGHTJAR and DS4_DSPARK_NIGHTJAR_SHADOW are mutually exclusive" >&2
+  exit 2
+fi
 case "$COORDINATOR_LANES" in
   1|2|3) ;;
   *) echo "Invalid DS4_SERVER_DSPARK_LANES: $COORDINATOR_LANES (expected 1, 2 or 3)" >&2; exit 2 ;;
@@ -352,6 +376,16 @@ if [[ "$SCHEDULER_DETERMINISTIC" == "1" ]]; then
 else
   unset DS4_DSPARK_SCHEDULER_DETERMINISTIC
 fi
+if [[ "$NIGHTJAR" == "1" ]]; then
+  export DS4_DSPARK_NIGHTJAR=1
+else
+  unset DS4_DSPARK_NIGHTJAR
+fi
+if [[ "$NIGHTJAR_SHADOW" == "1" ]]; then
+  export DS4_DSPARK_NIGHTJAR_SHADOW=1
+else
+  unset DS4_DSPARK_NIGHTJAR_SHADOW
+fi
 export DS4_SERVER_DSPARK_LANES="$COORDINATOR_LANES"
 export DS4_SERVER_DSPARK_HOT_LANES="$COORDINATOR_HOT_LANES"
 export DS4_SERVER_DSPARK_LANE_RESERVE_MB="$COORDINATOR_LANE_RESERVE_MB"
@@ -379,6 +413,7 @@ echo "Streaming: decode-heartbeat=${DS4_STREAM_HEARTBEAT_SEC}s"
 echo "KV:     policy=$DS4_KV_PREFILL_CHECKPOINT_POLICY keep-long-text-hits=$DS4_KV_KEEP_LONG_TEXT_HITS canonical-min-sec=$DS4_KV_CANONICAL_PREFILL_MIN_SEC cold-max=$KV_COLD_MAX_TOKENS long-anchor-min=$DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS trim=$DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS disk-mb=$KV_DISK_SPACE_MB"
 echo "Context guard: physical=$CTX advertise=${ADVERTISE_CONTEXT_PCT}%"
 echo "DSpark scheduler: hardware-aware Algorithm 1 + exact t-2 production capacity, full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY shadow=$SCHEDULER_SHADOW deterministic=$SCHEDULER_DETERMINISTIC"
+echo "DSpark Nightjar: active=$NIGHTJAR shadow=$NIGHTJAR_SHADOW aggregate-budget=1..R*$DRAFT (B=0 singleton-only) t-2-capacity current-confidence-ranked executor=exact-shape-aware recent-reward=pure-neural-ms/token"
 echo "DSpark coordinator: resident=$COORDINATOR_HOT_LANES max=$COORDINATOR_LANES reserve=${COORDINATOR_LANE_RESERVE_MB}MiB coalesce=${COORDINATOR_COALESCE_US}us active-rendezvous=${COORDINATOR_ACTIVE_COALESCE_US}us min-physical-rows=$COORDINATOR_MIN_PHYSICAL_ROWS load-aware-prefix=1 physical-R1..R${COORDINATOR_LANES}=profiled serial-fallback=1"
 echo "DSpark STS: profile=${STS_PROFILE:-online-fallback} capture=${DS4_DSPARK_STS_CAPTURE:-disabled}"
 echo "DSpark hardware profile: $DS4_DSPARK_HW_PROFILE (versioned model/binary fingerprint)"

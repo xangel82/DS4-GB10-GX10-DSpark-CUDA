@@ -30,6 +30,11 @@ DeepSeek-V4-Flash Q2/imatrix target:
 | Sustained GB10 temperature observed in long runs | about 75 C |
 | Memory behavior with the compact Q2 sidecar | stable, about 5.06 GiB less than Q4 |
 
+The published performance table characterizes the original Flash release.
+The installer and launcher now select Antirez's final
+`DeepSeek-V4-Flash-0731` Q2/imatrix GGUF; its release-specific performance is
+being revalidated with the same workloads before replacing historical numbers.
+
 The original CUDA path measured about 13 decode t/s on the same machine.
 Decode varies with prompt, sampling and DSpark acceptance. Prefill averages are
 also affected by short final chunks, so the table reports both request-level
@@ -187,8 +192,8 @@ Recommended layout:
 ### Automatic installation
 
 For a fresh machine, clone the repository and let the installer download the
-target, fetch the official DSpark shards, build both sidecars, run the CUDA
-regression and compile the server:
+final Antirez `DeepSeek-V4-Flash-0731` target, fetch the official DSpark
+shards, build both sidecars, run the CUDA regression and compile the server:
 
 ```bash
 cd "$HOME" && git clone https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA.git && cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && ./install-gb10.sh --install-deps --dspark both
@@ -208,6 +213,39 @@ active, protecting unified-memory headroom. `--skip-regression` now permits
 download, sidecar conversion and compilation while a server from this or
 another checkout is running; stop the server and run the regression separately
 before promoting that build.
+
+The recommended target is expected at:
+
+```text
+$HOME/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
+```
+
+If Antirez's 0731 file is not present locally, the installer downloads it from
+[`antirez/deepseek-v4-gguf`](https://huggingface.co/antirez/deepseek-v4-gguf).
+A missing remote file or interrupted transfer fails before the active model
+link is changed. The 86.72 GB decimal GGUF is a complete new target, not a
+small binary patch over the preview weights.
+
+### Upgrade an existing preview installation to 0731
+
+Update the source checkout, download the new target and atomically update the
+`ds4flash.gguf` link:
+
+```bash
+cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && git fetch origin && git pull --ff-only origin main && ./upgrade-target-0731.sh --model-dir "$HOME/ds4"
+```
+
+The command is resumable, preserves the previous GGUF for rollback and reuses
+an already complete 0731 file. It does not overwrite or rebuild DSpark
+sidecars. To preview paths and actions without downloading:
+
+```bash
+./upgrade-target-0731.sh --model-dir "$HOME/ds4" --dry-run
+```
+
+After the download, stop the old server and start normally. Existing scheduler
+profiles are fingerprinted: incompatible target-specific profiles are ignored
+automatically and the generic safe curve is used until 0731 is calibrated.
 
 Preview paths and planned work without downloading:
 
@@ -244,12 +282,12 @@ cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && git fetch origin && git pull --ff-only o
 
 ### 2. Download the target model
 
-Create the persistent model directory and download the recommended
-DeepSeek-V4-Flash Q2/imatrix target:
+Create the persistent model directory and download the recommended final
+DeepSeek-V4-Flash-0731 Q2/imatrix target:
 
 ```bash
-mkdir -p "$HOME/ds4" && cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && DS4_GGUF_DIR="$HOME/ds4" ./download_model.sh q2-imatrix
-ln -sfn "$HOME/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf" "$HOME/ds4/ds4flash.gguf"
+mkdir -p "$HOME/ds4" && cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && DS4_GGUF_DIR="$HOME/ds4" ./download_model.sh q2-imatrix-0731
+ln -sfn "$HOME/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf" "$HOME/ds4/ds4flash.gguf"
 ```
 
 To use another compatible target, point `DS4_MODEL` to its GGUF instead of
@@ -318,6 +356,11 @@ Start the default Q2 profile on port `30007`:
 cd "$HOME/DS4-GB10-GX10-DSpark-CUDA" && ./run-dspark-server.sh 2>&1 | tee "$HOME/ds4/ds4-dspark-q2.log"
 ```
 
+The launcher selects the explicit 0731 filename by default. If it is absent,
+startup stops with the exact `upgrade-target-0731.sh` command instead of
+silently running the preview target. A previous target remains available only
+through an explicit `DS4_MODEL=/path/to/old.gguf` rollback override.
+
 Start the optional Q4 profile:
 
 ```bash
@@ -369,7 +412,10 @@ Current GB10 release defaults in `run-dspark-server.sh`:
 
 ```text
 DS4_MODEL_DIR=$HOME/ds4
+DS4_MODEL=$HOME/ds4/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
 DS4_DSPARK_VARIANT=q2
+DS4_DSPARK_NIGHTJAR=0
+DS4_DSPARK_NIGHTJAR_SHADOW=0
 DS4_CTX=262144
 DS4_ADVERTISE_CONTEXT_PCT=85
 DS4_MAX_TOKENS=2200

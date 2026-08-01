@@ -12,6 +12,8 @@ enum {
     DS4_DSPARK_SCHEDULER_MAX_ROWS =
         DS4_DSPARK_SCHEDULER_MAX_REQUESTS *
         (DS4_DSPARK_SCHEDULER_MAX_PREFIX + 1),
+    DS4_DSPARK_NIGHTJAR_MAX_CONTEXTS = 64,
+    DS4_DSPARK_NIGHTJAR_MAX_ARMS = 64,
 };
 
 typedef struct {
@@ -87,6 +89,65 @@ typedef double (*ds4_dspark_shape_sps_fn)(
         uint32_t batch_size,
         void *opaque);
 
+/* Nightjar keeps one independent bin/block timeline for each serving
+ * context. The DSpark integration uses an aggregate neural draft budget as
+ * the arm; executor selection remains an independent hardware-shape
+ * decision. */
+typedef struct {
+    uint32_t arm;
+    double predicted_loss;
+    double switch_loss;
+} ds4_dspark_nightjar_candidate;
+
+typedef struct {
+    uint32_t arm;
+    double mean_loss;
+    double recent_loss;
+    double total_latency;
+    uint64_t total_tokens;
+    uint64_t samples;
+    uint32_t recent_samples;
+    uint32_t in_use;
+} ds4_dspark_nightjar_arm;
+
+typedef struct {
+    uint64_t key;
+    uint64_t last_seen;
+    uint64_t block_horizon;
+    uint64_t observations;
+    uint64_t rng;
+    uint32_t block_index;
+    uint32_t bin_index;
+    uint32_t round_in_bin;
+    uint32_t locked_arm;
+    uint32_t previous_arm;
+    uint32_t locked;
+    uint32_t previous_valid;
+    uint32_t revoked_pending;
+    uint32_t in_use;
+    double safe_ratio;
+    ds4_dspark_nightjar_arm arm[DS4_DSPARK_NIGHTJAR_MAX_ARMS];
+} ds4_dspark_nightjar_context;
+
+typedef struct {
+    ds4_dspark_nightjar_context
+        context[DS4_DSPARK_NIGHTJAR_MAX_CONTEXTS];
+    uint64_t clock;
+} ds4_dspark_nightjar_state;
+
+typedef struct {
+    uint32_t arm;
+    uint32_t exploration;
+    uint32_t locked;
+    uint32_t revoked;
+    uint32_t block_index;
+    uint32_t bin_index;
+    uint32_t round_in_bin;
+    uint32_t arm_samples;
+    double estimated_loss;
+    double exploration_probability;
+} ds4_dspark_nightjar_decision;
+
 /* Request-major physical layout consumed by a variable-prefix verifier.
  * Prefix row zero is the mandatory pending target token; rows 1..K are the
  * selected DSpark draft prefix. row_request is the marker tensor payload. */
@@ -141,6 +202,49 @@ int ds4_dspark_hardware_schedule_async(
         uint32_t sps_count,
         ds4_dspark_schedule_result *result);
 
+/* Fill an already selected physical capacity with the highest-survival
+ * current candidates. Nightjar uses this after selecting an aggregate budget
+ * to compare physical and serial execution without changing that capacity. */
+int ds4_dspark_hardware_schedule_fixed_capacity_shape(
+        const ds4_dspark_schedule_request *requests,
+        uint32_t request_count,
+        uint32_t capacity_batch_size,
+        const double *sps,
+        uint32_t sps_count,
+        ds4_dspark_shape_sps_fn shape_sps,
+        void *shape_sps_opaque,
+        ds4_dspark_schedule_result *result);
+
+int ds4_dspark_hardware_schedule_fixed_capacity(
+        const ds4_dspark_schedule_request *requests,
+        uint32_t request_count,
+        uint32_t capacity_batch_size,
+        const double *sps,
+        uint32_t sps_count,
+        ds4_dspark_schedule_result *result);
+
+void ds4_dspark_nightjar_state_reset(
+        ds4_dspark_nightjar_state *state);
+
+/* Warm-started ADA-BINGREEDY. Offline SPS supplies a prior for unseen arms;
+ * measured token-weighted loss and a recent EWMA replace it after observation.
+ * Exploration is probationary rather than bin-locked, and a degraded lock is
+ * revoked before the next decision. safe_ratio bounds eligible exploration. */
+int ds4_dspark_nightjar_select(
+        ds4_dspark_nightjar_state *state,
+        uint64_t context_key,
+        const ds4_dspark_nightjar_candidate *candidates,
+        uint32_t candidate_count,
+        double safe_ratio,
+        ds4_dspark_nightjar_decision *decision);
+
+int ds4_dspark_nightjar_observe(
+        ds4_dspark_nightjar_state *state,
+        uint64_t context_key,
+        uint32_t arm,
+        double latency_seconds,
+        uint32_t emitted_tokens);
+
 void ds4_dspark_scheduler_state_reset(
         ds4_dspark_scheduler_state *state);
 
@@ -149,6 +253,14 @@ void ds4_dspark_scheduler_state_reset(
  * but unrelated runtime maturity/probe counters do not re-enter startup. */
 void ds4_dspark_scheduler_state_reset_history(
         ds4_dspark_scheduler_state *state);
+
+/* Read the confidence snapshot that the next asynchronous scheduler step
+ * would use for capacity selection. The lookup is exact t-2 and never
+ * advances or mutates the scheduler timeline. */
+int ds4_dspark_scheduler_peek_delayed_request(
+        const ds4_dspark_scheduler_state *state,
+        uint64_t request_id,
+        ds4_dspark_schedule_request *request);
 
 /* Forgetting a retired request prevents a later request that reuses its
  * identifier from inheriting stale confidence. Returns one when found. */

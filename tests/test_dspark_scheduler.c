@@ -221,6 +221,380 @@ static void test_async_current_confidence_cannot_expand_capacity(void) {
                  "current confidence must not expand historical capacity");
 }
 
+static void test_fixed_capacity_reranks_current_requests(void) {
+    ds4_dspark_schedule_request request[2];
+    memset(request, 0, sizeof(request));
+    request[0].max_prefix = request[1].max_prefix = 2;
+    request[0].conditional[0] = 0.40;
+    request[0].conditional[1] = 0.20;
+    request[1].conditional[0] = 0.99;
+    request[1].conditional[1] = 0.95;
+    const double sps[] = {0.0, 0.0, 10.0, 9.0, 8.0, 7.0, 6.0};
+    ds4_dspark_schedule_result result;
+    require_true(ds4_dspark_hardware_schedule_fixed_capacity(
+                     request, 2, 4, sps, 7, &result) == 0,
+                 "fixed-capacity schedule failed");
+    require_true(result.prefix[0] == 0 && result.prefix[1] == 2,
+                 "fixed capacity must use current global rank");
+    require_true(result.admitted_candidates == 2 &&
+                 result.batch_size == 4,
+                 "fixed capacity must retain the locked row count");
+    require_close(result.expected_tokens, 2.99 + 0.9405,
+                  "fixed-capacity expected tokens");
+    require_true(ds4_dspark_hardware_schedule_fixed_capacity(
+                     request, 2, 7, sps, 7, &result) != 0,
+                 "unreachable fixed capacity must be rejected");
+}
+
+static void test_nightjar_capacity_does_not_lock_historical_lane(void) {
+    ds4_dspark_nightjar_state state;
+    ds4_dspark_nightjar_state_reset(&state);
+    const ds4_dspark_nightjar_candidate candidate[] = {
+        {.arm = 1u, .predicted_loss = 0.080, .switch_loss = 0.0},
+        {.arm = 2u, .predicted_loss = 0.050, .switch_loss = 0.0},
+    };
+    ds4_dspark_nightjar_decision decision;
+    require_true(ds4_dspark_nightjar_select(
+                     &state, 91u, candidate, 2u, 1.08, &decision) == 0,
+                 "Nightjar capacity selection failed");
+    require_true(decision.arm == 2u,
+                 "Nightjar did not select the expected aggregate budget");
+
+    ds4_dspark_schedule_request current[2];
+    memset(current, 0, sizeof(current));
+    current[0].max_prefix = current[1].max_prefix = 2u;
+    current[0].conditional[0] = 0.20;
+    current[0].conditional[1] = 0.10;
+    current[1].conditional[0] = 0.99;
+    current[1].conditional[1] = 0.95;
+    const double sps[] = {0.0, 0.0, 10.0, 9.0, 8.0, 7.0, 6.0};
+    ds4_dspark_schedule_result result;
+    require_true(ds4_dspark_hardware_schedule_fixed_capacity(
+                     current, 2u, 2u + decision.arm,
+                     sps, 7u, &result) == 0,
+                 "Nightjar fixed-capacity rerank failed");
+    require_true(result.prefix[0] == 0u && result.prefix[1] == 2u,
+                 "t-2 capacity must not lock the historical lane allocation");
+}
+
+static void test_nightjar_warm_start_and_bin_lock(void) {
+    ds4_dspark_nightjar_state state;
+    ds4_dspark_nightjar_state_reset(&state);
+    const ds4_dspark_nightjar_candidate candidate[] = {
+        {.arm = 10u, .predicted_loss = 0.050, .switch_loss = 0.0},
+        {.arm = 20u, .predicted_loss = 0.040, .switch_loss = 0.0},
+    };
+    ds4_dspark_nightjar_decision decision;
+    require_true(ds4_dspark_nightjar_select(
+                     &state, 7u, candidate, 2u, 1.0, &decision) == 0,
+                 "Nightjar warm start failed");
+    require_true(decision.arm == 20u && decision.exploration == 0u,
+                 "Nightjar must warm-start from the SPS prior");
+    require_true(ds4_dspark_nightjar_observe(
+                     &state, 7u, decision.arm, 0.041, 1u) == 0,
+                 "Nightjar first observation failed");
+
+    const ds4_dspark_nightjar_candidate shifted[] = {
+        {.arm = 10u, .predicted_loss = 0.030, .switch_loss = 0.0},
+        {.arm = 20u, .predicted_loss = 0.040, .switch_loss = 0.0},
+    };
+    /* An unseen arm is measured when its prior becomes competitive, without
+     * exhaustively bootstrapping every possible budget. */
+    require_true(ds4_dspark_nightjar_select(
+                     &state, 7u, shifted, 2u, 1.0, &decision) == 0,
+                 "Nightjar bootstrap exploration failed");
+    require_true(decision.arm == 10u && decision.exploration == 1u,
+                 "Nightjar must sample the remaining unobserved arm");
+    require_true(state.context[0].locked == 0u,
+                 "Nightjar exploratory probation must not lock a bin");
+    require_true(ds4_dspark_nightjar_observe(
+                     &state, 7u, decision.arm, 0.042, 1u) == 0,
+                 "Nightjar second observation failed");
+
+    require_true(ds4_dspark_nightjar_select(
+                     &state, 7u, candidate, 2u, 2.0, &decision) == 0,
+                 "Nightjar first post-bootstrap round failed");
+
+    require_true(ds4_dspark_nightjar_select(
+                     &state, 8u, candidate, 2u, 1.0, &decision) == 0,
+                 "Nightjar independent context failed");
+    require_true(decision.arm == 20u && decision.arm_samples == 0u,
+                 "Nightjar contexts must keep independent statistics");
+}
+
+static void test_peek_delayed_request_is_exact_and_read_only(void) {
+    ds4_dspark_scheduler_state state;
+    ds4_dspark_scheduler_state_reset(&state);
+    state.step = 4u;
+    state.entry_count = 1u;
+    state.entries[0].in_use = 1u;
+    state.entries[0].request_id = 77u;
+    state.entries[0].history_count = 2u;
+    state.entries[0].history_step[0] = 4u;
+    state.entries[0].history_step[1] = 3u;
+    state.entries[0].history[0].max_prefix = 5u;
+    state.entries[0].history[0].conditional[0] = 0.11;
+    state.entries[0].history[1].max_prefix = 5u;
+    state.entries[0].history[1].conditional[0] = 0.73;
+
+    ds4_dspark_schedule_request delayed;
+    require_true(ds4_dspark_scheduler_peek_delayed_request(
+                     &state, 77u, &delayed) == 0,
+                 "exact t-2 confidence lookup failed");
+    require_close(delayed.conditional[0], 0.73,
+                  "exact t-2 confidence value");
+    require_true(state.step == 4u &&
+                 state.entries[0].history_step[0] == 4u,
+                 "t-2 confidence lookup mutated scheduler state");
+    require_true(ds4_dspark_scheduler_peek_delayed_request(
+                     &state, 78u, &delayed) != 0,
+                 "unknown request unexpectedly found t-2 confidence");
+}
+
+static void test_nightjar_skips_unsafe_bootstrap_arms(void) {
+    ds4_dspark_nightjar_state state;
+    ds4_dspark_nightjar_state_reset(&state);
+    const ds4_dspark_nightjar_candidate candidate[] = {
+        {.arm = 2u, .predicted_loss = 0.030, .switch_loss = 0.0},
+        {.arm = 9u, .predicted_loss = 0.060, .switch_loss = 0.0},
+    };
+    ds4_dspark_nightjar_decision decision;
+    require_true(ds4_dspark_nightjar_select(
+                     &state, 0x17u, candidate, 2u, 1.15, &decision) == 0 &&
+                 decision.arm == 2u,
+                 "Nightjar safe bootstrap setup failed");
+    require_true(ds4_dspark_nightjar_observe(
+                     &state, 0x17u, 2u, 0.030, 1u) == 0,
+                 "Nightjar safe bootstrap observation failed");
+    require_true(ds4_dspark_nightjar_select(
+                     &state, 0x17u, candidate, 2u, 1.15, &decision) == 0 &&
+                 decision.arm == 2u && decision.exploration == 0u,
+                 "Nightjar sampled an unsafe unobserved arm");
+}
+
+static void test_nightjar_revokes_a_degraded_lock(void) {
+    ds4_dspark_nightjar_state state;
+    ds4_dspark_nightjar_state_reset(&state);
+    const ds4_dspark_nightjar_candidate candidate[] = {
+        {.arm = 2u, .predicted_loss = 0.030, .switch_loss = 0.0},
+        {.arm = 5u, .predicted_loss = 0.034, .switch_loss = 0.0},
+    };
+    const ds4_dspark_nightjar_candidate shifted[] = {
+        {.arm = 2u, .predicted_loss = 0.030, .switch_loss = 0.0},
+        {.arm = 5u, .predicted_loss = 0.025, .switch_loss = 0.0},
+    };
+    ds4_dspark_nightjar_decision decision;
+
+    require_true(ds4_dspark_nightjar_select(
+                     &state, 0x91u, candidate, 2u, 1.15, &decision) == 0 &&
+                 decision.arm == 2u,
+                 "Nightjar revocation setup must select the best prior");
+    require_true(ds4_dspark_nightjar_observe(
+                     &state, 0x91u, 2u, 0.030, 1u) == 0,
+                 "Nightjar revocation setup observation failed");
+    require_true(ds4_dspark_nightjar_select(
+                     &state, 0x91u, shifted, 2u, 1.0, &decision) == 0 &&
+                 decision.arm == 5u && decision.exploration == 1u,
+                 "Nightjar must probation the unseen arm");
+    require_true(ds4_dspark_nightjar_observe(
+                     &state, 0x91u, 5u, 0.040, 1u) == 0,
+                 "Nightjar probation observation failed");
+
+    for (uint32_t attempt = 0u;
+         attempt < 8u && state.context[0].locked == 0u;
+         attempt++) {
+        require_true(ds4_dspark_nightjar_select(
+                         &state, 0x91u, candidate, 2u, 1.15,
+                         &decision) == 0 && decision.arm == 2u,
+                     "Nightjar must select the measured incumbent");
+        if (state.context[0].locked == 0u) {
+            require_true(ds4_dspark_nightjar_observe(
+                             &state, 0x91u, 2u, 0.030, 1u) == 0,
+                         "Nightjar incumbent warm-up failed");
+        }
+    }
+    require_true(state.context[0].locked == 1u,
+                 "Nightjar incumbent was not bin-locked");
+    require_true(ds4_dspark_nightjar_observe(
+                     &state, 0x91u, 2u, 0.200, 1u) == 0,
+                 "Nightjar degraded observation failed");
+    require_true(state.context[0].locked == 0u,
+                 "Nightjar did not revoke a degraded lock");
+    require_true(ds4_dspark_nightjar_select(
+                     &state, 0x91u, candidate, 2u, 1.15, &decision) == 0 &&
+                 decision.arm == 5u && decision.revoked == 1u,
+                 "Nightjar did not expose and recover from revocation");
+}
+
+static void test_nightjar_safe_exploration_uses_observed_loss(void) {
+    ds4_dspark_nightjar_state state;
+    ds4_dspark_nightjar_state_reset(&state);
+    const ds4_dspark_nightjar_candidate candidates[] = {
+        {.arm = 2u, .predicted_loss = 0.031, .switch_loss = 0.0},
+        {.arm = 5u, .predicted_loss = 0.030, .switch_loss = 0.0},
+    };
+    ds4_dspark_nightjar_decision decision;
+    require_true(ds4_dspark_nightjar_select(
+                         &state, 0x52u, candidates, 2u, 1.15, &decision) == 0,
+                 "Nightjar observed-loss setup select failed");
+    require_true(decision.arm == 5u,
+                 "Nightjar observed-loss setup must use the best prior");
+    require_true(ds4_dspark_nightjar_observe(
+                         &state, 0x52u, 5u, 0.029, 1u) == 0,
+                 "Nightjar observed-loss setup observe failed");
+
+    /* Advance beyond the first one-round block.  Arm 2 still has an
+     * optimistic SPS prior here, so make its measured cost explicitly bad. */
+    require_true(ds4_dspark_nightjar_select(
+                         &state, 0x52u, candidates, 2u, 1.15, &decision) == 0,
+                 "Nightjar observed-loss second select failed");
+    require_true(ds4_dspark_nightjar_observe(
+                         &state, 0x52u, 2u, 0.046, 1u) == 0,
+                 "Nightjar observed-loss bad-arm observe failed");
+
+    for (uint32_t i = 0; i < 32u; i++) {
+        require_true(ds4_dspark_nightjar_select(
+                             &state, 0x52u, candidates, 2u, 1.15,
+                             &decision) == 0,
+                     "Nightjar observed-loss exploration select failed");
+        require_true(decision.locked || decision.arm == 5u,
+                     "Nightjar exploration crossed the observed-loss guard");
+        require_true(ds4_dspark_nightjar_observe(
+                             &state, 0x52u, decision.arm,
+                             decision.arm == 5u ? 0.029 : 0.046,
+                             1u) == 0,
+                     "Nightjar observed-loss exploration observe failed");
+    }
+}
+
+static void test_nightjar_switch_cost_only_wakes_drafter(void) {
+    ds4_dspark_nightjar_state state;
+    ds4_dspark_nightjar_state_reset(&state);
+    ds4_dspark_nightjar_decision decision;
+    const ds4_dspark_nightjar_candidate sleep_candidates[] = {
+        {.arm = 0u, .predicted_loss = 0.012, .switch_loss = 0.0},
+        {.arm = 1u, .predicted_loss = 0.020, .switch_loss = 0.005},
+    };
+    require_true(ds4_dspark_nightjar_select(
+                         &state, 0x91u, sleep_candidates, 2u, 1.0,
+                         &decision) == 0 && decision.arm == 0u,
+                 "Nightjar sleep arm setup failed");
+    require_true(ds4_dspark_nightjar_observe(
+                         &state, 0x91u, 0u, 0.012, 1u) == 0,
+                 "Nightjar sleep observation failed");
+    const ds4_dspark_nightjar_candidate wake_candidates[] = {
+        {.arm = 0u, .predicted_loss = 0.012, .switch_loss = 0.0},
+        {.arm = 1u, .predicted_loss = 0.010, .switch_loss = 0.005},
+    };
+    require_true(ds4_dspark_nightjar_observe(
+                         &state, 0x91u, 1u, 0.010, 1u) == 0,
+                 "Nightjar wake-arm observation failed");
+    state.context[0].previous_arm = 0u;
+    state.context[0].previous_valid = 1u;
+    state.context[0].locked = 0u;
+    require_true(ds4_dspark_nightjar_select(
+                         &state, 0x91u, wake_candidates, 2u, 1.0,
+                         &decision) == 0 && decision.arm == 0u,
+                 "Nightjar must charge the K0-to-draft wake cost");
+
+    ds4_dspark_nightjar_state_reset(&state);
+    const ds4_dspark_nightjar_candidate positive_setup[] = {
+        {.arm = 1u, .predicted_loss = 0.010, .switch_loss = 0.100},
+        {.arm = 2u, .predicted_loss = 0.020, .switch_loss = 0.100},
+    };
+    require_true(ds4_dspark_nightjar_select(
+                         &state, 0x92u, positive_setup, 2u, 1.0,
+                         &decision) == 0 && decision.arm == 1u,
+                 "Nightjar positive-arm setup failed");
+    require_true(ds4_dspark_nightjar_observe(
+                         &state, 0x92u, 1u, 0.010, 1u) == 0,
+                 "Nightjar positive-arm observation failed");
+    const ds4_dspark_nightjar_candidate positive_switch[] = {
+        {.arm = 1u, .predicted_loss = 0.020, .switch_loss = 0.100},
+        {.arm = 2u, .predicted_loss = 0.009, .switch_loss = 0.100},
+    };
+    require_true(ds4_dspark_nightjar_select(
+                         &state, 0x92u, positive_switch, 2u, 1.0,
+                         &decision) == 0 && decision.arm == 2u,
+                 "Nightjar bootstrap must measure the second positive arm");
+    require_true(ds4_dspark_nightjar_observe(
+                         &state, 0x92u, 2u, 0.009, 1u) == 0,
+                 "Nightjar second positive-arm observation failed");
+    state.context[0].previous_arm = 1u;
+    state.context[0].previous_valid = 1u;
+    state.context[0].locked = 0u;
+    require_true(ds4_dspark_nightjar_select(
+                         &state, 0x92u, positive_switch, 2u, 1.0,
+                         &decision) == 0 && decision.arm == 2u,
+                 "Nightjar must not charge gamma-to-gamma switching");
+}
+
+static void test_nightjar_reward_is_token_weighted(void) {
+    ds4_dspark_nightjar_state state;
+    ds4_dspark_nightjar_state_reset(&state);
+    const ds4_dspark_nightjar_candidate candidate[] = {
+        {.arm = 2u, .predicted_loss = 0.060, .switch_loss = 0.0},
+    };
+    ds4_dspark_nightjar_decision decision;
+    require_true(ds4_dspark_nightjar_select(
+                         &state, 0xa1u, candidate, 1u, 1.0,
+                         &decision) == 0,
+                 "Nightjar weighted reward setup failed");
+    require_true(ds4_dspark_nightjar_observe(
+                         &state, 0xa1u, 2u, 0.100, 1u) == 0 &&
+                 ds4_dspark_nightjar_observe(
+                         &state, 0xa1u, 2u, 0.100, 3u) == 0,
+                 "Nightjar weighted reward observations failed");
+    require_close(state.context[0].arm[0].mean_loss, 0.050,
+                  "Nightjar reward must be total latency / total tokens");
+}
+
+static void test_nightjar_mature_measurements_override_stale_prior(void) {
+    ds4_dspark_nightjar_state state;
+    ds4_dspark_nightjar_state_reset(&state);
+    const uint64_t context = UINT64_C(0x7711);
+    const ds4_dspark_nightjar_candidate initial[] = {
+        {.arm = 2u, .predicted_loss = 0.030, .switch_loss = 0.0},
+        {.arm = 5u, .predicted_loss = 0.040, .switch_loss = 0.0},
+    };
+    ds4_dspark_nightjar_decision decision;
+    require_true(ds4_dspark_nightjar_select(
+                     &state, context, initial, 2u, 2.0, &decision) == 0,
+                 "Nightjar mature-prior setup failed");
+
+    ds4_dspark_nightjar_context *ctx = &state.context[0];
+    memset(ctx->arm, 0, sizeof(ctx->arm));
+    ctx->observations = 8u;
+    ctx->locked = 0u;
+    ctx->bin_index = 100u;
+    ctx->arm[0].in_use = 1u;
+    ctx->arm[0].arm = 2u;
+    ctx->arm[0].samples = 4u;
+    ctx->arm[0].total_tokens = 4u;
+    ctx->arm[0].total_latency = 0.200;
+    ctx->arm[0].mean_loss = 0.050;
+    ctx->arm[0].recent_loss = 0.050;
+    ctx->arm[0].recent_samples = 4u;
+    ctx->arm[1].in_use = 1u;
+    ctx->arm[1].arm = 5u;
+    ctx->arm[1].samples = 4u;
+    ctx->arm[1].total_tokens = 4u;
+    ctx->arm[1].total_latency = 0.160;
+    ctx->arm[1].mean_loss = 0.040;
+    ctx->arm[1].recent_loss = 0.040;
+    ctx->arm[1].recent_samples = 4u;
+
+    const ds4_dspark_nightjar_candidate stale[] = {
+        {.arm = 2u, .predicted_loss = 0.020, .switch_loss = 0.0},
+        {.arm = 5u, .predicted_loss = 0.080, .switch_loss = 0.0},
+    };
+    require_true(ds4_dspark_nightjar_select(
+                     &state, context, stale, 2u, 2.0, &decision) == 0,
+                 "Nightjar mature-prior selection failed");
+    require_true(decision.arm == 5u,
+                 "mature measured loss did not override the stale prior");
+}
+
 static ds4_dspark_schedule_item schedule_item(
         uint64_t id, double c1, double c2) {
     ds4_dspark_schedule_item item;
@@ -811,6 +1185,16 @@ int main(void) {
     test_async_crosses_jagged_hardware_cliff();
     test_async_capacity_is_historical();
     test_async_current_confidence_cannot_expand_capacity();
+    test_fixed_capacity_reranks_current_requests();
+    test_nightjar_capacity_does_not_lock_historical_lane();
+    test_nightjar_warm_start_and_bin_lock();
+    test_peek_delayed_request_is_exact_and_read_only();
+    test_nightjar_skips_unsafe_bootstrap_arms();
+    test_nightjar_safe_exploration_uses_observed_loss();
+    test_nightjar_revokes_a_degraded_lock();
+    test_nightjar_switch_cost_only_wakes_drafter();
+    test_nightjar_reward_is_token_weighted();
+    test_nightjar_mature_measurements_override_stale_prior();
     test_shape_aware_step_and_fallback();
     test_stateful_two_step_barrier();
     test_executor_pair_advances_history_once();

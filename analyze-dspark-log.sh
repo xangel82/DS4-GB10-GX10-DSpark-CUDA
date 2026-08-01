@@ -135,6 +135,47 @@ function text_value(prefix,    i,a) {
     }
   }
 }
+/dspark nightjar mode=/ {
+  nightjar_n++
+  nightjar_mode = text_value("mode")
+  nightjar_executor = text_value("executor")
+  nightjar_budget = value("budget")
+  if (nightjar_budget < 0) nightjar_budget = value("gamma")
+  nightjar_generated = value("generated")
+  nightjar_locked = value("lock")
+  nightjar_explore = value("explore")
+  nightjar_revoked = value("revoked")
+  nightjar_t2 = text_value("t2")
+  if (nightjar_mode == "active") nightjar_active++
+  else if (nightjar_mode == "shadow") nightjar_shadow++
+  if (nightjar_locked == 1) nightjar_lock_reuse++
+  if (nightjar_explore == 1) nightjar_exploration++
+  if (nightjar_revoked == 1) nightjar_revocations++
+  if (nightjar_t2 != "") {
+    split(nightjar_t2, nightjar_t2_parts, "/")
+    if (nightjar_t2_parts[1] ~ /^[0-9]+$/ &&
+        nightjar_t2_parts[2] ~ /^[0-9]+$/) {
+      nightjar_t2_ready += nightjar_t2_parts[1] + 0
+      nightjar_t2_total += nightjar_t2_parts[2] + 0
+    }
+  }
+  if (nightjar_executor != "") {
+    nightjar_executor_n[nightjar_executor]++
+  }
+  if (nightjar_budget >= 0 && nightjar_budget <= 64) {
+    nightjar_budget_n[nightjar_budget]++
+    if (nightjar_budget > nightjar_max_budget) {
+      nightjar_max_budget = nightjar_budget
+    }
+  }
+  if (nightjar_generated >= 0) nightjar_generated_sum += nightjar_generated
+}
+/dspark nightjar reward / {
+  nightjar_reward_n++
+  nightjar_line_emitted = value("emitted")
+  nightjar_reward_ms += value("latency") * nightjar_line_emitted
+  nightjar_reward_emitted += nightjar_line_emitted
+}
 /dspark coordinator mode=/ {
   coordinator_mode = text_value("mode")
   coordinator_reason = text_value("reason")
@@ -534,6 +575,37 @@ END {
     if (shadow_rate_n > 0) {
       printf "Mean shadow predicted rate: %.3f t/s\n",
              shadow_rate_sum / shadow_rate_n
+    }
+  }
+  if (nightjar_n > 0) {
+    printf "Nightjar decisions:        %d (active=%d shadow=%d)\n",
+           nightjar_n, nightjar_active, nightjar_shadow
+    printf "Nightjar lock/explore/revoke: %d / %d / %d (%.2f%% / %.2f%% / %.2f%%)\n",
+           nightjar_lock_reuse, nightjar_exploration, nightjar_revocations,
+           100.0 * nightjar_lock_reuse / nightjar_n,
+           100.0 * nightjar_exploration / nightjar_n,
+           100.0 * nightjar_revocations / nightjar_n
+    printf "Nightjar executor:         physical=%d serial=%d\n",
+           nightjar_executor_n["physical"],
+           nightjar_executor_n["serial"]
+    if (nightjar_t2_total > 0) {
+      printf "Nightjar exact t-2 input:  %d / %d lanes (%.2f%%)\n",
+             nightjar_t2_ready, nightjar_t2_total,
+             100.0 * nightjar_t2_ready / nightjar_t2_total
+    }
+    printf "Nightjar aggregate budget:"
+    for (k = 0; k <= nightjar_max_budget; k++) {
+      if (nightjar_budget_n[k] > 0) {
+        printf " B%d=%d", k, nightjar_budget_n[k]
+      }
+    }
+    printf "\n"
+    printf "Nightjar generated/decision: %.2f tokens (aggregate rows across R)\n",
+           nightjar_generated_sum / nightjar_n
+    if (nightjar_reward_emitted > 0) {
+      printf "Nightjar observed reward:  %.3f ms/token (%d cohorts, %d emitted)\n",
+             nightjar_reward_ms / nightjar_reward_emitted,
+             nightjar_reward_n, nightjar_reward_emitted
     }
   }
   if (cohort_n > 0) {

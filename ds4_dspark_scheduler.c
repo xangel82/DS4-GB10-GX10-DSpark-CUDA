@@ -3,6 +3,7 @@
 
 #include "ds4_dspark_scheduler.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -356,6 +357,502 @@ int ds4_dspark_hardware_schedule_async(
             sps, sps_count, NULL, NULL, result);
 }
 
+int ds4_dspark_hardware_schedule_fixed_capacity_shape(
+        const ds4_dspark_schedule_request *requests,
+        uint32_t request_count,
+        uint32_t capacity_batch_size,
+        const double *sps,
+        uint32_t sps_count,
+        ds4_dspark_shape_sps_fn shape_sps,
+        void *shape_sps_opaque,
+        ds4_dspark_schedule_result *result) {
+    if (!requests || !sps || !result || request_count == 0u ||
+        request_count > DS4_DSPARK_SCHEDULER_MAX_REQUESTS) {
+        return 1;
+    }
+    memset(result, 0, sizeof(*result));
+
+    ds4_dspark_candidate candidates[
+        DS4_DSPARK_SCHEDULER_MAX_CANDIDATES];
+    uint32_t candidate_count = 0u;
+    uint32_t baseline_batch = 0u;
+    double baseline_expected = 0.0;
+    if (ds4_dspark_build_candidates(
+            requests, request_count, candidates, &candidate_count,
+            &baseline_batch, &baseline_expected) != 0 ||
+        ds4_dspark_validate_sps(
+            sps, sps_count, baseline_batch, candidate_count) != 0 ||
+        capacity_batch_size < baseline_batch ||
+        capacity_batch_size > baseline_batch + candidate_count) {
+        return 1;
+    }
+
+    uint32_t prefix[DS4_DSPARK_SCHEDULER_MAX_REQUESTS] = {0};
+    for (uint32_t r = 0; r < request_count; r++) {
+        prefix[r] = requests[r].minimum_prefix;
+    }
+    const uint32_t admitted = capacity_batch_size - baseline_batch;
+    double expected = baseline_expected;
+    for (uint32_t i = 0; i < admitted; i++) {
+        const ds4_dspark_candidate *candidate = &candidates[i];
+        if (candidate->prefix != prefix[candidate->request] + 1u) {
+            return 1;
+        }
+        prefix[candidate->request] = candidate->prefix;
+        expected += candidate->survival;
+    }
+
+    uint32_t baseline_prefix[DS4_DSPARK_SCHEDULER_MAX_REQUESTS] = {0};
+    for (uint32_t r = 0; r < request_count; r++) {
+        baseline_prefix[r] = requests[r].minimum_prefix;
+    }
+    result->request_count = request_count;
+    result->batch_size = capacity_batch_size;
+    result->capacity_batch_size = capacity_batch_size;
+    result->admitted_candidates = admitted;
+    result->evaluated_candidates = candidate_count;
+    result->stop_request = UINT32_MAX;
+    result->expected_tokens = expected;
+    result->throughput = expected * ds4_dspark_schedule_sps(
+            sps, capacity_batch_size, prefix, request_count,
+            shape_sps, shape_sps_opaque);
+    result->baseline_throughput = baseline_expected *
+        ds4_dspark_schedule_sps(
+                sps, baseline_batch, baseline_prefix, request_count,
+                shape_sps, shape_sps_opaque);
+    result->capacity_throughput = result->throughput;
+    memcpy(result->prefix, prefix,
+           (size_t)request_count * sizeof(result->prefix[0]));
+    return 0;
+}
+
+int ds4_dspark_hardware_schedule_fixed_capacity(
+        const ds4_dspark_schedule_request *requests,
+        uint32_t request_count,
+        uint32_t capacity_batch_size,
+        const double *sps,
+        uint32_t sps_count,
+        ds4_dspark_schedule_result *result) {
+    return ds4_dspark_hardware_schedule_fixed_capacity_shape(
+            requests, request_count, capacity_batch_size,
+            sps, sps_count, NULL, NULL, result);
+}
+
+void ds4_dspark_nightjar_state_reset(
+        ds4_dspark_nightjar_state *state) {
+    if (state) memset(state, 0, sizeof(*state));
+}
+
+static uint64_t ds4_dspark_nightjar_random(uint64_t *state) {
+    uint64_t x = *state;
+    if (x == 0u) x = UINT64_C(0x9e3779b97f4a7c15);
+    x ^= x >> 12u;
+    x ^= x << 25u;
+    x ^= x >> 27u;
+    *state = x;
+    return x * UINT64_C(2685821657736338717);
+}
+
+static ds4_dspark_nightjar_context *ds4_dspark_nightjar_context_get(
+        ds4_dspark_nightjar_state *state,
+        uint64_t context_key,
+        int create) {
+    if (!state) return NULL;
+    ds4_dspark_nightjar_context *free_context = NULL;
+    ds4_dspark_nightjar_context *oldest = NULL;
+    for (uint32_t i = 0; i < DS4_DSPARK_NIGHTJAR_MAX_CONTEXTS; i++) {
+        ds4_dspark_nightjar_context *context = &state->context[i];
+        if (context->in_use && context->key == context_key) {
+            context->last_seen = ++state->clock;
+            return context;
+        }
+        if (!context->in_use && !free_context) free_context = context;
+        if (context->in_use &&
+            (!oldest || context->last_seen < oldest->last_seen)) {
+            oldest = context;
+        }
+    }
+    if (!create) return NULL;
+    ds4_dspark_nightjar_context *context =
+        free_context ? free_context : oldest;
+    if (!context) return NULL;
+    memset(context, 0, sizeof(*context));
+    context->in_use = 1u;
+    context->key = context_key;
+    context->last_seen = ++state->clock;
+    context->block_index = 1u;
+    context->block_horizon = 1u;
+    context->bin_index = 1u;
+    context->rng = context_key ^ UINT64_C(0xd1b54a32d192ed03);
+    if (context->rng == 0u) context->rng = 1u;
+    return context;
+}
+
+static ds4_dspark_nightjar_arm *ds4_dspark_nightjar_arm_get(
+        ds4_dspark_nightjar_context *context,
+        uint32_t arm,
+        int create) {
+    if (!context) return NULL;
+    ds4_dspark_nightjar_arm *free_arm = NULL;
+    for (uint32_t i = 0; i < DS4_DSPARK_NIGHTJAR_MAX_ARMS; i++) {
+        ds4_dspark_nightjar_arm *slot = &context->arm[i];
+        if (slot->in_use && slot->arm == arm) return slot;
+        if (!slot->in_use && !free_arm) free_arm = slot;
+    }
+    if (!create || !free_arm) return NULL;
+    memset(free_arm, 0, sizeof(*free_arm));
+    free_arm->in_use = 1u;
+    free_arm->arm = arm;
+    return free_arm;
+}
+
+static uint32_t ds4_dspark_nightjar_bin_span(uint64_t horizon) {
+    if (horizon == 0u) return 1u;
+    const double root = sqrt((double)horizon);
+    uint64_t span = (uint64_t)ceil(root);
+    if (span == 0u) span = 1u;
+    if (span > UINT32_MAX) span = UINT32_MAX;
+    return (uint32_t)span;
+}
+
+static int ds4_dspark_nightjar_candidate_index(
+        const ds4_dspark_nightjar_candidate *candidates,
+        uint32_t candidate_count,
+        uint32_t arm) {
+    for (uint32_t i = 0; i < candidate_count; i++) {
+        if (candidates[i].arm == arm) return (int)i;
+    }
+    return -1;
+}
+
+static double ds4_dspark_nightjar_arm_loss(
+        const ds4_dspark_nightjar_arm *arm,
+        double predicted_loss) {
+    if (!arm || arm->samples == 0u) return predicted_loss;
+    double observed = arm->mean_loss;
+    if (arm->recent_samples < 2u || !(arm->recent_loss > 0.0)) {
+        return predicted_loss > 0.0
+            ? observed * 0.65 + predicted_loss * 0.35
+            : observed;
+    }
+    observed = arm->mean_loss * 0.35 + arm->recent_loss * 0.65;
+    if (!(predicted_loss > 0.0)) return observed;
+    /* The offline SPS/confidence model is a cold-start prior. Once an arm has
+     * enough real token-weighted observations, retaining a large prior weight
+     * can pin the scheduler to a locally inferior budget after the workload
+     * changes. Keep a small stabilizing contribution without overruling the
+     * measured recent loss. */
+    const double predicted_weight = arm->samples >= 4u ? 0.10 : 0.25;
+    return observed * (1.0 - predicted_weight) +
+           predicted_loss * predicted_weight;
+}
+
+int ds4_dspark_nightjar_select(
+        ds4_dspark_nightjar_state *state,
+        uint64_t context_key,
+        const ds4_dspark_nightjar_candidate *candidates,
+        uint32_t candidate_count,
+        double safe_ratio,
+        ds4_dspark_nightjar_decision *decision) {
+    if (!state || !candidates || !decision || candidate_count == 0u ||
+        candidate_count > DS4_DSPARK_NIGHTJAR_MAX_ARMS ||
+        !(safe_ratio >= 1.0) || !isfinite(safe_ratio)) {
+        return 1;
+    }
+    memset(decision, 0, sizeof(*decision));
+    for (uint32_t i = 0; i < candidate_count; i++) {
+        if (!(candidates[i].predicted_loss > 0.0) ||
+            !isfinite(candidates[i].predicted_loss) ||
+            !(candidates[i].switch_loss >= 0.0) ||
+            !isfinite(candidates[i].switch_loss)) {
+            return 1;
+        }
+        for (uint32_t j = 0; j < i; j++) {
+            if (candidates[j].arm == candidates[i].arm) return 1;
+        }
+    }
+
+    ds4_dspark_nightjar_context *context =
+        ds4_dspark_nightjar_context_get(state, context_key, 1);
+    if (!context) return 1;
+    context->safe_ratio = safe_ratio;
+
+    int selected_index = -1;
+    int bootstrap_index = -1;
+    double bootstrap_loss = DBL_MAX;
+    if (!context->locked && context->observations == 0u) {
+        double best_current = DBL_MAX;
+        for (uint32_t i = 0; i < candidate_count; i++) {
+            ds4_dspark_nightjar_arm *slot =
+                ds4_dspark_nightjar_arm_get(
+                        context, candidates[i].arm, 1);
+            if (!slot) return 1;
+            double loss = ds4_dspark_nightjar_arm_loss(
+                    slot, candidates[i].predicted_loss);
+            if (context->previous_valid &&
+                context->previous_arm == 0u &&
+                candidates[i].arm != 0u) {
+                loss += candidates[i].switch_loss;
+            }
+            if (loss < best_current) best_current = loss;
+        }
+        const double bootstrap_limit = best_current * safe_ratio;
+        for (uint32_t i = 0; i < candidate_count; i++) {
+            ds4_dspark_nightjar_arm *slot =
+                ds4_dspark_nightjar_arm_get(
+                        context, candidates[i].arm, 1);
+            if (!slot) return 1;
+            if (slot->samples != 0u) continue;
+            double loss = candidates[i].predicted_loss;
+            if (context->previous_valid &&
+                context->previous_arm == 0u &&
+                candidates[i].arm != 0u) {
+                loss += candidates[i].switch_loss;
+            }
+            if (loss > bootstrap_limit) continue;
+            if (loss < bootstrap_loss ||
+                (loss == bootstrap_loss &&
+                 (bootstrap_index < 0 ||
+                  candidates[i].arm <
+                      candidates[bootstrap_index].arm))) {
+                bootstrap_loss = loss;
+                bootstrap_index = (int)i;
+            }
+        }
+    }
+    const int locked_index = context->locked
+        ? ds4_dspark_nightjar_candidate_index(
+                candidates, candidate_count, context->locked_arm)
+        : -1;
+    const uint32_t reused_lock = locked_index >= 0 ? 1u : 0u;
+    uint32_t exploration = 0u;
+    double exploration_probability = 0.0;
+    if (bootstrap_index >= 0) {
+        selected_index = bootstrap_index;
+        exploration = context->observations != 0u ? 1u : 0u;
+        exploration_probability = exploration ? 1.0 : 0.0;
+        context->locked = 0u;
+    } else if (locked_index >= 0) {
+        selected_index = locked_index;
+    } else {
+        context->locked = 0u;
+        exploration_probability =
+            1.0 / (double)(context->bin_index ? context->bin_index : 1u);
+        if (exploration_probability > 0.10) {
+            exploration_probability = 0.10;
+        }
+        if (context->observations != 0u) {
+            const double unit =
+                (double)(ds4_dspark_nightjar_random(&context->rng) >> 11u) *
+                (1.0 / 9007199254740992.0);
+            exploration = unit < exploration_probability ? 1u : 0u;
+        }
+
+        if (exploration) {
+            uint32_t safe[DS4_DSPARK_NIGHTJAR_MAX_ARMS];
+            uint32_t safe_count = 0u;
+            double current_loss[DS4_DSPARK_NIGHTJAR_MAX_ARMS];
+            double best_current = DBL_MAX;
+            int best_current_index = -1;
+            for (uint32_t i = 0; i < candidate_count; i++) {
+                ds4_dspark_nightjar_arm *slot =
+                    ds4_dspark_nightjar_arm_get(
+                            context, candidates[i].arm, 1);
+                if (!slot) return 1;
+                double loss = ds4_dspark_nightjar_arm_loss(
+                        slot, candidates[i].predicted_loss);
+                if (context->previous_valid &&
+                    context->previous_arm == 0u &&
+                    candidates[i].arm != 0u) {
+                    loss += candidates[i].switch_loss;
+                }
+                current_loss[i] = loss;
+                if (loss < best_current ||
+                    (loss == best_current &&
+                     (best_current_index < 0 ||
+                      candidates[i].arm <
+                          candidates[best_current_index].arm))) {
+                    best_current = loss;
+                    best_current_index = (int)i;
+                }
+            }
+            if (best_current_index < 0) return 1;
+            const double limit = best_current * safe_ratio;
+            for (uint32_t i = 0; i < candidate_count; i++) {
+                if (current_loss[i] <= limit) {
+                    safe[safe_count++] = i;
+                }
+            }
+            if (safe_count == 0u) return 1;
+            const uint32_t best_arm =
+                candidates[best_current_index].arm;
+            uint32_t best_distance = UINT32_MAX;
+            uint64_t fewest_samples = UINT64_MAX;
+            double neighbor_loss = DBL_MAX;
+            for (uint32_t i = 0; i < safe_count; i++) {
+                const uint32_t index = safe[i];
+                const uint32_t arm = candidates[index].arm;
+                if ((int)index == best_current_index) continue;
+                const uint32_t distance = arm > best_arm
+                    ? arm - best_arm : best_arm - arm;
+                ds4_dspark_nightjar_arm *slot =
+                    ds4_dspark_nightjar_arm_get(context, arm, 1);
+                if (!slot) return 1;
+                if (distance < best_distance ||
+                    (distance == best_distance &&
+                     slot->samples < fewest_samples) ||
+                    (distance == best_distance &&
+                     slot->samples == fewest_samples &&
+                     current_loss[index] < neighbor_loss)) {
+                    selected_index = (int)index;
+                    best_distance = distance;
+                    fewest_samples = slot->samples;
+                    neighbor_loss = current_loss[index];
+                }
+            }
+            if (selected_index < 0) {
+                selected_index = best_current_index;
+                exploration = 0u;
+            }
+        } else {
+            double best_loss = DBL_MAX;
+            uint64_t best_samples = 0u;
+            for (uint32_t i = 0; i < candidate_count; i++) {
+                ds4_dspark_nightjar_arm *slot =
+                    ds4_dspark_nightjar_arm_get(
+                            context, candidates[i].arm, 1);
+                if (!slot) return 1;
+                double loss = ds4_dspark_nightjar_arm_loss(
+                        slot, candidates[i].predicted_loss);
+                if (context->previous_valid &&
+                    context->previous_arm == 0u &&
+                    candidates[i].arm != 0u) {
+                    loss += candidates[i].switch_loss;
+                }
+                if (loss < best_loss ||
+                    (loss == best_loss && slot->samples > best_samples) ||
+                    (loss == best_loss && slot->samples == best_samples &&
+                     (selected_index < 0 ||
+                      candidates[i].arm <
+                          candidates[selected_index].arm))) {
+                    selected_index = (int)i;
+                    best_loss = loss;
+                    best_samples = slot->samples;
+                }
+            }
+        }
+        if (selected_index < 0) return 1;
+        context->locked_arm = candidates[selected_index].arm;
+    }
+
+    ds4_dspark_nightjar_arm *selected =
+        ds4_dspark_nightjar_arm_get(
+                context, candidates[selected_index].arm, 1);
+    if (!selected) return 1;
+    if (context->observations != 0u && selected->samples == 0u) {
+        exploration = 1u;
+    }
+    /* A new arm gets two real observations before it can own a bin, whether
+     * it arrived through random exploration or because its prior became the
+     * best prediction after a phase change. */
+    context->locked = selected->samples >= 2u && !exploration;
+    double estimated = ds4_dspark_nightjar_arm_loss(
+            selected, candidates[selected_index].predicted_loss);
+    if (context->previous_valid &&
+        context->previous_arm == 0u &&
+        candidates[selected_index].arm != 0u) {
+        estimated += candidates[selected_index].switch_loss;
+    }
+    decision->arm = candidates[selected_index].arm;
+    decision->exploration = exploration;
+    decision->locked = reused_lock;
+    decision->revoked = context->revoked_pending;
+    context->revoked_pending = 0u;
+    decision->block_index = context->block_index;
+    decision->bin_index = context->bin_index;
+    decision->round_in_bin = context->round_in_bin + 1u;
+    decision->arm_samples = selected->samples > UINT32_MAX
+        ? UINT32_MAX : (uint32_t)selected->samples;
+    decision->estimated_loss = estimated;
+    decision->exploration_probability = exploration_probability;
+
+    context->previous_arm = decision->arm;
+    context->previous_valid = 1u;
+    context->round_in_bin++;
+    const uint32_t span =
+        ds4_dspark_nightjar_bin_span(context->block_horizon);
+    if (context->round_in_bin >= span) {
+        context->round_in_bin = 0u;
+        context->locked = 0u;
+        context->bin_index++;
+        if (context->bin_index > span) {
+            context->block_index++;
+            if (context->block_horizon <= UINT64_MAX / 2u) {
+                context->block_horizon *= 2u;
+            }
+            context->bin_index = 1u;
+        }
+    }
+    return 0;
+}
+
+int ds4_dspark_nightjar_observe(
+        ds4_dspark_nightjar_state *state,
+        uint64_t context_key,
+        uint32_t arm,
+        double latency_seconds,
+        uint32_t emitted_tokens) {
+    if (!state || !(latency_seconds > 0.0) ||
+        !isfinite(latency_seconds) || emitted_tokens == 0u) {
+        return 1;
+    }
+    ds4_dspark_nightjar_context *context =
+        ds4_dspark_nightjar_context_get(state, context_key, 0);
+    if (!context) return 1;
+    ds4_dspark_nightjar_arm *slot =
+        ds4_dspark_nightjar_arm_get(context, arm, 0);
+    if (!slot) return 1;
+    slot->samples++;
+    slot->total_latency += latency_seconds;
+    slot->total_tokens += emitted_tokens;
+    slot->mean_loss = slot->total_tokens != 0u
+        ? slot->total_latency / (double)slot->total_tokens
+        : 0.0;
+    const double sample_loss = latency_seconds / (double)emitted_tokens;
+    const double alpha = slot->recent_samples < 4u ? 0.5 : 0.25;
+    slot->recent_loss = slot->recent_samples == 0u
+        ? sample_loss
+        : slot->recent_loss * (1.0 - alpha) + sample_loss * alpha;
+    slot->recent_samples++;
+    context->observations++;
+
+    if (context->locked && context->locked_arm == arm) {
+        double best_other = DBL_MAX;
+        for (uint32_t i = 0; i < DS4_DSPARK_NIGHTJAR_MAX_ARMS; i++) {
+            const ds4_dspark_nightjar_arm *candidate = &context->arm[i];
+            if (!candidate->in_use || candidate->arm == arm ||
+                candidate->samples == 0u) {
+                continue;
+            }
+            const double loss = ds4_dspark_nightjar_arm_loss(candidate, 0.0);
+            if (loss > 0.0 && loss < best_other) best_other = loss;
+        }
+        const double selected_loss =
+            ds4_dspark_nightjar_arm_loss(slot, 0.0);
+        double abort_ratio = context->safe_ratio;
+        if (!(abort_ratio >= 1.0) || !isfinite(abort_ratio)) {
+            abort_ratio = 1.08;
+        }
+        if (abort_ratio > 1.08) abort_ratio = 1.08;
+        if (best_other < DBL_MAX && selected_loss > 0.0 &&
+            selected_loss > best_other * abort_ratio) {
+            context->locked = 0u;
+            context->revoked_pending = 1u;
+        }
+    }
+    return 0;
+}
+
 void ds4_dspark_scheduler_state_reset(
         ds4_dspark_scheduler_state *state) {
     if (state) memset(state, 0, sizeof(*state));
@@ -368,6 +865,29 @@ void ds4_dspark_scheduler_state_reset_history(
     memset(state->entries, 0, sizeof(state->entries));
     state->entry_count = 0u;
     state->step = step;
+}
+
+int ds4_dspark_scheduler_peek_delayed_request(
+        const ds4_dspark_scheduler_state *state,
+        uint64_t request_id,
+        ds4_dspark_schedule_request *request) {
+    if (!state || !request || request_id == 0u) return 1;
+    const uint64_t current_step = state->step + 1u;
+    const uint64_t capacity_step =
+        current_step > 2u ? current_step - 2u : 0u;
+    if (capacity_step == 0u) return 1;
+    for (uint32_t i = 0; i < DS4_DSPARK_SCHEDULER_MAX_REQUESTS; i++) {
+        const ds4_dspark_scheduler_entry *entry = &state->entries[i];
+        if (!entry->in_use || entry->request_id != request_id) continue;
+        for (uint32_t h = 0; h < entry->history_count; h++) {
+            if (entry->history_step[h] == capacity_step) {
+                *request = entry->history[h];
+                return 0;
+            }
+        }
+        return 1;
+    }
+    return 1;
 }
 
 int ds4_dspark_should_confirm_physical(

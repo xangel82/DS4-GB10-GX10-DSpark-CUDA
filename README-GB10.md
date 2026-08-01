@@ -849,11 +849,15 @@ In media 29,20 dei 43 layer attention per ciclo sono stati eseguiti dal percorso
 fisico. Il prefill non e' regredito: un prompt da 23.335 token ha mantenuto
 1.001,38 t/s.
 
-La stessa misura identifica il prossimo limite: l'acceptance complessiva e'
-stata 60,59% e 2.310 dei 7.675 cicli neurali, circa il 30%, hanno verificato
-soltanto K=1, ottenendo 4,821 t/s. Il batching multi-sessione non e' piu' il
-primo collo di bottiglia; lo sono ora le decisioni conservative K=1 e il target
-verifier, che occupa in media 251,54 ms dei 277,54 ms del ciclo.
+La stessa misura aveva inizialmente attribuito 4,821 t/s alle 2.310 lane K=1
+dei 7.675 cicli neurali. L'audit successivo ha chiarito che questo non era il
+throughput delle coorti K=1: ogni riga per-lane riportava l'intero tempo della
+coorte R2/R3, mentre altre lane dello stesso batch potevano usare K2/K3. Nei
+run controllati, per esempio, 78 lane R3 erano K1 ma soltanto due coorti
+avevano budget aggregato B=1. L'analizzatore distingue ora esplicitamente il K
+della lane dal budget B e dal throughput aggregato della coorte. Il target
+verifier resta invece un limite reale: occupava in media 251,54 ms dei 277,54
+ms del ciclo.
 
 Il default e':
 

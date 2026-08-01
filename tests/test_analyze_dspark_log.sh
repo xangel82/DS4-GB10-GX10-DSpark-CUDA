@@ -43,10 +43,10 @@ printf '%s\n' \
   'ds4: dspark nightjar reward R=2 bucket=1 context=0000000101000201 gamma=3 emitted=7 latency=40.000000 ms/token pure_neural=1' \
   'ds4: dspark nightjar reward R=2 bucket=1 context=0000000101000201 budget=2 selected_budget=3 guarded=1 emitted=3 latency=20.000000 ms/token pure_neural=1' \
   'ds4: dspark coordinator mode=physical R=2 scheduled_batch=8 physical_rate=25.00 serial_batch=8 serial_rate=18.18 physical_samples=2 serial_samples=2 physical_shape_samples=2 serial_shape_samples=2 bucket=0 shape_mature=1 step=7 reason=predicted' \
-  'ds4: dspark cohort timing cohort=7 requested_r=2 executor=physical fallback=none drafted=6 committed=4 emitted=7 rows=8 wait_us=1000 draft=40.000 ms verify=240.000 ms total=280.000 ms' \
+  'ds4: dspark cohort timing cohort=7 requested_r=2 executor=physical fallback=none path=neural drafted=6 committed=4 emitted=7 rows=8 wait_us=1000 draft=40.000 ms verify=240.000 ms total=280.000 ms' \
   'ds4: dspark admission R=2 executor=serial batch=8 capacity_batch=8 capacity_age=2 expected=6.0 rate=18.18 capacity_rate=18.18 hw_prefix=3,3 sps_curve=lane-model physical_curve=generic serial_curve=lane-model shape_curve=5/5 physical_prefix=3,3 serial_prefix=3,3 conditional=0.8/0.8' \
   'ds4: dspark coordinator mode=serial R=2 scheduled_batch=8 physical_rate=17.00 serial_batch=8 serial_rate=18.18 physical_samples=2 serial_samples=2 physical_shape_samples=2 serial_shape_samples=2 bucket=0 shape_mature=1 step=8 reason=predicted' \
-  'ds4: dspark cohort timing cohort=8 requested_r=2 executor=serial fallback=none drafted=6 committed=3 emitted=6 rows=8 wait_us=2000 draft=40.000 ms verify=290.000 ms total=330.000 ms' \
+  'ds4: dspark cohort timing cohort=8 requested_r=2 executor=serial fallback=none path=neural drafted=6 committed=3 emitted=6 rows=8 wait_us=2000 draft=40.000 ms verify=290.000 ms total=330.000 ms' \
   'ds4-server: decode summary req=chatcmpl-1 kind=chat prompt=128 gen=100 seconds=10.000000 tps=10.000 finish=stop' \
   >"$LOG"
 
@@ -58,6 +58,9 @@ grep -Fq 'rendezvous R=2 n=2 mean=1.500ms max=2.000ms' "$OUT"
 grep -Fq 'Cohort aggregate throughput: 21.311 t/s' "$OUT"
 grep -Fq 'physical R=2 n=1 aggregate=25.000t/s accept=66.67% rows=8.000' "$OUT"
 grep -Fq 'serial R=2 n=1 aggregate=18.182t/s accept=50.00% rows=8.000' "$OUT"
+grep -Fq 'Pure-neural cohort budgets (aggregate B, not lane K):' "$OUT"
+grep -Fq 'physical R=2 B=6 n=1 aggregate=25.000t/s accept=66.67%' "$OUT"
+grep -Fq 'serial R=2 B=6 n=1 aggregate=18.182t/s accept=50.00%' "$OUT"
 grep -Fq 'Coordinator dispatch reasons: predicted=2' "$OUT"
 grep -Fq 'dispatch physical R=2 reason=predicted n=1' "$OUT"
 grep -Fq 'dispatch serial R=2 reason=predicted n=1' "$OUT"

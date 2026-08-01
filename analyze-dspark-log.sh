@@ -221,6 +221,8 @@ function text_value(prefix,    i,a) {
   cohort_n++
   cohort_executor = text_value("executor")
   if (cohort_executor == "") cohort_executor = "unknown"
+  cohort_path = text_value("path")
+  if (cohort_path == "") cohort_path = "unknown"
   cohort_fallback = text_value("fallback")
   if (cohort_fallback == "") cohort_fallback = "none"
   cohort_r = value("requested_r")
@@ -281,6 +283,21 @@ function text_value(prefix,    i,a) {
     }
     if (cohort_total_value >= 0) {
       cohort_by_key_total_ms[cohort_key] += cohort_total_value
+    }
+    # A lane-local K is not a cohort throughput measurement: every lane log
+    # carries the complete overlapping cohort time.  Track the aggregate
+    # neural budget B from the one cohort record instead.
+    if (cohort_path == "neural" &&
+        cohort_drafted_value >= 0 && cohort_drafted_value <= 64) {
+      cohort_budget_key = cohort_executor SUBSEP cohort_r SUBSEP cohort_drafted_value
+      cohort_budget_n[cohort_budget_key]++
+      cohort_budget_emitted[cohort_budget_key] += cohort_emitted_value
+      cohort_budget_committed[cohort_budget_key] += cohort_committed_value
+      cohort_budget_drafted[cohort_budget_key] += cohort_drafted_value
+      cohort_budget_total_ms[cohort_budget_key] += cohort_total_value
+      if (cohort_drafted_value > cohort_budget_max) {
+        cohort_budget_max = cohort_drafted_value
+      }
     }
   }
 }
@@ -689,6 +706,29 @@ END {
         printf "  %s R=%d n=%d aggregate=%.3ft/s accept=%.2f%% rows=%.3f\n",
                executor, rr, cohort_by_key_n[cohort_key],
                aggregate_rate, accept_rate, average_rows
+      }
+    }
+    if (cohort_budget_max >= 0) {
+      printf "Pure-neural cohort budgets (aggregate B, not lane K):\n"
+      for (rr = 1; rr <= cohort_max_r; rr++) {
+        for (budget = 0; budget <= cohort_budget_max; budget++) {
+          for (executor_index = 1; executor_index <= 2; executor_index++) {
+            if (executor_index == 1) executor = "physical"
+            else executor = "serial"
+            cohort_budget_key = executor SUBSEP rr SUBSEP budget
+            if (cohort_budget_n[cohort_budget_key] == 0) continue
+            budget_rate = cohort_budget_total_ms[cohort_budget_key] > 0 \
+              ? 1000.0 * cohort_budget_emitted[cohort_budget_key] / \
+                  cohort_budget_total_ms[cohort_budget_key] : 0.0
+            budget_accept = cohort_budget_drafted[cohort_budget_key] > 0 \
+              ? 100.0 * cohort_budget_committed[cohort_budget_key] / \
+                  cohort_budget_drafted[cohort_budget_key] : 0.0
+            printf "  %s R=%d B=%d n=%d aggregate=%.3ft/s accept=%.2f%%\n",
+                   executor, rr, budget,
+                   cohort_budget_n[cohort_budget_key],
+                   budget_rate, budget_accept
+          }
+        }
       }
     }
     printf "Cohort fallback reasons:"

@@ -5081,6 +5081,14 @@ static bool request_exceeds_context(const request *r, int ctx_size) {
     return r && r->prompt.len >= ctx_size;
 }
 
+static void request_clamp_max_tokens(request *r, int server_max_tokens) {
+    /* Some OpenAI-compatible clients use the provider's theoretical output
+     * limit when a per-model limit is not configured.  Keep an explicit
+     * request within the same completion limit advertised by /v1/models. */
+    if (!r || server_max_tokens <= 0) return;
+    if (r->max_tokens > server_max_tokens) r->max_tokens = server_max_tokens;
+}
+
 static bool request_exceeds_context_budget(const request *r, int ctx_size) {
     if (request_exceeds_context(r, ctx_size)) return true;
     if (!r || r->max_tokens <= 0) return false;
@@ -5101,10 +5109,20 @@ static bool http_error_context_length_exceeded(int fd, bool enable_cors,
                                                int n_prompt_tokens,
                                                int ctx_size) {
     buf b = {0};
-    char msg[160];
-    snprintf(msg, sizeof(msg),
-             "Prompt has %d tokens, but the configured context size is %d tokens",
-             n_prompt_tokens, ctx_size);
+    char msg[256];
+    const int max_tokens = r && r->max_tokens > 0 ? r->max_tokens : 0;
+    const int64_t n_requested_tokens =
+        (int64_t)n_prompt_tokens + (int64_t)max_tokens;
+    if (max_tokens > 0) {
+        snprintf(msg, sizeof(msg),
+                 "Prompt has %d tokens and max_tokens is %d (%lld total), but the configured context size is %d tokens",
+                 n_prompt_tokens, max_tokens,
+                 (long long)n_requested_tokens, ctx_size);
+    } else {
+        snprintf(msg, sizeof(msg),
+                 "Prompt has %d tokens, but the configured context size is %d tokens",
+                 n_prompt_tokens, ctx_size);
+    }
 
     if (r && r->api == API_ANTHROPIC) {
         buf_puts(&b, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":");
@@ -5113,6 +5131,10 @@ static bool http_error_context_length_exceeded(int fd, bool enable_cors,
         buf_printf(&b, "%d", n_prompt_tokens);
         buf_puts(&b, ",\"n_ctx\":");
         buf_printf(&b, "%d", ctx_size);
+        buf_puts(&b, ",\"max_tokens\":");
+        buf_printf(&b, "%d", max_tokens);
+        buf_puts(&b, ",\"n_requested_tokens\":");
+        buf_printf(&b, "%lld", (long long)n_requested_tokens);
         buf_puts(&b, "}}\n");
     } else {
         buf_puts(&b, "{\"error\":{\"message\":");
@@ -5123,6 +5145,10 @@ static bool http_error_context_length_exceeded(int fd, bool enable_cors,
         buf_printf(&b, "%d", n_prompt_tokens);
         buf_puts(&b, ",\"n_ctx\":");
         buf_printf(&b, "%d", ctx_size);
+        buf_puts(&b, ",\"max_tokens\":");
+        buf_printf(&b, "%d", max_tokens);
+        buf_puts(&b, ",\"n_requested_tokens\":");
+        buf_printf(&b, "%lld", (long long)n_requested_tokens);
         buf_puts(&b, "}}\n");
     }
     bool ok = http_response(fd, enable_cors, 400, "application/json", b.ptr);
@@ -13491,6 +13517,7 @@ static void *client_main(void *arg) {
         free(req.model);
         req.model = xstrdup(server_model_id_from_engine(s->engine));
     }
+    request_clamp_max_tokens(&req, s->default_tokens);
     if (request_exceeds_context_budget(&req, request_ctx_size)) {
         http_error_context_length_exceeded(fd, s->enable_cors, &req,
                                            req.prompt.len, request_ctx_size);
@@ -14603,6 +14630,11 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
     TEST_ASSERT(request_exceeds_context_budget(&r, 140083));
     r.max_tokens = 1000;
     TEST_ASSERT(!request_exceeds_context_budget(&r, 140083));
+    r.prompt.len = 9070;
+    r.max_tokens = 256000;
+    request_clamp_max_tokens(&r, 2200);
+    TEST_ASSERT(r.max_tokens == 2200);
+    TEST_ASSERT(!request_exceeds_context_budget(&r, 222822));
     r.prompt.len = 16;
 
     int sv[2];
@@ -14617,6 +14649,8 @@ static void test_context_length_error_uses_protocol_standard_shape(void) {
         TEST_ASSERT(strstr(out, "\"param\":\"messages\"") != NULL);
         TEST_ASSERT(strstr(out, "\"n_prompt_tokens\":16") != NULL);
         TEST_ASSERT(strstr(out, "\"n_ctx\":16") != NULL);
+        TEST_ASSERT(strstr(out, "\"max_tokens\":2200") != NULL);
+        TEST_ASSERT(strstr(out, "\"n_requested_tokens\":2216") != NULL);
         free(out);
         close(sv[0]);
         close(sv[1]);

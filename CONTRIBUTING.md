@@ -5,6 +5,9 @@ affect. The project has two regression tracks: correctness and speed. Please
 include the commands you ran, the machine/backend, the model quant, and any
 notable failures in the PR or commit notes.
 
+People whose code, measurements, bug reports, or technical analysis materially
+improved the project are recorded in [CONTRIBUTORS.md](CONTRIBUTORS.md).
+
 Do not send PRs affecting one or more inference backends without checking if the
 resulting code is still correct and fast. The only acceptable regression speed
 is when an important correctness bug is fixed and it requires some speed penalty.

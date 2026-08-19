@@ -1919,6 +1919,44 @@ DS4_CUDA_MTP_GRAPH_SMALL_RESERVE=8
 limite globale. I due topology slot per variante restano invariati e possono
 essere disabilitati separatamente con il rollback già indicato sopra.
 
+La causa non e' una perdita di memoria di `cudaGraphExecDestroy`: gli
+eseguibili venivano conservati correttamente, ma il riuso LRU era limitato agli
+slot della singola variante e non poneva alcun tetto alla somma delle varianti.
+Il costo di ogni graph exec cresce inoltre con il contesto, quindi una cache
+che si riempie gradualmente puo' occupare diversi GiB di UMA prima di
+raggiungere il proprio limite strutturale. Il budget globale interviene sulla
+causa mantenendo invariata la cache locale per variante.
+
+#### Validazione Athena del 19 agosto 2026
+
+Il percorso e' stato verificato prima con un limite forzato di due eseguibili,
+che ha esercitato ripetutamente l'espulsione cross-variant senza superare il
+budget, e poi con la configurazione di produzione `slru`, 24 eseguibili e
+riserva piccola pari a 8.
+
+| Verifica | Risultato |
+| --- | ---: |
+| Build e suite `cuda-regression` SM121a | superate |
+| Stress test `max-live=2` | limite rispettato, richiesta completata |
+| Test operativo multi-agente | 6954 cicli DSpark |
+| Acceptance verifier | 65,76% |
+| Graph exec vivi / picco | 7 / 7 |
+| Errori CUDA Graph / OOM | 0 / 0 |
+| RSS / HWM del server | circa 800 / 823 MiB |
+| Swap del processo | 0 |
+
+Nel test operativo non sono avvenute espulsioni perche' i sette grafi vivi
+erano ancora sotto il budget di 24; questo e' il comportamento atteso. Il test
+forzato ha invece verificato il ramo di eviction. La politica modifica soltanto
+la residenza degli eseguibili compilati e non cambia matematica del modello,
+KV, sampling o stato delle sessioni.
+
+La diagnosi della crescita cross-variant e le misurazioni che hanno distinto
+la saturazione della cache da un leak del driver sono state fornite da
+[`avisual`](https://github.com/avisual) nella
+[#3](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA/issues/3).
+Il contributo e' registrato anche in [CONTRIBUTORS.md](CONTRIBUTORS.md).
+
 ### Risultato A/B Athena del 22 luglio 2026
 
 Un confronto sul server reale con telemetria attiva ha misurato il candidato

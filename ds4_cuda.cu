@@ -284,6 +284,12 @@ static cudaGraphExec_t
 static uint64_t
     g_mtp_graph_exec_last_used[DS4_CUDA_MTP_GRAPH_VARIANTS]
                               [DS4_CUDA_MTP_GRAPH_TOPOLOGY_SLOTS];
+static uint32_t
+    g_mtp_graph_exec_node_count[DS4_CUDA_MTP_GRAPH_VARIANTS]
+                               [DS4_CUDA_MTP_GRAPH_TOPOLOGY_SLOTS];
+static unsigned char
+    g_mtp_graph_exec_protected[DS4_CUDA_MTP_GRAPH_VARIANTS]
+                              [DS4_CUDA_MTP_GRAPH_TOPOLOGY_SLOTS];
 static uint32_t g_mtp_graph_capture_variant;
 static int g_mtp_graph_capturing;
 static uint32_t g_mtp_graph_warm_mask;
@@ -300,7 +306,206 @@ static uint64_t g_mtp_graph_updates;
 static uint64_t g_mtp_graph_rebuilds;
 static uint64_t g_mtp_graph_topology_reuses;
 static uint64_t g_mtp_graph_use_clock;
+/* Bound driver-owned graph memory across all speculative families. Newly
+ * instantiated topologies stay in probation until a successful update proves
+ * reuse; the small-graph quota protects cheap drafter variants from large
+ * verifier scans. */
+static uint64_t g_mtp_graph_cache_evictions;
+static uint64_t g_mtp_graph_cache_probation_evictions;
+static uint64_t g_mtp_graph_cache_protected_evictions;
+static uint64_t g_mtp_graph_cache_small_evictions;
+static uint64_t g_mtp_graph_cache_large_evictions;
+static uint32_t g_mtp_graph_cache_live;
+static uint32_t g_mtp_graph_cache_peak_live;
+static int g_mtp_graph_cache_config_ready;
+static int g_mtp_graph_cache_segmented = 1;
+static uint32_t g_mtp_graph_cache_max_live = 24u;
+static uint32_t g_mtp_graph_cache_small_reserve = 8u;
+enum { DS4_CUDA_MTP_GRAPH_SMALL_NODE_LIMIT = 512u };
 static void cuda_mtp_graph_release(void);
+static uint32_t cuda_mtp_graph_family_bit(uint32_t variant);
+
+static uint32_t cuda_mtp_graph_parse_limit(const char *name,
+                                           uint32_t fallback) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return fallback;
+    char *end = NULL;
+    errno = 0;
+    const unsigned long value = strtoul(env, &end, 10);
+    if (errno != 0 || end == env || *end != '\0' || value > UINT32_MAX) {
+        fprintf(stderr,
+                "ds4: ignoring invalid %s=%s (expected an unsigned integer)\n",
+                name, env);
+        return fallback;
+    }
+    return (uint32_t)value;
+}
+
+static void cuda_mtp_graph_cache_configure(void) {
+    if (g_mtp_graph_cache_config_ready) return;
+    g_mtp_graph_cache_config_ready = 1;
+
+    const char *policy = getenv("DS4_CUDA_MTP_GRAPH_CACHE_POLICY");
+    if (policy && (!strcmp(policy, "legacy") ||
+                   !strcmp(policy, "unbounded"))) {
+        g_mtp_graph_cache_max_live = UINT32_MAX;
+        g_mtp_graph_cache_segmented = 0;
+        return;
+    }
+    if (policy && !strcmp(policy, "lru")) {
+        g_mtp_graph_cache_segmented = 0;
+    } else if (policy && strcmp(policy, "slru") != 0) {
+        fprintf(stderr,
+                "ds4: ignoring invalid DS4_CUDA_MTP_GRAPH_CACHE_POLICY=%s "
+                "(expected slru, lru or legacy)\n",
+                policy);
+    }
+
+    g_mtp_graph_cache_max_live = cuda_mtp_graph_parse_limit(
+            "DS4_CUDA_MTP_GRAPH_MAX_LIVE", 24u);
+    if (g_mtp_graph_cache_max_live == 0u) {
+        g_mtp_graph_cache_max_live = UINT32_MAX;
+        return;
+    }
+    const uint32_t physical_max =
+        DS4_CUDA_MTP_GRAPH_VARIANTS * DS4_CUDA_MTP_GRAPH_TOPOLOGY_SLOTS;
+    if (g_mtp_graph_cache_max_live > physical_max) {
+        g_mtp_graph_cache_max_live = physical_max;
+    }
+    if (g_mtp_graph_cache_max_live < 2u) {
+        g_mtp_graph_cache_max_live = 2u;
+    }
+    g_mtp_graph_cache_small_reserve = cuda_mtp_graph_parse_limit(
+            "DS4_CUDA_MTP_GRAPH_SMALL_RESERVE", 8u);
+    if (g_mtp_graph_cache_small_reserve >= g_mtp_graph_cache_max_live) {
+        g_mtp_graph_cache_small_reserve =
+            g_mtp_graph_cache_max_live > 1u
+                ? g_mtp_graph_cache_max_live - 1u
+                : 0u;
+    }
+}
+
+static bool cuda_mtp_graph_cache_slot_small(uint32_t variant,
+                                             uint32_t slot) {
+    return g_mtp_graph_exec_node_count[variant][slot] <=
+           DS4_CUDA_MTP_GRAPH_SMALL_NODE_LIMIT;
+}
+
+static void cuda_mtp_graph_cache_clear_slot(uint32_t variant,
+                                             uint32_t slot) {
+    g_mtp_graph_exec[variant][slot] = NULL;
+    g_mtp_graph_exec_last_used[variant][slot] = 0;
+    g_mtp_graph_exec_node_count[variant][slot] = 0;
+    g_mtp_graph_exec_protected[variant][slot] = 0;
+}
+
+static void cuda_mtp_graph_cache_note_insert(void) {
+    g_mtp_graph_cache_live++;
+    if (g_mtp_graph_cache_live > g_mtp_graph_cache_peak_live) {
+        g_mtp_graph_cache_peak_live = g_mtp_graph_cache_live;
+    }
+}
+
+static bool cuda_mtp_graph_cache_evict_for_insert(uint32_t keep_variant,
+                                                   size_t new_node_count) {
+    cuda_mtp_graph_cache_configure();
+    if (g_mtp_graph_cache_max_live == UINT32_MAX ||
+        g_mtp_graph_cache_live < g_mtp_graph_cache_max_live) {
+        return false;
+    }
+
+    uint32_t small_live = 0;
+    for (uint32_t variant = 0;
+         variant < DS4_CUDA_MTP_GRAPH_VARIANTS; variant++) {
+        for (uint32_t slot = 0;
+             slot < DS4_CUDA_MTP_GRAPH_TOPOLOGY_SLOTS; slot++) {
+            if (g_mtp_graph_exec[variant][slot] &&
+                cuda_mtp_graph_cache_slot_small(variant, slot)) {
+                small_live++;
+            }
+        }
+    }
+
+    const bool new_small =
+        new_node_count <= DS4_CUDA_MTP_GRAPH_SMALL_NODE_LIMIT;
+    /* Fill the small quota before replacing one of its entries. Large graphs
+     * borrow every otherwise unused slot but preferentially replace peers. */
+    const bool evict_small = new_small &&
+        small_live >= g_mtp_graph_cache_small_reserve;
+    const uint32_t keep_family = cuda_mtp_graph_family_bit(keep_variant);
+    uint32_t victim_variant = DS4_CUDA_MTP_GRAPH_VARIANTS;
+    uint32_t victim_slot = DS4_CUDA_MTP_GRAPH_TOPOLOGY_SLOTS;
+    uint32_t best_class_rank = UINT32_MAX;
+    uint32_t best_family_rank = UINT32_MAX;
+    uint32_t best_protected_rank = UINT32_MAX;
+    uint64_t best_age = UINT64_MAX;
+
+    for (uint32_t variant = 0;
+         variant < DS4_CUDA_MTP_GRAPH_VARIANTS; variant++) {
+        if (variant == keep_variant) continue;
+        for (uint32_t slot = 0;
+             slot < DS4_CUDA_MTP_GRAPH_TOPOLOGY_SLOTS; slot++) {
+            if (!g_mtp_graph_exec[variant][slot]) continue;
+            const bool candidate_small =
+                cuda_mtp_graph_cache_slot_small(variant, slot);
+            const uint32_t class_rank =
+                candidate_small == evict_small ? 0u : 1u;
+            const uint32_t family_rank =
+                cuda_mtp_graph_family_bit(variant) == keep_family ? 1u : 0u;
+            const uint32_t protected_rank =
+                g_mtp_graph_cache_segmented &&
+                g_mtp_graph_exec_protected[variant][slot] ? 1u : 0u;
+            const uint64_t age = g_mtp_graph_exec_last_used[variant][slot];
+            if (class_rank > best_class_rank ||
+                (class_rank == best_class_rank &&
+                 protected_rank > best_protected_rank) ||
+                (class_rank == best_class_rank &&
+                 protected_rank == best_protected_rank &&
+                 family_rank > best_family_rank) ||
+                (class_rank == best_class_rank &&
+                 protected_rank == best_protected_rank &&
+                 family_rank == best_family_rank &&
+                 age >= best_age)) {
+                continue;
+            }
+            victim_variant = variant;
+            victim_slot = slot;
+            best_class_rank = class_rank;
+            best_family_rank = family_rank;
+            best_protected_rank = protected_rank;
+            best_age = age;
+        }
+    }
+    if (victim_variant == DS4_CUDA_MTP_GRAPH_VARIANTS) return false;
+
+    const bool victim_small =
+        cuda_mtp_graph_cache_slot_small(victim_variant, victim_slot);
+    const bool victim_protected =
+        g_mtp_graph_exec_protected[victim_variant][victim_slot] != 0;
+    (void)cudaGraphExecDestroy(
+            g_mtp_graph_exec[victim_variant][victim_slot]);
+    cuda_mtp_graph_cache_clear_slot(victim_variant, victim_slot);
+    if (g_mtp_graph_cache_live != 0u) g_mtp_graph_cache_live--;
+    g_mtp_graph_cache_evictions++;
+    if (victim_protected) g_mtp_graph_cache_protected_evictions++;
+    else g_mtp_graph_cache_probation_evictions++;
+    if (victim_small) g_mtp_graph_cache_small_evictions++;
+    else g_mtp_graph_cache_large_evictions++;
+
+    if (g_mtp_graph_cache_evictions == 1u ||
+        (getenv("DS4_CUDA_MTP_GRAPH_VERBOSE") != NULL &&
+         (g_mtp_graph_cache_evictions % 64u) == 0u)) {
+        fprintf(stderr,
+                "ds4: CUDA speculative graph cache eviction variant=%u "
+                "slot=%u class=%s segment=%s live=%u/%u\n",
+                victim_variant, victim_slot,
+                victim_small ? "small" : "large",
+                victim_protected ? "protected" : "probation",
+                g_mtp_graph_cache_live,
+                g_mtp_graph_cache_max_live);
+    }
+    return true;
+}
 static uint32_t cuda_mtp_graph_topology_slots(uint32_t variant) {
     /* Only DSpark verifier variants 16..55 exhibited the alternating
      * topology.  MTP and DSpark drafter graphs retain their original single
@@ -3718,9 +3923,11 @@ static void cuda_mtp_graph_release_family(uint32_t family) {
              slot < DS4_CUDA_MTP_GRAPH_TOPOLOGY_SLOTS; slot++) {
             if (g_mtp_graph_exec[i][slot]) {
                 (void)cudaGraphExecDestroy(g_mtp_graph_exec[i][slot]);
-                g_mtp_graph_exec[i][slot] = NULL;
+                if (g_mtp_graph_cache_live != 0u) {
+                    g_mtp_graph_cache_live--;
+                }
             }
-            g_mtp_graph_exec_last_used[i][slot] = 0;
+            cuda_mtp_graph_cache_clear_slot(i, slot);
         }
     }
 #else
@@ -3741,9 +3948,8 @@ static void cuda_mtp_graph_release(void) {
              slot < DS4_CUDA_MTP_GRAPH_TOPOLOGY_SLOTS; slot++) {
             if (g_mtp_graph_exec[i][slot]) {
                 (void)cudaGraphExecDestroy(g_mtp_graph_exec[i][slot]);
-                g_mtp_graph_exec[i][slot] = NULL;
             }
-            g_mtp_graph_exec_last_used[i][slot] = 0;
+            cuda_mtp_graph_cache_clear_slot(i, slot);
         }
     }
 #endif
@@ -3760,6 +3966,13 @@ static void cuda_mtp_graph_release(void) {
     g_mtp_graph_rebuilds = 0;
     g_mtp_graph_topology_reuses = 0;
     g_mtp_graph_use_clock = 0;
+    g_mtp_graph_cache_evictions = 0;
+    g_mtp_graph_cache_probation_evictions = 0;
+    g_mtp_graph_cache_protected_evictions = 0;
+    g_mtp_graph_cache_small_evictions = 0;
+    g_mtp_graph_cache_large_evictions = 0;
+    g_mtp_graph_cache_live = 0;
+    g_mtp_graph_cache_peak_live = 0;
 }
 
 static void cuda_token_graph_release(void) {
@@ -3980,10 +4193,23 @@ static int cuda_aux_graph_begin(uint32_t variant, uint32_t pos,
     g_mtp_graph_capture_variant = variant;
     g_mtp_graph_capturing = 1;
     if (!g_mtp_graph_notice) {
-        fprintf(stderr,
-                "ds4: CUDA speculative auxiliary graphs enabled "
-                "(per-thread stream, %u topology variants)\n",
-                (unsigned)DS4_CUDA_MTP_GRAPH_VARIANTS);
+        cuda_mtp_graph_cache_configure();
+        if (g_mtp_graph_cache_max_live == UINT32_MAX) {
+            fprintf(stderr,
+                    "ds4: CUDA speculative auxiliary graphs enabled "
+                    "(per-thread stream, %u topology variants, "
+                    "cache=unbounded)\n",
+                    (unsigned)DS4_CUDA_MTP_GRAPH_VARIANTS);
+        } else {
+            fprintf(stderr,
+                    "ds4: CUDA speculative auxiliary graphs enabled "
+                    "(per-thread stream, %u topology variants, cache=%s "
+                    "max-live=%u small-reserve=%u)\n",
+                    (unsigned)DS4_CUDA_MTP_GRAPH_VARIANTS,
+                    g_mtp_graph_cache_segmented ? "slru" : "lru",
+                    g_mtp_graph_cache_max_live,
+                    g_mtp_graph_cache_small_reserve);
+        }
         g_mtp_graph_notice = 1;
     }
     return 1;
@@ -4154,6 +4380,7 @@ extern "C" int ds4_gpu_mtp_graph_end(void) {
                                       graph, &err)) {
             exec = &g_mtp_graph_exec[variant][slot];
             exec_slot = slot;
+            g_mtp_graph_exec_protected[variant][slot] = 1;
             g_mtp_graph_updates++;
             if (failed_updates != 0) g_mtp_graph_topology_reuses++;
             break;
@@ -4162,6 +4389,31 @@ extern "C" int ds4_gpu_mtp_graph_end(void) {
         (void)cudaGetLastError();
     }
     if (!exec) {
+        exec_slot = slot_count;
+        for (uint32_t slot = 0; slot < slot_count; slot++) {
+            if (!g_mtp_graph_exec[variant][slot]) {
+                exec_slot = slot;
+                break;
+            }
+        }
+        if (exec_slot == slot_count) {
+            exec_slot = 0;
+            for (uint32_t slot = 1; slot < slot_count; slot++) {
+                const bool candidate_protected =
+                    g_mtp_graph_exec_protected[variant][slot] != 0;
+                const bool current_protected =
+                    g_mtp_graph_exec_protected[variant][exec_slot] != 0;
+                if ((current_protected && !candidate_protected) ||
+                    (candidate_protected == current_protected &&
+                     g_mtp_graph_exec_last_used[variant][slot] <
+                     g_mtp_graph_exec_last_used[variant][exec_slot])) {
+                    exec_slot = slot;
+                }
+            }
+        } else {
+            (void)cuda_mtp_graph_cache_evict_for_insert(variant, node_count);
+        }
+
         cudaGraphExec_t new_exec = NULL;
         err = cuda_token_graph_instantiate(&new_exec, graph);
         if (err != cudaSuccess) {
@@ -4181,37 +4433,27 @@ extern "C" int ds4_gpu_mtp_graph_end(void) {
             return 0;
         }
 
-        exec_slot = slot_count;
-        for (uint32_t slot = 0; slot < slot_count; slot++) {
-            if (!g_mtp_graph_exec[variant][slot]) {
-                exec_slot = slot;
-                break;
-            }
-        }
-        if (exec_slot == slot_count) {
-            exec_slot = 0;
-            for (uint32_t slot = 1; slot < slot_count; slot++) {
-                if (g_mtp_graph_exec_last_used[variant][slot] <
-                    g_mtp_graph_exec_last_used[variant][exec_slot]) {
-                    exec_slot = slot;
-                }
-            }
-        }
         const bool replaced = g_mtp_graph_exec[variant][exec_slot] != NULL;
         if (replaced) {
             (void)cudaGraphExecDestroy(
                     g_mtp_graph_exec[variant][exec_slot]);
+        } else {
+            cuda_mtp_graph_cache_note_insert();
         }
         g_mtp_graph_exec[variant][exec_slot] = new_exec;
+        g_mtp_graph_exec_node_count[variant][exec_slot] =
+            node_count > UINT32_MAX ? UINT32_MAX : (uint32_t)node_count;
+        g_mtp_graph_exec_protected[variant][exec_slot] = 0;
         exec = &g_mtp_graph_exec[variant][exec_slot];
         g_mtp_graph_rebuilds++;
         fprintf(stderr,
                 "ds4: CUDA MTP graph variant=%u nodes=%zu topology-slot=%u "
-                "%s\n",
+                "%s cache-live=%u\n",
                 variant,
                 node_count,
                 exec_slot,
-                replaced ? "replaced" : "instantiated");
+                replaced ? "replaced" : "instantiated",
+                g_mtp_graph_cache_live);
     }
     (void)cudaGraphDestroy(graph);
 
@@ -4248,7 +4490,9 @@ extern "C" int ds4_gpu_mtp_graph_end(void) {
         fprintf(stderr,
                 "ds4: CUDA speculative graph launches=%llu mtp_draft=%llu "
                 "mtp_verify=%llu dspark_draft=%llu dspark_verify=%llu "
-                "updates=%llu rebuilds=%llu topology_reuses=%llu\n",
+                "updates=%llu rebuilds=%llu topology_reuses=%llu "
+                "cache_live=%u cache_peak=%u evictions=%llu "
+                "probation=%llu protected=%llu small=%llu large=%llu\n",
                 (unsigned long long)g_mtp_graph_launches,
                 (unsigned long long)g_mtp_graph_draft_launches,
                 (unsigned long long)g_mtp_graph_verifier_launches,
@@ -4256,7 +4500,14 @@ extern "C" int ds4_gpu_mtp_graph_end(void) {
                 (unsigned long long)g_dspark_graph_verifier_launches,
                 (unsigned long long)g_mtp_graph_updates,
                 (unsigned long long)g_mtp_graph_rebuilds,
-                (unsigned long long)g_mtp_graph_topology_reuses);
+                (unsigned long long)g_mtp_graph_topology_reuses,
+                g_mtp_graph_cache_live,
+                g_mtp_graph_cache_peak_live,
+                (unsigned long long)g_mtp_graph_cache_evictions,
+                (unsigned long long)g_mtp_graph_cache_probation_evictions,
+                (unsigned long long)g_mtp_graph_cache_protected_evictions,
+                (unsigned long long)g_mtp_graph_cache_small_evictions,
+                (unsigned long long)g_mtp_graph_cache_large_evictions);
     }
     return 1;
 #endif

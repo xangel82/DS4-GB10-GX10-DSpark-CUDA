@@ -16,6 +16,7 @@ export DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS=524288
 export DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS=65536
 export DS4_ADVERTISE_CONTEXT_PCT=85
 export DS4_MEMORY_PROFILE=balanced
+export DS4_MAX_TOKENS="${DS4_MAX_TOKENS:-16384}"
 
 # Keep experimental checkpoints separate from the recommended 256K profile.
 export DS4_EXPERIMENT_KV_DIR="${DS4_EXPERIMENT_KV_DIR:-/tmp/ds4-gb10-dspark-1m-kv}"

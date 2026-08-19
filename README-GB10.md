@@ -1892,6 +1892,33 @@ Con `DS4_CUDA_DSPARK_GRAPH_VERBOSE=1`, il contatore `topology_reuses` indica
 quante ricostruzioni sono state evitate trovando una topologia compatibile nel
 secondo slot.
 
+### Budget globale degli eseguibili CUDA Graph
+
+I due slot precedenti risolvono il riuso locale, ma non limitano il numero
+complessivo di eseguibili: con 120 varianti il vecchio limite effettivo era 184
+(due slot soltanto per verifier e HybridLC, uno per le altre famiglie).
+Il backend applica ora una cache globale segmentata con un massimo predefinito
+di 24 eseguibili vivi. Le nuove topologie entrano in probation e vengono
+promosse dopo il primo `cudaGraphExecUpdate` riuscito; l'espulsione preferisce
+quindi topologie mai riutilizzate prima di quelle protette. Una riserva morbida
+di otto grafi piccoli evita che drafter e varianti leggere vengano scacciati
+dai verifier da migliaia di nodi.
+
+La politica conserva la matematica e lo stato di ogni sessione: cambia soltanto
+quali eseguibili CUDA già compilati restano residenti. La telemetria verbose
+riporta `cache_live`, `cache_peak`, espulsioni probation/protected e
+small/large. I parametri A/B sono:
+
+```text
+DS4_CUDA_MTP_GRAPH_CACHE_POLICY=slru|lru|legacy
+DS4_CUDA_MTP_GRAPH_MAX_LIVE=24
+DS4_CUDA_MTP_GRAPH_SMALL_RESERVE=8
+```
+
+`legacy` (oppure `DS4_CUDA_MTP_GRAPH_MAX_LIVE=0`) ripristina la cache senza
+limite globale. I due topology slot per variante restano invariati e possono
+essere disabilitati separatamente con il rollback già indicato sopra.
+
 ### Risultato A/B Athena del 22 luglio 2026
 
 Un confronto sul server reale con telemetria attiva ha misurato il candidato
@@ -2589,9 +2616,10 @@ DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS=131072
 DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS=16384
 ```
 
-Il context guard pubblica circa 222822 token e sottrae anche il budget di
-output, 2200 token per default. Questo lascia margine per la compaction del
-client prima del limite fisico.
+Il context guard pubblica circa 222822 token. Il server consente per default
+fino a 16384 token di output e riduce automaticamente il budget quando prompt
+e generazione non entrano insieme nel contesto disponibile. Il valore resta
+personalizzabile con `DS4_MAX_TOKENS`.
 
 ### Profilo sperimentale da 1M token
 

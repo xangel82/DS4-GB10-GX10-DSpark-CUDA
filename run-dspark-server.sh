@@ -28,7 +28,7 @@ else
 fi
 KV_DIR="${DS4_EXPERIMENT_KV_DIR:-/tmp/ds4-gb10-dspark-kv}"
 CTX="${DS4_CTX:-262144}"
-MAX_TOKENS="${DS4_MAX_TOKENS:-2200}"
+MAX_TOKENS="${DS4_MAX_TOKENS:-16384}"
 THREADS="${DS4_THREADS:-10}"
 PORT="${DS4_PORT:-30007}"
 KV_DISK_SPACE_MB="${DS4_KV_DISK_SPACE_MB:-16384}"
@@ -80,6 +80,9 @@ LONG_ANCHOR_MIN_TOKENS="${DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS:-$((CTX / 2))}"
 LONG_ANCHOR_TRIM_TOKENS="${DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS:-$((CTX / 16))}"
 CONFIDENCE_POST_NORM="${DS4_DSPARK_CONFIDENCE_POST_NORM:-0}"
 GRAPH_TOPOLOGY_CACHE_DISABLE="${DS4_CUDA_DSPARK_GRAPH_TOPOLOGY_CACHE_DISABLE:-0}"
+GRAPH_EXEC_CACHE_POLICY="${DS4_CUDA_MTP_GRAPH_CACHE_POLICY:-slru}"
+GRAPH_EXEC_CACHE_MAX_LIVE="${DS4_CUDA_MTP_GRAPH_MAX_LIVE:-24}"
+GRAPH_EXEC_CACHE_SMALL_RESERVE="${DS4_CUDA_MTP_GRAPH_SMALL_RESERVE:-8}"
 SECONDARY_COPY_PIPELINED="${DS4_CUDA_SECONDARY_COPY_PIPELINED:-1}"
 HYBRID_LC_SHADOW="${DS4_DSPARK_HYBRID_LC_SHADOW:-0}"
 if [[ -n "${DS4_DSPARK_HYBRID_LC+x}" ]]; then
@@ -122,6 +125,16 @@ esac
 case "$GRAPH_TOPOLOGY_CACHE_DISABLE" in
   0|1) ;;
   *) echo "Invalid DS4_CUDA_DSPARK_GRAPH_TOPOLOGY_CACHE_DISABLE: $GRAPH_TOPOLOGY_CACHE_DISABLE (expected 0 or 1)" >&2; exit 2 ;;
+esac
+case "$GRAPH_EXEC_CACHE_POLICY" in
+  slru|lru|legacy|unbounded) ;;
+  *) echo "Invalid DS4_CUDA_MTP_GRAPH_CACHE_POLICY: $GRAPH_EXEC_CACHE_POLICY (expected slru, lru, legacy or unbounded)" >&2; exit 2 ;;
+esac
+case "$GRAPH_EXEC_CACHE_MAX_LIVE" in
+  ''|*[!0-9]*) echo "Invalid DS4_CUDA_MTP_GRAPH_MAX_LIVE: $GRAPH_EXEC_CACHE_MAX_LIVE (expected an unsigned integer)" >&2; exit 2 ;;
+esac
+case "$GRAPH_EXEC_CACHE_SMALL_RESERVE" in
+  ''|*[!0-9]*) echo "Invalid DS4_CUDA_MTP_GRAPH_SMALL_RESERVE: $GRAPH_EXEC_CACHE_SMALL_RESERVE (expected an unsigned integer)" >&2; exit 2 ;;
 esac
 case "$SECONDARY_COPY_PIPELINED" in
   0|1) ;;
@@ -421,7 +434,7 @@ echo "Memory: secondary-copy=${DS4_CUDA_COPY_SECONDARY_MODEL:-1}, secondary-pipe
 echo "Prefill: chunk=$PREFILL_CHUNK final-logits-only=${DS4_PREFILL_FINAL_LOGITS_ONLY:-0}"
 echo "Streaming: decode-heartbeat=${DS4_STREAM_HEARTBEAT_SEC}s"
 echo "KV:     policy=$DS4_KV_PREFILL_CHECKPOINT_POLICY keep-long-text-hits=$DS4_KV_KEEP_LONG_TEXT_HITS canonical-min-sec=$DS4_KV_CANONICAL_PREFILL_MIN_SEC cold-max=$KV_COLD_MAX_TOKENS long-anchor-min=$DS4_KV_LONG_COLD_ANCHOR_MIN_TOKENS trim=$DS4_KV_LONG_COLD_ANCHOR_TRIM_TOKENS disk-mb=$KV_DISK_SPACE_MB"
-echo "Context guard: physical=$CTX advertise=${ADVERTISE_CONTEXT_PCT}%"
+echo "Context guard: physical=$CTX advertise=${ADVERTISE_CONTEXT_PCT}% max-output=$MAX_TOKENS"
 echo "DSpark scheduler: hardware-aware Algorithm 1 + exact t-2 production capacity, full 5-slot draft, adaptive verifier K=0..$DRAFT, always-draft=${DS4_DSPARK_ALWAYS_DRAFT:-0}, circuit-breaker=${DS4_DSPARK_CIRCUIT_BREAKER:-0}, fused K+1 verifier, graphs=on, telemetry=$TELEMETRY shadow=$SCHEDULER_SHADOW deterministic=$SCHEDULER_DETERMINISTIC"
 echo "DSpark Nightjar: active=$NIGHTJAR shadow=$NIGHTJAR_SHADOW max-r=$NIGHTJAR_MAX_R aggregate-budget=1..R*$DRAFT (B=0 singleton-only) t-2-capacity current-confidence-ranked executor=paired-physical/serial exact-shape-aware recent-reward=pure-neural-ms/token max-predicted-regression=$NIGHTJAR_MAX_REGRESSION persistent-warm-start=bounded"
 echo "DSpark coordinator: requested-hot=$COORDINATOR_HOT_LANES max=$COORDINATOR_LANES adaptive-UMA-admission=1 reserve=${COORDINATOR_LANE_RESERVE_MB}MiB coalesce=${COORDINATOR_COALESCE_US}us active-rendezvous=${COORDINATOR_ACTIVE_COALESCE_US}us min-physical-rows=$COORDINATOR_MIN_PHYSICAL_ROWS load-aware-prefix=1 physical-R1..R${COORDINATOR_LANES}=profiled bounded-serial-KV-replay=1"
@@ -429,6 +442,7 @@ echo "DSpark STS: profile=${STS_PROFILE:-online-fallback} capture=${DS4_DSPARK_S
 echo "DSpark hardware profile: $DS4_DSPARK_HW_PROFILE (versioned model/binary fingerprint)"
 echo "DSpark offline SPS: $DS4_DSPARK_SPS_PROFILE (immutable complete-curve calibration; force-fingerprint=$SPS_FORCE_PROFILE; generic fallback)"
 echo "DSpark parity: confidence-input=$CONFIDENCE_INPUT, verifier-topology-cache=$GRAPH_TOPOLOGY_CACHE"
+echo "DSpark graph memory: policy=$GRAPH_EXEC_CACHE_POLICY max-live=$GRAPH_EXEC_CACHE_MAX_LIVE small-reserve=$GRAPH_EXEC_CACHE_SMALL_RESERVE"
 echo "DSpark sampling: lossless p/q rejection for top_k=0 top_p=1 min-p policy (rollback DS4_DSPARK_REJECTION_DISABLE=1)"
 echo "HybridLC: enabled=$HYBRID_LC shadow=$HYBRID_LC_SHADOW indexed-suffix=8-token transition-q=top8 BlockV=lossless max-draft=15 graph-rows=8/12/16 forced-width=${HYBRID_WIDTH:-auto}"
 echo "GB10 verifier: Q8 batch-reuse=${DS4_CUDA_Q8_BATCH_REUSE:-0}, Q4-sidecar direct-MoE=${DS4_CUDA_MOE_TINY_DIRECT_Q4_ONLY:-0}, tiny-TC=${DS4_CUDA_DSPARK_TENSOR_CORES:-0}, tiny-TC-Q8=${DS4_CUDA_DSPARK_TENSOR_CORES_Q8:-0}"

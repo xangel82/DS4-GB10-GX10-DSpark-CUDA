@@ -555,3 +555,9 @@ sublicensing and sale of the software, provided that the copyright notice and
 license text are preserved in copies or substantial portions of the software.
 When reusing this repository, preserve the relevant upstream from Antirez, Entrpi/ds4,
 llama.cpp and Marco Palaferri notices together with the MIT license.
+
+## Thanks to contributors
+
+Thank you to everyone who contributes code, measurements, bug reports,
+corrections, testing time and technical insight to this project. Individual
+contributions are recorded in [`CONTRIBUTORS.md`](CONTRIBUTORS.md).

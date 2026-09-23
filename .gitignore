@@ -11,6 +11,7 @@
 /tests/test_dspark_scheduler
 /tests/test_dspark_sps
 /tests/test_dspark_sts
+/tests/test_dspark_rollback
 /ds4flash.gguf
 /TODO.md
 /gguf/

@@ -10586,6 +10586,25 @@ typedef struct ds4_gpu_graph {
     uint32_t spec_prefix_cap;
     uint32_t dspark_draft_cap;
     uint32_t dspark_verify_cap;
+
+    /* EXPERIMENTAL ratio-128 sparse undo journal (mode D).  Enabled by
+     * DS4_DSPARK_R128_UNDO_JOURNAL; unset keeps the legacy full-frontier
+     * snapshot / prefix-capture path (mode A) byte for byte.
+     *
+     * A ratio-128 layer writes exactly one row per speculative token
+     * (dst_row = position % 128, see compressor_store_kernel), so the whole
+     * 128-row window never needs to be copied.  The payload and the device
+     * pointer table are preallocated with the graph and bound once; the hot
+     * path is one batched capture kernel and, on a partial accept or a
+     * failure, one batched suffix-undo kernel. */
+    ds4_gpu_tensor *spec_r128_journal;
+    ds4_gpu_tensor *spec_r128_table;
+    uint32_t spec_r128_layers[DS4_MAX_LAYER];
+    uint32_t spec_r128_layer_count;
+    uint32_t spec_r128_journal_rows;   /* rows covered by the live journal    */
+    uint32_t spec_r128_journal_pos0;
+    uint32_t spec_r128_base_n_comp[DS4_MAX_LAYER];
+    bool     spec_r128_journal_valid;  /* a capture succeeded this cycle      */
     uint32_t raw_cap;
     /* Maximum compressed-row capacity across layers.  Shared work buffers use
      * this worst-case size because ratio-4 indexer layers can still reach it. */
@@ -10829,6 +10848,8 @@ static void metal_graph_free_shared_lane(ds4_gpu_graph *g) {
             ds4_gpu_tensor_free(g->spec_prefix_gvr_hint[p][il]);
         }
     }
+    ds4_gpu_tensor_free(g->spec_r128_journal);
+    ds4_gpu_tensor_free(g->spec_r128_table);
     ds4_gpu_tensor_free(g->mtp_raw_cache);
     for (uint32_t block = 0; block < DS4_DSPARK_N_BLOCK; block++) {
         ds4_gpu_tensor_free(g->dspark_raw_cache[block]);
@@ -11010,6 +11031,8 @@ static void metal_graph_free(ds4_gpu_graph *g) {
             ds4_gpu_tensor_free(g->spec_prefix_gvr_hint[p][il]);
         }
     }
+    ds4_gpu_tensor_free(g->spec_r128_journal);
+    ds4_gpu_tensor_free(g->spec_r128_table);
     ds4_gpu_tensor_free(g->kv);
     ds4_gpu_tensor_free(g->kv_raw);
     ds4_gpu_tensor_free(g->q);
@@ -11367,6 +11390,87 @@ static ds4_gpu_tensor *metal_graph_tensor_alias_or_alloc(
  * Metal Release Graph Allocation.
  * ========================================================================= */
 
+/* EXPERIMENTAL mode D: ratio-128 sparse undo journal.
+ *
+ * OFF by default.  Presence-tested exactly like the other DSpark rollback
+ * switches, so `unset` and `=0` both select the legacy full-frontier path.
+ * CUDA only: Metal and ROCm keep mode A unchanged.
+ *
+ * Read once so the choice cannot change between a snapshot and its matching
+ * commit/restore, and so a captured CUDA graph keeps a stable topology. */
+DS4_MAYBE_UNUSED static bool dspark_r128_journal_enabled(void) {
+#if defined(__APPLE__) || defined(DS4_ROCM_BUILD) || defined(DS4_NO_GPU)
+    return false;
+#else
+    static int cached = -1;
+    if (cached < 0) {
+        cached = ds4_env_enabled("DS4_DSPARK_R128_UNDO_JOURNAL") ? 1 : 0;
+        if (cached) {
+            fprintf(stderr,
+                    "ds4: DSpark ratio-128 sparse undo journal enabled "
+                    "(EXPERIMENTAL; ratio-4, indexer, GVR and the DSpark ring "
+                    "keep the legacy snapshot/prefix-capture path)\n");
+        }
+    }
+    return cached != 0;
+#endif
+}
+
+/* Optional host-side accounting for the ratio-128 journal.  OFF by default and
+ * deliberately sync free: it only adds to counters the caller already owns, so
+ * enabling it cannot perturb the CUDA stream or the graph topology. */
+typedef struct {
+    uint64_t cycles;
+    uint64_t full_accept;
+    uint64_t partial_accept;
+    uint64_t reject;
+    uint64_t failure;
+    uint64_t journal_capture_kernels;
+    uint64_t journal_undo_kernels;
+    uint64_t journal_bytes;
+    uint64_t legacy_r128_bytes_saved;
+    uint64_t legacy_r128_copies_saved;
+} dspark_r128_journal_stats;
+
+DS4_MAYBE_UNUSED static dspark_r128_journal_stats g_dspark_r128_stats;
+
+static bool dspark_r128_journal_stats_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        cached = ds4_env_enabled("DS4_DSPARK_R128_JOURNAL_STATS") ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+/* Rows the verifier touches in a ratio-128 layer are (pos0 + t) % 128 for
+ * t in [0, n_rows).  Those are distinct for any block of at most 128 rows, so
+ * the journal never aliases and its undo is order independent. */
+DS4_MAYBE_UNUSED static uint64_t dspark_r128_journal_bytes(const ds4_gpu_graph *g,
+                                          uint32_t             n_rows) {
+    return (uint64_t)g->spec_r128_layer_count * n_rows * 2ull *
+           DS4_N_HEAD_DIM * sizeof(float);
+}
+
+/* Legacy ratio-128 traffic the journal replaces, for the A/D accounting. */
+DS4_MAYBE_UNUSED static uint64_t dspark_r128_legacy_frontier_bytes(const ds4_gpu_graph *g) {
+    return (uint64_t)g->spec_r128_layer_count * 2ull *
+           DS4_N_HEAD_DIM * 128ull * sizeof(float);
+}
+
+/* n_comp for a ratio-128 layer is reconstructible: the compressor emits when
+ * (pos + 1) % ratio == 0, so after keeping `keep` speculative rows it is the
+ * baseline counter plus the number of emitting positions inside the kept
+ * prefix.  Mode D therefore journals no counter copies at all. */
+static uint32_t dspark_r128_derived_n_comp(uint32_t base_n_comp,
+                                           uint32_t pos0,
+                                           uint32_t keep_rows) {
+    uint32_t n = base_n_comp;
+    for (uint32_t t = 0; t < keep_rows; t++) {
+        if (((pos0 + t + 1u) % 128u) == 0u) n++;
+    }
+    return n;
+}
+
 /* Allocate the Metal graph state for a chosen raw-cache capacity.  The model
  * weights are not copied here; tensors reference the mapped GGUF. */
 static bool metal_graph_alloc_raw_cap(
@@ -11565,6 +11669,59 @@ static bool metal_graph_alloc_raw_cap(
             }
         }
     }
+    /* EXPERIMENTAL mode D storage.  Preallocated once so the speculative hot
+     * path never allocates: payload sized for every ratio-128 layer at the
+     * maximum verifier row count, plus a device pointer table bound below. */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    g->spec_r128_layer_count = 0;
+    if (enable_spec && dspark_r128_journal_enabled()) {
+        for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+            if (ds4_layer_compress_ratio(il) != 128u) continue;
+            if (!g->layer_attn_state_kv[il] ||
+                !g->layer_attn_state_score[il]) continue;
+            g->spec_r128_layers[g->spec_r128_layer_count++] = il;
+        }
+        if (g->spec_r128_layer_count != 0) {
+            const uint32_t rows = g->dspark_verify_cap != 0
+                ? g->dspark_verify_cap : DS4_DSPARK_VERIFY_ROWS;
+            g->spec_r128_journal = ds4_gpu_tensor_alloc(
+                    (uint64_t)g->spec_r128_layer_count * rows * 2ull *
+                    DS4_N_HEAD_DIM * sizeof(float));
+            g->spec_r128_table = ds4_gpu_tensor_alloc(
+                    (uint64_t)2u * g->spec_r128_layer_count *
+                    sizeof(void *));
+            ds4_gpu_tensor *kv[DS4_MAX_LAYER];
+            ds4_gpu_tensor *sc[DS4_MAX_LAYER];
+            for (uint32_t i = 0; i < g->spec_r128_layer_count; i++) {
+                kv[i] = g->layer_attn_state_kv[g->spec_r128_layers[i]];
+                sc[i] = g->layer_attn_state_score[g->spec_r128_layers[i]];
+            }
+            if (!g->spec_r128_journal || !g->spec_r128_table ||
+                !ds4_gpu_spec_r128_journal_bind(
+                        g->spec_r128_table, kv, sc,
+                        g->spec_r128_layer_count)) {
+                fprintf(stderr,
+                        "ds4: DSpark ratio-128 undo journal allocation failed; "
+                        "using the legacy full-frontier path\n");
+                ds4_gpu_tensor_free(g->spec_r128_journal);
+                ds4_gpu_tensor_free(g->spec_r128_table);
+                g->spec_r128_journal = NULL;
+                g->spec_r128_table = NULL;
+                g->spec_r128_layer_count = 0;
+            } else {
+                fprintf(stderr,
+                        "ds4: DSpark ratio-128 undo journal armed "
+                        "(%u layers, %u rows, %.3f MiB payload; legacy "
+                        "ratio-128 frontier was %.3f MiB per copy)\n",
+                        g->spec_r128_layer_count, rows,
+                        (double)ds4_gpu_tensor_bytes(g->spec_r128_journal) /
+                            1048576.0,
+                        (double)dspark_r128_legacy_frontier_bytes(g) /
+                            1048576.0);
+            }
+        }
+    }
+#endif
     g->comp_kv_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     g->comp_sc_cur = ds4_gpu_tensor_alloc(comp_width_max * sizeof(float));
     if (DS4_GPU_ATTN_COMP_CACHE_F16) {
@@ -12047,6 +12204,16 @@ static bool metal_graph_alloc_shared_lane(
         lane->dspark_raw_cache[block] = NULL;
         lane->dspark_spec_ring_backup[block] = NULL;
     }
+    /* Mode D is per lane: each request owns its speculative transaction, so it
+     * needs its own journal payload and its own pointer table.  Nothing is
+     * shared with the owner. */
+    lane->spec_r128_journal = NULL;
+    lane->spec_r128_table = NULL;
+    lane->spec_r128_journal_rows = 0;
+    lane->spec_r128_journal_pos0 = 0;
+    lane->spec_r128_journal_valid = false;
+    memset(lane->spec_r128_base_n_comp, 0,
+           sizeof(lane->spec_r128_base_n_comp));
 
     bool ok = true;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -12211,6 +12378,42 @@ static bool metal_graph_alloc_shared_lane(
                     lane, &lane->dspark_verify_accept,
                     owner->dspark_verify_accept, false);
     }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Mode D: give the lane its own journal payload and pointer table, bound
+     * to the lane's own ratio-128 state.  A lane must never roll back through
+     * the owner's frontier, and it must not reintroduce a per-lane full
+     * snapshot by another name. */
+    if (ok && owner->spec_r128_layer_count != 0) {
+        lane->spec_r128_layer_count = owner->spec_r128_layer_count;
+        memcpy(lane->spec_r128_layers, owner->spec_r128_layers,
+               sizeof(lane->spec_r128_layers));
+        const uint32_t rows = lane->dspark_verify_cap != 0
+            ? lane->dspark_verify_cap : DS4_DSPARK_VERIFY_ROWS;
+        ok = metal_graph_clone_lane_tensor(
+                lane, &lane->spec_r128_journal,
+                owner->spec_r128_journal, false) &&
+             metal_graph_clone_lane_tensor(
+                lane, &lane->spec_r128_table,
+                owner->spec_r128_table, false);
+        if (ok) {
+            ds4_gpu_tensor *kv[DS4_MAX_LAYER];
+            ds4_gpu_tensor *sc[DS4_MAX_LAYER];
+            for (uint32_t i = 0; i < lane->spec_r128_layer_count; i++) {
+                kv[i] = lane->layer_attn_state_kv[lane->spec_r128_layers[i]];
+                sc[i] = lane->layer_attn_state_score[lane->spec_r128_layers[i]];
+            }
+            ok = ds4_gpu_spec_r128_journal_bind(
+                    lane->spec_r128_table, kv, sc,
+                    lane->spec_r128_layer_count) != 0;
+        }
+        if (!ok) {
+            fprintf(stderr,
+                    "ds4: DSpark ratio-128 undo journal lane bind failed\n");
+        } else {
+            (void)rows;
+        }
+    }
+#endif
     if (!ok) {
         metal_graph_free_shared_lane(lane);
         return false;
@@ -14114,8 +14317,17 @@ static bool metal_graph_capture_prefix_attn_state(
     if (prefix_index >= g->spec_capture_prefixes ||
         prefix_index >= g->spec_prefix_cap ||
         !g->spec_prefix_attn_state_kv[prefix_index][il]) return true;
-    const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
     g->spec_prefix_n_comp[prefix_index][il] = g->layer_n_comp[il];
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Mode D: a ratio-128 prefix is fully described by the undo journal, so
+     * the 128-row window is never copied per prefix.  The counter above stays
+     * for the optional derived-vs-captured cross-check only. */
+    if (g->spec_r128_journal_valid &&
+        ds4_layer_compress_ratio(il) == 128u) {
+        return true;
+    }
+#endif
+    const uint64_t bytes = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
     return ds4_gpu_tensor_copy(g->spec_prefix_attn_state_kv[prefix_index][il], 0,
                                  g->layer_attn_state_kv[il], 0, bytes) != 0 &&
            ds4_gpu_tensor_copy(g->spec_prefix_attn_state_score[prefix_index][il], 0,
@@ -14942,8 +15154,11 @@ static bool metal_graph_streaming_expert_hotlist_add(
         uint32_t    counts[DS4_MAX_LAYER],
         bool        seen[DS4_MAX_LAYER][DS4_MAX_EXPERT],
         uint32_t   *loaded) {
-    if (layer >= DS4_N_LAYER || expert >= DS4_N_EXPERT) return true;
-    if (layer >= DS4_MAX_LAYER || expert >= DS4_MAX_EXPERT) return true;
+    /* Out-of-range entries are malformed input, not entries to ignore.  In
+     * particular, silently dropping them can turn a broken hotlist into a
+     * partial seed and hide the failure for variants that publish one. */
+    if (layer >= DS4_N_LAYER || expert >= DS4_N_EXPERT) return false;
+    if (layer >= DS4_MAX_LAYER || expert >= DS4_MAX_EXPERT) return false;
     if (seen[layer][expert]) return true;
     if (counts[layer] >= DS4_MAX_EXPERT) return false;
     seen[layer][expert] = true;
@@ -24643,6 +24858,11 @@ static bool metal_graph_encode_layer_attention_output_rn(
  * run once over the flattened request-major batch. The attention core remains
  * request-private because each session owns a different KV timeline; row-local
  * output, dense/routed-MoE and vocabulary projections are batched again. */
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+static bool metal_graph_spec_r128_journal_begin(
+        ds4_gpu_graph *g, uint32_t pos0, uint32_t n_rows);
+#endif
+
 static bool metal_graph_verify_suffix_rn(
         ds4_gpu_graph *scratch,
         const ds4_model *model,
@@ -24852,6 +25072,16 @@ static bool metal_graph_verify_suffix_rn(
     if (ok) {
         failure_stage = "begin-commands";
         ok = ds4_gpu_begin_commands() != 0;
+    }
+    /* Mode D: every lane owns its own speculative transaction, so every lane
+     * journals its own ratio-128 rows here.  Nothing reintroduces a per-lane
+     * full-frontier snapshot. */
+    for (uint32_t r = 0; ok && r < request_count; r++) {
+        failure_stage = "ratio128-journal";
+        ok = metal_graph_spec_r128_journal_begin(
+                requests[r].state,
+                requests[r].start,
+                requests[r].rows);
     }
 
     bool hc_norm_f16_ready = false;
@@ -25704,6 +25934,84 @@ static bool metal_graph_encode_verify_suffix_commands(
     return ok;
 }
 
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+/* EXPERIMENTAL mode D: record the before-image of every ratio-128 row this
+ * speculative block will overwrite, in ONE batched kernel, before the verifier
+ * touches any state.  The rows are (pos0 + t) % 128 for t in [0, n_rows), so
+ * they are known up front and distinct; a rejected suffix is undone later by a
+ * single batched kernel.
+ *
+ * Encoded inside the caller's existing command region, so it costs no extra
+ * synchronisation and is replayed with the captured CUDA graph.  Failing here
+ * leaves the state unmutated, which is exactly what the caller's error path
+ * assumes. */
+static bool metal_graph_spec_r128_journal_begin(
+        ds4_gpu_graph *g, uint32_t pos0, uint32_t n_rows) {
+    g->spec_r128_journal_valid = false;
+    g->spec_r128_journal_rows = 0;
+    if (!dspark_r128_journal_enabled() ||
+        g->spec_r128_layer_count == 0u ||
+        !g->spec_r128_journal || !g->spec_r128_table ||
+        n_rows == 0u || n_rows > 128u) {
+        return true;
+    }
+    /* Instrumentation for a later GB10 run: an NVTX range costs nothing when
+     * the profiler is not attached and, unlike a host timer, needs no
+     * synchronisation to attribute the kernel. */
+    const bool nvtx = cuda_prefill_nvtx_enabled();
+    if (nvtx) {
+        ds4_gpu_nvtx_range_push(
+                "ds4/decode/dspark/r128-journal-capture",
+                cuda_prefill_nvtx_payload(g->spec_r128_layer_count, n_rows));
+    }
+    const bool captured = ds4_gpu_spec_r128_journal_capture(
+                g->spec_r128_journal,
+                g->spec_r128_table,
+                g->spec_r128_layer_count,
+                pos0,
+                n_rows,
+                128u,
+                DS4_N_HEAD_DIM) != 0;
+    if (nvtx) ds4_gpu_nvtx_range_pop();
+    if (!captured) return false;
+    g->spec_r128_journal_pos0 = pos0;
+    g->spec_r128_journal_rows = n_rows;
+    g->spec_r128_journal_valid = true;
+    if (dspark_r128_journal_stats_enabled()) {
+        g_dspark_r128_stats.cycles++;
+        g_dspark_r128_stats.journal_capture_kernels++;
+        g_dspark_r128_stats.journal_bytes +=
+            dspark_r128_journal_bytes(g, n_rows);
+        /* One baseline snapshot plus one capture per prefix, at 2 copies per
+         * ratio-128 layer, is what mode D no longer issues. */
+        const uint64_t frontier = dspark_r128_legacy_frontier_bytes(g);
+        const uint64_t copies = 2ull * g->spec_r128_layer_count;
+        g_dspark_r128_stats.legacy_r128_bytes_saved +=
+            frontier * (1ull + (n_rows > 0u ? n_rows - 1u : 0u));
+        g_dspark_r128_stats.legacy_r128_copies_saved +=
+            copies * (1ull + (n_rows > 0u ? n_rows - 1u : 0u));
+        if ((g_dspark_r128_stats.cycles & 255ull) == 0ull) {
+            fprintf(stderr,
+                    "ds4: dspark r128-journal cycles=%llu capture_kernels=%llu "
+                    "undo_kernels=%llu journal=%.2f MiB "
+                    "legacy_r128_avoided=%.2f MiB/%llu copies "
+                    "full=%llu partial=%llu reject=%llu failure=%llu\n",
+                    (unsigned long long)g_dspark_r128_stats.cycles,
+                    (unsigned long long)g_dspark_r128_stats.journal_capture_kernels,
+                    (unsigned long long)g_dspark_r128_stats.journal_undo_kernels,
+                    (double)g_dspark_r128_stats.journal_bytes / 1048576.0,
+                    (double)g_dspark_r128_stats.legacy_r128_bytes_saved / 1048576.0,
+                    (unsigned long long)g_dspark_r128_stats.legacy_r128_copies_saved,
+                    (unsigned long long)g_dspark_r128_stats.full_accept,
+                    (unsigned long long)g_dspark_r128_stats.partial_accept,
+                    (unsigned long long)g_dspark_r128_stats.reject,
+                    (unsigned long long)g_dspark_r128_stats.failure);
+        }
+    }
+    return true;
+}
+#endif
+
 static bool metal_graph_verify_suffix_tops(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -25763,6 +26071,9 @@ static bool metal_graph_verify_suffix_tops(
     }
 
     ok = mtp_graph_capture || ds4_gpu_begin_commands() != 0;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (ok) ok = metal_graph_spec_r128_journal_begin(g, start, n_tokens);
+#endif
     if (ok) ok = metal_graph_encode_verify_suffix_commands(g,
                                                             model,
                                                             weights,
@@ -25788,6 +26099,10 @@ static bool metal_graph_verify_suffix_tops(
              * exactly once through the normal command path. */
             metal_graph_mtp_verify_capture_state_restore(g, &capture_state);
             ok = ds4_gpu_begin_commands() != 0;
+            /* The aborted capture never executed its recorded work, so the
+             * journal was not written either.  Re-issue it before the replay
+             * encodes the mutations again. */
+            if (ok) ok = metal_graph_spec_r128_journal_begin(g, start, n_tokens);
             if (ok) ok = metal_graph_encode_verify_suffix_commands(g,
                                                                     model,
                                                                     weights,
@@ -30319,6 +30634,10 @@ typedef struct {
     uint32_t n_index_comp[DS4_MAX_LAYER];
     bool gvr_hint_valid[DS4_MAX_LAYER];
     uint32_t mtp_n_raw;
+    /* EXPERIMENTAL mode D: this snapshot deliberately left the ratio-128
+     * window uncopied because the matching verifier journals its rows.  The
+     * flag travels with the frontier so a restore can never guess. */
+    bool r128_journal;
 } ds4_spec_frontier;
 
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
@@ -30334,10 +30653,30 @@ static void spec_frontier_free(ds4_spec_frontier *f) {
     memset(f, 0, sizeof(*f));
 }
 
-static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
+/* Mode D is opt-in per call site.  Only the two speculative paths that are
+ * guaranteed to run the journalling verifier may skip the ratio-128 window:
+ * ds4_session_eval_dspark_cycle and ds4_sessions_verify_suffix_rn_begin.
+ * Every other snapshot (MTP decode-2 exact, the argmax speculative paths)
+ * keeps the legacy full-frontier copy, so a caller can never arm a rollback it
+ * has no journal for. */
+static bool spec_frontier_snapshot_ex(ds4_spec_frontier *f, ds4_session *s,
+                                      bool allow_r128_journal) {
     memset(f, 0, sizeof(*f));
     ds4_gpu_graph *g = &s->graph;
     f->mtp_n_raw = g->mtp_n_raw;
+    /* Any snapshot opens a new speculative transaction: a journal left over
+     * from a previous cycle must never be replayable. */
+    g->spec_r128_journal_valid = false;
+    g->spec_r128_journal_rows = 0;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    f->r128_journal = allow_r128_journal &&
+                      dspark_r128_journal_enabled() &&
+                      g->spec_r128_layer_count != 0 &&
+                      g->spec_r128_journal != NULL &&
+                      g->spec_r128_table != NULL;
+#else
+    (void)allow_r128_journal;
+#endif
 
     bool ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -30346,6 +30685,13 @@ static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
         f->gvr_hint_valid[il] = g->layer_gvr_hint_valid[il];
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
+        if (f->r128_journal && ratio == 128u) {
+            /* Mode D: no 128-row window copy.  Remember the baseline counter
+             * so the accepted-prefix n_comp can be derived instead of
+             * journalled (it is a pure function of position and prefix). */
+            g->spec_r128_base_n_comp[il] = g->layer_n_comp[il];
+            continue;
+        }
         const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
         ok = ds4_gpu_tensor_copy(g->spec_attn_state_kv[il], 0,
                                    g->layer_attn_state_kv[il], 0, ab) != 0 &&
@@ -30375,16 +30721,54 @@ static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
     return false;
 }
 
+static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
+    return spec_frontier_snapshot_ex(f, s, false);
+}
+
 static bool spec_frontier_restore(ds4_spec_frontier *f, ds4_session *s) {
     ds4_gpu_graph *g = &s->graph;
     bool ok = ds4_gpu_begin_commands() != 0;
     g->mtp_n_raw = f->mtp_n_raw;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Mode D hard-failure path: one batched undo of the whole speculative
+     * suffix.  If the verifier failed before its capture ran, nothing was
+     * mutated and there is nothing to undo. */
+    if (ok && f->r128_journal && g->spec_r128_journal_valid) {
+        const bool nvtx = cuda_prefill_nvtx_enabled();
+        if (nvtx) {
+            ds4_gpu_nvtx_range_push(
+                    "ds4/decode/dspark/r128-journal-undo-full",
+                    cuda_prefill_nvtx_payload(
+                            g->spec_r128_layer_count,
+                            g->spec_r128_journal_rows));
+        }
+        ok = ds4_gpu_spec_r128_journal_undo(
+                g->spec_r128_journal,
+                g->spec_r128_table,
+                g->spec_r128_layer_count,
+                g->spec_r128_journal_pos0,
+                0u,
+                g->spec_r128_journal_rows,
+                128u,
+                DS4_N_HEAD_DIM) != 0;
+        if (nvtx) ds4_gpu_nvtx_range_pop();
+        if (dspark_r128_journal_stats_enabled()) {
+            g_dspark_r128_stats.journal_undo_kernels++;
+            g_dspark_r128_stats.failure++;
+        }
+    }
+    if (f->r128_journal) {
+        g->spec_r128_journal_valid = false;
+        g->spec_r128_journal_rows = 0;
+    }
+#endif
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         g->layer_n_comp[il] = f->n_comp[il];
         g->layer_n_index_comp[il] = f->n_index_comp[il];
         g->layer_gvr_hint_valid[il] = f->gvr_hint_valid[il];
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
+        if (f->r128_journal && ratio == 128u) continue;
         const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
         ok = ds4_gpu_tensor_copy(g->layer_attn_state_kv[il], 0,
                                    g->spec_attn_state_kv[il], 0, ab) != 0 &&
@@ -30424,9 +30808,75 @@ static bool spec_frontier_commit_prefix(ds4_session *s, uint32_t prefix_tokens) 
     const uint32_t p = prefix_tokens - 1u;
     ds4_gpu_graph *g = &s->graph;
     bool ok = ds4_gpu_begin_commands() != 0;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Mode D partial accept: one batched undo of the rejected suffix only.
+     * The accepted prefix stays exactly as the verifier produced it, so there
+     * is no ratio-128 prefix commit copy at all. */
+    const bool r128_journal = g->spec_r128_journal_valid;
+    if (ok && r128_journal) {
+        if (prefix_tokens > g->spec_r128_journal_rows) {
+            ok = false;
+        } else {
+            const bool nvtx = cuda_prefill_nvtx_enabled();
+            if (nvtx) {
+                ds4_gpu_nvtx_range_push(
+                        "ds4/decode/dspark/r128-journal-undo-suffix",
+                        cuda_prefill_nvtx_payload(
+                                g->spec_r128_journal_rows - prefix_tokens,
+                                g->spec_r128_journal_rows));
+            }
+            ok = ds4_gpu_spec_r128_journal_undo(
+                    g->spec_r128_journal,
+                    g->spec_r128_table,
+                    g->spec_r128_layer_count,
+                    g->spec_r128_journal_pos0,
+                    prefix_tokens,
+                    g->spec_r128_journal_rows,
+                    128u,
+                    DS4_N_HEAD_DIM) != 0;
+            if (nvtx) ds4_gpu_nvtx_range_pop();
+            if (ok && dspark_r128_journal_stats_enabled()) {
+                if (prefix_tokens == g->spec_r128_journal_rows) {
+                    g_dspark_r128_stats.full_accept++;
+                } else {
+                    g_dspark_r128_stats.journal_undo_kernels++;
+                    if (prefix_tokens <= 1u) g_dspark_r128_stats.reject++;
+                    else g_dspark_r128_stats.partial_accept++;
+                }
+            }
+        }
+        /* Retire the journal only once its undo has actually been issued.  A
+         * failed commit falls through to spec_frontier_restore, which still
+         * needs a live journal to roll the whole suffix back. */
+        if (ok) {
+            g->spec_r128_journal_valid = false;
+            g->spec_r128_journal_rows = 0;
+        }
+    }
+#else
+    const bool r128_journal = false;
+#endif
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         if (ratio == 0) continue;
+        if (r128_journal && ratio == 128u) {
+            /* n_comp is a pure function of the baseline counter, the block
+             * start position and the accepted prefix length, so mode D
+             * journals no counters (see dspark_r128_derived_n_comp). */
+            const uint32_t derived = dspark_r128_derived_n_comp(
+                    g->spec_r128_base_n_comp[il],
+                    g->spec_r128_journal_pos0,
+                    prefix_tokens);
+            if (dspark_r128_journal_stats_enabled() &&
+                derived != g->spec_prefix_n_comp[p][il]) {
+                fprintf(stderr,
+                        "ds4: ratio-128 derived n_comp mismatch layer=%u "
+                        "derived=%u captured=%u\n",
+                        il, derived, g->spec_prefix_n_comp[p][il]);
+            }
+            g->layer_n_comp[il] = derived;
+            continue;
+        }
 
         g->layer_n_comp[il] = g->spec_prefix_n_comp[p][il];
         const uint64_t ab = ds4_gpu_tensor_bytes(g->layer_attn_state_kv[il]);
@@ -33168,8 +33618,10 @@ int ds4_sessions_verify_suffix_rn_begin(
         txn->saved_raw[r] = session->graph.dspark_n_raw;
         txn->saved_capture[r] =
             session->graph.spec_capture_prefixes;
+        /* This path always runs metal_graph_verify_suffix_rn, which journals
+         * the ratio-128 rows for every lane, so mode D may be armed here. */
         txn->have_frontier[r] =
-            spec_frontier_snapshot(&txn->frontier[r], session);
+            spec_frontier_snapshot_ex(&txn->frontier[r], session, true);
         txn->have_ring[r] = txn->have_frontier[r] &&
             dspark_spec_ring_save(
                     &session->graph, request->start, request->rows);
@@ -36841,7 +37293,10 @@ static int ds4_session_eval_dspark_cycle(
                   sizeof(verify_logits[0]))
         : NULL;
 
-    const bool have_frontier = spec_frontier_snapshot(&frontier, s);
+    /* This path always runs metal_graph_verify_suffix_tops, which journals the
+     * ratio-128 rows, so mode D may be armed here. */
+    const bool have_frontier =
+        spec_frontier_snapshot_ex(&frontier, s, true);
     const bool have_ring_backup = have_frontier &&
         dspark_spec_ring_save(&s->graph, (uint32_t)start, verify_rows);
     bool verifier_started = false;

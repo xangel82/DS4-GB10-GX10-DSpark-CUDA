@@ -2180,6 +2180,13 @@ static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
 
+static void test_streaming_hotlist_rejects_out_of_range(void) {
+    TEST_ASSERT(!metal_graph_streaming_expert_hotlist_add(
+        DS4_N_LAYER, 0, 1, NULL, NULL, NULL, NULL, NULL));
+    TEST_ASSERT(!metal_graph_streaming_expert_hotlist_add(
+        0, DS4_N_EXPERT, 1, NULL, NULL, NULL, NULL, NULL));
+}
+
 typedef void (*test_fn)(void);
 
 typedef struct {
@@ -2203,6 +2210,7 @@ static const ds4_test_entry test_entries[] = {
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
 #endif
+    {"--streaming-hotlist-range", "streaming-hotlist-range", "reject out-of-range streaming hotlist entries", test_streaming_hotlist_rejects_out_of_range},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

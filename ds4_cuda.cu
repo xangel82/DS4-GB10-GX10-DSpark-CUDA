@@ -16237,6 +16237,158 @@ extern "C" int ds4_gpu_ring_rows_restore_tensor(
             ring_cap, pos0, restore_from, n_rows, width);
     return cuda_ok(cudaGetLastError(), "ring rows restore launch");
 }
+
+/* =========================================================================
+ * EXPERIMENTAL: ratio-128 sparse undo journal.
+ * =========================================================================
+ *
+ * Enabled by DS4_DSPARK_R128_UNDO_JOURNAL (presence-tested, OFF by default).
+ *
+ * A ratio-128 compressor layer keeps a 128-row window, but one speculative
+ * token writes exactly one row of it: compressor_store_kernel above uses
+ * dst_row = (pos0 + t) % ratio for both state_kv and state_score.  The legacy
+ * frontier machinery still copies the whole 128-row window once for the
+ * baseline snapshot and once per captured prefix, which is a 128x write
+ * amplification against the rows the verifier actually touches.
+ *
+ * The journal records the before-image of exactly those rows, for every
+ * ratio-128 layer and every speculative row, in ONE batched kernel; undoing a
+ * rejected suffix is one more batched kernel.  No per-row, per-token or
+ * per-layer launches, and no hot-path allocation: the payload and the device
+ * pointer table are preallocated with the graph and bound once.
+ *
+ * Speculative rows are distinct modulo 128 for any block of at most 128 rows,
+ * so no row is written twice inside one cycle and the undo is order
+ * independent -- a single batched suffix restore is exact.
+ *
+ * Journal layout (float32, row major, fully coalesced along `width`):
+ *   journal[(((l * n_rows) + t) * 2 + half) * width + j]
+ *     l    ratio-128 layer index (dense, 0..n_layers-1)
+ *     t    speculative row index (0..n_rows-1)
+ *     half 0 = state_kv before-image, 1 = state_score before-image
+ *
+ * Pointer table layout (device):
+ *   table[l]             = layer l state_kv base
+ *   table[n_layers + l]  = layer l state_score base
+ */
+__global__ static void spec_r128_journal_capture_kernel(
+        float          *journal,
+        float *const   *state,
+        uint32_t        n_layers,
+        uint32_t        pos0,
+        uint32_t        n_rows,
+        uint32_t        ratio,
+        uint32_t        width) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_layers * n_rows * 2ull * width;
+    if (gid >= n) return;
+    const uint32_t j = (uint32_t)(gid % width);
+    uint64_t rest = gid / width;
+    const uint32_t half = (uint32_t)(rest & 1ull);
+    rest >>= 1;
+    const uint32_t t = (uint32_t)(rest % n_rows);
+    const uint32_t l = (uint32_t)(rest / n_rows);
+    const float *src = state[(uint64_t)half * n_layers + l];
+    const uint32_t row = (pos0 + t) % ratio;
+    journal[gid] = src[(uint64_t)row * width + j];
+}
+
+__global__ static void spec_r128_journal_undo_kernel(
+        float *const   *state,
+        const float    *journal,
+        uint32_t        n_layers,
+        uint32_t        pos0,
+        uint32_t        keep_rows,
+        uint32_t        n_rows,
+        uint32_t        ratio,
+        uint32_t        width) {
+    const uint32_t undo_rows = n_rows - keep_rows;
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_layers * undo_rows * 2ull * width;
+    if (gid >= n) return;
+    const uint32_t j = (uint32_t)(gid % width);
+    uint64_t rest = gid / width;
+    const uint32_t half = (uint32_t)(rest & 1ull);
+    rest >>= 1;
+    const uint32_t t = keep_rows + (uint32_t)(rest % undo_rows);
+    const uint32_t l = (uint32_t)(rest / undo_rows);
+    float *dst = state[(uint64_t)half * n_layers + l];
+    const uint32_t row = (pos0 + t) % ratio;
+    dst[(uint64_t)row * width + j] =
+        journal[((((uint64_t)l * n_rows + t) << 1) + half) * width + j];
+}
+
+/* Bind the ratio-128 state pointers into the device table.  Called once when
+ * the graph (or a shared-arena lane) is allocated, never on the hot path. */
+extern "C" int ds4_gpu_spec_r128_journal_bind(
+        ds4_gpu_tensor        *table,
+        ds4_gpu_tensor *const *state_kv,
+        ds4_gpu_tensor *const *state_score,
+        uint32_t               n_layers) {
+    if (!table || !state_kv || !state_score || n_layers == 0u ||
+        table->bytes < (uint64_t)2u * n_layers * sizeof(float *)) {
+        return 0;
+    }
+    float **host = (float **)malloc((size_t)2u * n_layers * sizeof(float *));
+    if (!host) return 0;
+    for (uint32_t l = 0; l < n_layers; l++) {
+        if (!state_kv[l] || !state_score[l]) { free(host); return 0; }
+        host[l] = (float *)state_kv[l]->ptr;
+        host[n_layers + l] = (float *)state_score[l]->ptr;
+    }
+    const cudaError_t err = cudaMemcpy(
+            table->ptr, host,
+            (size_t)2u * n_layers * sizeof(float *),
+            cudaMemcpyHostToDevice);
+    free(host);
+    return cuda_ok(err, "spec ratio-128 journal bind");
+}
+
+extern "C" int ds4_gpu_spec_r128_journal_capture(
+        ds4_gpu_tensor       *journal,
+        const ds4_gpu_tensor *table,
+        uint32_t              n_layers,
+        uint32_t              pos0,
+        uint32_t              n_rows,
+        uint32_t              ratio,
+        uint32_t              width) {
+    if (!journal || !table || n_layers == 0u || n_rows == 0u ||
+        ratio == 0u || width == 0u || n_rows > ratio) return 0;
+    const uint64_t n = (uint64_t)n_layers * n_rows * 2ull * width;
+    if (journal->bytes < n * sizeof(float) ||
+        table->bytes < (uint64_t)2u * n_layers * sizeof(float *)) return 0;
+    spec_r128_journal_capture_kernel<<<(n + 255u) / 256u, 256>>>(
+            (float *)journal->ptr,
+            (float *const *)table->ptr,
+            n_layers, pos0, n_rows, ratio, width);
+    return cuda_ok(cudaGetLastError(), "spec ratio-128 journal capture launch");
+}
+
+extern "C" int ds4_gpu_spec_r128_journal_undo(
+        const ds4_gpu_tensor *journal,
+        const ds4_gpu_tensor *table,
+        uint32_t              n_layers,
+        uint32_t              pos0,
+        uint32_t              keep_rows,
+        uint32_t              n_rows,
+        uint32_t              ratio,
+        uint32_t              width) {
+    if (!journal || !table || n_layers == 0u || n_rows == 0u ||
+        ratio == 0u || width == 0u || keep_rows > n_rows ||
+        n_rows > ratio) return 0;
+    const uint64_t total = (uint64_t)n_layers * n_rows * 2ull * width;
+    if (journal->bytes < total * sizeof(float) ||
+        table->bytes < (uint64_t)2u * n_layers * sizeof(float *)) return 0;
+    if (keep_rows == n_rows) return 1;          /* full accept: nothing to undo */
+    const uint64_t n =
+        (uint64_t)n_layers * (n_rows - keep_rows) * 2ull * width;
+    spec_r128_journal_undo_kernel<<<(n + 255u) / 256u, 256>>>(
+            (float *const *)table->ptr,
+            (const float *)journal->ptr,
+            n_layers, pos0, keep_rows, n_rows, ratio, width);
+    return cuda_ok(cudaGetLastError(), "spec ratio-128 journal undo launch");
+}
+
 extern "C" int ds4_gpu_compressor_store_batch_tensor(
         const ds4_gpu_tensor *kv,
         const ds4_gpu_tensor *sc,

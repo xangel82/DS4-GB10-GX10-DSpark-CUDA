@@ -758,6 +758,43 @@ int ds4_gpu_ring_rows_restore_tensor(
         uint32_t              n_rows,
         uint32_t              width);
 
+/* EXPERIMENTAL ratio-128 sparse undo journal (DS4_DSPARK_R128_UNDO_JOURNAL).
+ * CUDA only; the Metal and ROCm backends keep the legacy full-frontier
+ * snapshot/prefix-capture path.
+ *
+ * A ratio-128 compressor layer keeps a 128-row window but one speculative
+ * token rewrites a single row of it (dst_row = position % ratio).  Instead of
+ * copying the whole window for the baseline snapshot and again for every
+ * captured prefix, record the before-image of just the touched rows for the
+ * whole speculative block in one batched kernel, and undo a rejected suffix in
+ * one more.  Speculative rows are distinct modulo the ratio, so the undo is
+ * order independent.
+ *
+ * `bind` publishes the per-layer state pointers into a preallocated device
+ * table and is called once at graph/lane allocation, never on the hot path. */
+int ds4_gpu_spec_r128_journal_bind(
+        ds4_gpu_tensor        *table,
+        ds4_gpu_tensor *const *state_kv,
+        ds4_gpu_tensor *const *state_score,
+        uint32_t               n_layers);
+int ds4_gpu_spec_r128_journal_capture(
+        ds4_gpu_tensor       *journal,
+        const ds4_gpu_tensor *table,
+        uint32_t              n_layers,
+        uint32_t              pos0,
+        uint32_t              n_rows,
+        uint32_t              ratio,
+        uint32_t              width);
+int ds4_gpu_spec_r128_journal_undo(
+        const ds4_gpu_tensor *journal,
+        const ds4_gpu_tensor *table,
+        uint32_t              n_layers,
+        uint32_t              pos0,
+        uint32_t              keep_rows,
+        uint32_t              n_rows,
+        uint32_t              ratio,
+        uint32_t              width);
+
 /* =========================================================================
  * KV Compression and Attention.
  * =========================================================================

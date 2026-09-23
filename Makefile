@@ -327,6 +327,15 @@ test-dspark-sts: tests/test_dspark_sts
 tests/test_dspark_sts: tests/test_dspark_sts.c ds4_dspark_sts.c ds4_dspark_sts.h tests/fixtures/dspark_sts_v1.conf profiles/dspark-sts-q2.conf
 	$(CC) $(CFLAGS) -I. -o $@ tests/test_dspark_sts.c ds4_dspark_sts.c -lm
 
+# Host-only DSpark rollback audit harness (EXPERIMENT, not part of `make test`).
+# Models the legacy speculative frontier lifecycle with the real Flash shapes.
+# No CUDA, no GPU, no production behaviour change.
+test-dspark-rollback: tests/test_dspark_rollback
+	./tests/test_dspark_rollback --iters=600
+
+tests/test_dspark_rollback: tests/test_dspark_rollback.c
+	$(CC) -O2 -Wall -Wextra -std=c11 -o $@ tests/test_dspark_rollback.c -lm
+
 q4k-dot-test: tests/test_q4k_dot.c
 	$(CC) -O2 -Wall -Wextra -std=c99 -o tests/test_q4k_dot tests/test_q4k_dot.c -lm -pthread
 	./tests/test_q4k_dot

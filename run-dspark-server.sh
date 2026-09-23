@@ -93,6 +93,8 @@ else
   HYBRID_LC=1
 fi
 HYBRID_WIDTH="${DS4_DSPARK_HYBRID_WIDTH:-}"
+R128_JOURNAL="${DS4_DSPARK_R128_UNDO_JOURNAL:-0}"
+R128_JOURNAL_STATS="${DS4_DSPARK_R128_JOURNAL_STATS:-0}"
 
 if [[ ! -f "$MODEL" ]]; then
   echo "Main model not found: $MODEL" >&2
@@ -214,6 +216,14 @@ if [[ "$HYBRID_LC" == "1" && "$HYBRID_LC_SHADOW" == "1" ]]; then
   echo "DS4_DSPARK_HYBRID_LC and DS4_DSPARK_HYBRID_LC_SHADOW are mutually exclusive" >&2
   exit 2
 fi
+case "$R128_JOURNAL" in
+  0|1) ;;
+  *) echo "Invalid DS4_DSPARK_R128_UNDO_JOURNAL: $R128_JOURNAL (expected 0 or 1)" >&2; exit 2 ;;
+esac
+case "$R128_JOURNAL_STATS" in
+  0|1) ;;
+  *) echo "Invalid DS4_DSPARK_R128_JOURNAL_STATS: $R128_JOURNAL_STATS (expected 0 or 1)" >&2; exit 2 ;;
+esac
 case "$HYBRID_WIDTH" in
   ""|8|12|16) ;;
   *) echo "Invalid DS4_DSPARK_HYBRID_WIDTH: $HYBRID_WIDTH (expected 8, 12, or 16)" >&2; exit 2 ;;
@@ -375,6 +385,21 @@ else
   unset DS4_DSPARK_HYBRID_LC_SHADOW
 fi
 
+# EXPERIMENTAL ratio-128 sparse undo journal.  OFF by default: the legacy
+# full-frontier snapshot / prefix-capture path stays the production default
+# until a GB10 A/B validates the journal.  Presence-tested in ds4.c, so an
+# explicit 0 must unset the variable rather than export it.
+if [[ "$R128_JOURNAL" == "1" ]]; then
+  export DS4_DSPARK_R128_UNDO_JOURNAL=1
+else
+  unset DS4_DSPARK_R128_UNDO_JOURNAL
+fi
+if [[ "$R128_JOURNAL_STATS" == "1" ]]; then
+  export DS4_DSPARK_R128_JOURNAL_STATS=1
+else
+  unset DS4_DSPARK_R128_JOURNAL_STATS
+fi
+
 if [[ "$TELEMETRY" == "1" ]]; then
   export DS4_DSPARK_TIMING=1
   export DS4_DSPARK_LOG=1
@@ -443,6 +468,7 @@ echo "DSpark hardware profile: $DS4_DSPARK_HW_PROFILE (versioned model/binary fi
 echo "DSpark offline SPS: $DS4_DSPARK_SPS_PROFILE (immutable complete-curve calibration; force-fingerprint=$SPS_FORCE_PROFILE; generic fallback)"
 echo "DSpark parity: confidence-input=$CONFIDENCE_INPUT, verifier-topology-cache=$GRAPH_TOPOLOGY_CACHE"
 echo "DSpark graph memory: policy=$GRAPH_EXEC_CACHE_POLICY max-live=$GRAPH_EXEC_CACHE_MAX_LIVE small-reserve=$GRAPH_EXEC_CACHE_SMALL_RESERVE"
+echo "DSpark ratio-128 rollback: $([[ "$R128_JOURNAL" == "1" ]] && echo "sparse undo journal (EXPERIMENTAL)" || echo "legacy full-frontier snapshot/prefix-capture") stats=$R128_JOURNAL_STATS (ratio-4/indexer/GVR/ring always legacy)"
 echo "DSpark sampling: lossless p/q rejection for top_k=0 top_p=1 min-p policy (rollback DS4_DSPARK_REJECTION_DISABLE=1)"
 echo "HybridLC: enabled=$HYBRID_LC shadow=$HYBRID_LC_SHADOW indexed-suffix=8-token transition-q=top8 BlockV=lossless max-draft=15 graph-rows=8/12/16 forced-width=${HYBRID_WIDTH:-auto}"
 echo "GB10 verifier: Q8 batch-reuse=${DS4_CUDA_Q8_BATCH_REUSE:-0}, Q4-sidecar direct-MoE=${DS4_CUDA_MOE_TINY_DIRECT_Q4_ONLY:-0}, tiny-TC=${DS4_CUDA_DSPARK_TENSOR_CORES:-0}, tiny-TC-Q8=${DS4_CUDA_DSPARK_TENSOR_CORES_Q8:-0}"

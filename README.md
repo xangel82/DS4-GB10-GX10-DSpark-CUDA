@@ -1,5 +1,47 @@
 # DS4 GB10/GX10 DSpark CUDA
 
+> **This project continues as Athena.** The DSpark runtime for DeepSeek V4
+> Flash that started here grew into **[Athena's Engine](https://github.com/xangel82/Athena-Engine)**,
+> a local inference server for the NVIDIA DGX Spark and the ASUS GX10, and
+> **[Athena Logos](https://github.com/xangel82/Athena-Logos/releases/latest)**,
+> the assistant built on it. New releases, fixes and support are there: this
+> repository stays as it was in September 2026 and is no longer updated.
+
+## Where to go now: Athena
+
+Everything this fork did, on the same single GB10, and much more:
+
+- **More models.** DeepSeek V4 Flash with its DSpark sidecar, DeepSeek V4
+  Flash Vision-Exp to read images, Qwen3.8 Flash Next in our own NVFP4
+  quantization for Blackwell's tensor cores, and DeepSeek V4.1 Flash, 340 GiB,
+  read from the SSD on a 128 GB machine.
+- **Faster.** DeepSeek V4 Flash reads an 8k-token prompt at about 1,170
+  tokens/s and keeps about 1,000 at 256k. Qwen3.8 Flash Next reads an 8k-token
+  prompt at 1,762 tokens/s and writes a short chat answer at 46.6 tokens/s.
+- **Conversations that are not read twice.** Every model keeps its context on
+  disk: a 141k-token conversation comes back in under two seconds instead of
+  being read again.
+- **A drop-in server.** OpenAI- and Anthropic-compatible API with streaming
+  and tool calls, plus speech, transcription, embeddings, rerank and video, on
+  the same box, with a memory guardian sharing the 128 GB between them.
+- **An assistant on top.** Athena Logos runs in the browser on the Spark, your
+  laptop or your phone: voice, a document Library, agents, plans that resume.
+  Windows, macOS and Linux arm64.
+
+```bash
+docker pull ghcr.io/xangel82/athena-engine:1.0.5
+```
+
+- Athena, the project: https://palaferri.com/athena
+- Engine, installer and docs: https://github.com/xangel82/Athena-Engine
+- Athena Logos: https://github.com/xangel82/Athena-Logos/releases/latest
+
+Athena's Engine is distributed as binaries under its own license. This
+repository keeps its MIT license, and everything below describes the fork as
+it was last released.
+
+---
+
 Run DeepSeek-V4-Flash with lossless DSpark speculative decoding on one NVIDIA
 GB10/GX10. This fork of [antirez/ds4](https://github.com/antirez/ds4) is tuned
 for long-context coding and agent workloads, with exact sparse attention,
